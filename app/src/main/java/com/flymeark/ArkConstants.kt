@@ -40,6 +40,28 @@ object ArkConstants {
     const val ACTION_PANEL_MEDIA_KEY = "com.flymeark.PANEL_MEDIA_KEY"
     const val EXTRA_KEY_CODE = "key_code"
 
+    /**
+     * SystemUI → 播放面板：曲目更新（换曲 / 进度跳变 / 播放态变化）。
+     * 面板开着时由 [ArkLiveExpandHook] 主动推送，用来刷新曲名、封面与进度，
+     * 不再需要在切歌后把面板收起来。
+     */
+    const val ACTION_PANEL_TRACK = "com.flymeark.PANEL_TRACK"
+
+    /**
+     * 播放面板 → SystemUI：立即同步一次曲目。
+     * 切歌后不必等歌词通知刷新（可能慢 1~3 秒），面板直接要一次，SystemUI 从
+     * MediaSession 读 title/artist/albumArt/progress 立刻推回，换曲几乎无延迟。
+     */
+    const val ACTION_PANEL_SYNC = "com.flymeark.PANEL_SYNC"
+
+    /**
+     * 播放面板 → SystemUI：面板可见性。
+     * 面板展开时要求 SystemUI 把状态栏胶囊淡出（视觉上像胶囊向下展开成面板），
+     * 收起时恢复，避免「面板下面还挂着原胶囊」。
+     */
+    const val ACTION_PANEL_STATE = "com.flymeark.PANEL_STATE"
+    const val EXTRA_PANEL_VISIBLE = "panel_visible"
+
     /** Xposed 日志 TAG（logcat / LSPosed 日志里搜这个） */
     const val LOG_TAG = "FlymeArk"
 }

@@ -103,8 +103,10 @@ internal object ArkLiveCoverHook {
                                 )
                             }
 
-                            // 交给展开面板用（同进程静态缓存，点击时直接打包进 Intent）
+                            // 交给展开面板用（同进程静态缓存，点击时直接打包进 Intent；
+                            // 面板已展开时这里还会实时推送换曲信息）
                             ArkLiveExpandHook.onTrackInfo(
+                                ctx = ctx,
                                 sbn = sbn,
                                 notif = notif,
                                 cover = cachedPanelCover,
@@ -126,6 +128,10 @@ internal object ArkLiveCoverHook {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            // 面板展开时胶囊需要保持隐形：原生每次刷新都会重设视图，
+                            // 这里在渲染后立刻把胶囊容器压回 alpha=0，防止「闪回来」。
+                            ArkLiveExpandHook.onLiveViewUpdated()
+
                             val info = param.args[0] ?: return
                             val icon = XposedHelpers.callMethod(info, "getSmallIcon") as? Icon ?: return
                             // 仅处理位图型图标（= 我们注入的封面），原生资源图标保持原样

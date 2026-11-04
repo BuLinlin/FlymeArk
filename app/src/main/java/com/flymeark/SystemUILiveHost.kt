@@ -58,12 +58,25 @@ internal object SystemUILiveHost {
                 // v2.6：只接播放面板的媒体键请求。
                 // v2.2 的「播放器媒体事件 → SystemUI 代发实况通知」已废弃：
                 // 方舟不再自己发胶囊，避免与 QQ音乐 原生 ticker 胶囊冲突。
-                if (intent.action == ArkConstants.ACTION_PANEL_MEDIA_KEY) {
-                    dispatchPanelKey(context, intent)
+                when (intent.action) {
+                    ArkConstants.ACTION_PANEL_MEDIA_KEY -> dispatchPanelKey(context, intent)
+
+                    // v3.1：面板展开/收起 → 淡出/恢复状态栏胶囊
+                    ArkConstants.ACTION_PANEL_STATE -> {
+                        val visible =
+                            intent.getBooleanExtra(ArkConstants.EXTRA_PANEL_VISIBLE, false)
+                        ArkLiveExpandHook.setPanelVisible(visible)
+                    }
+
+                    // v3.1：面板要求立即同步曲目（切歌后不用等歌词通知刷新）
+                    ArkConstants.ACTION_PANEL_SYNC -> ArkLiveExpandHook.syncNow(context)
                 }
             }
         }
-        val filter = IntentFilter(ArkConstants.ACTION_PANEL_MEDIA_KEY)
+        val filter = IntentFilter(ArkConstants.ACTION_PANEL_MEDIA_KEY).apply {
+            addAction(ArkConstants.ACTION_PANEL_STATE)
+            addAction(ArkConstants.ACTION_PANEL_SYNC)
+        }
         try {
             if (Build.VERSION.SDK_INT >= 33) {
                 ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)

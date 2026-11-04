@@ -15,6 +15,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.lang.ref.WeakReference
 import kotlin.math.hypot
 
 /**
@@ -68,6 +69,15 @@ internal object ArkLiveExpandHook {
     /** 两次展开之间的最小间隔，防止焦点抖动导致连续拉起 */
     private const val PANEL_COOLDOWN_MS = 1_200L
 
+    /**
+     * 胶囊视图可能挂在这几个字段上（按可靠性排序，命中第一个就停）。
+     * 只淡出胶囊本身，不动整个状态栏左侧区域。
+     */
+    private val CAPSULE_FIELDS = arrayOf(
+        "mLiveNotificationDisplay",
+        "mLiveNotificationArea"
+    )
+
     private var downX = 0f
     private var downY = 0f
     private var downAt = 0L
@@ -77,6 +87,26 @@ internal object ArkLiveExpandHook {
 
     @Volatile
     private var lastLaunchAt = 0L
+
+    // ---------------- 面板联动状态 ----------------
+
+    /** 面板是否正在显示（由面板广播驱动） */
+    @Volatile
+    private var panelVisible = false
+
+    /** 当前 LiveNotificationController（弱引用，只用于淡出/恢复胶囊） */
+    @Volatile
+    private var ctrlRef: WeakReference<Any>? = null
+
+    /** 胶囊容器视图（淡出/恢复直接作用在它上面） */
+    @Volatile
+    private var capsuleRef: WeakReference<View>? = null
+
+    /** 上次推给面板的曲目 key，用于判断「是否换曲」 */
+    @Volatile
+    private var lastPushKey: String? = null
+
+    private var lastPushAt = 0L
 
     // ---------------- 曲目缓存（由 ArkLiveCoverHook 在每次歌词刷新时写入） ----------------
 
@@ -102,6 +132,7 @@ internal object ArkLiveExpandHook {
                             val consumed = param.result as? Boolean ?: false
                             val ev = param.args[0] as? MotionEvent ?: return
                             val ctrl = param.thisObject
+                            ctrlRef = WeakReference(ctrl)
 
                             when (ev.actionMasked) {
                                 MotionEvent.ACTION_DOWN -> {
@@ -162,7 +193,13 @@ internal object ArkLiveExpandHook {
     // 曲目信息（由 ArkLiveCoverHook 调）
     // ------------------------------------------------------------------
 
-    fun onTrackInfo(sbn: Any, notif: Notification, cover: Bitmap?, lyric: String?) {
+    fun onTrackInfo(
+        ctx: Context?,
+        sbn: Any,
+        notif: Notification,
+        cover: Bitmap?,
+        lyric: String?
+    ) {
         try {
             val ex = notif.extras
             val t = ex?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
@@ -179,8 +216,182 @@ internal object ArkLiveExpandHook {
             trackDuration = if (max > 0) max else -1
 
             trackPlaying = (notif.flags and Notification.FLAG_ONGOING_EVENT) != 0
+
+            pushToPanel(ctx)
         } catch (_: Throwable) {
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 面板联动：淡出原胶囊 + 实时推送曲目
+    // ------------------------------------------------------------------
+
+    /**
+     * 面板可见性回调（由 SystemUILiveHost 收到面板广播后转到 SystemUI 主线程调用）。
+     * 展开时把胶囊淡到全透明，视觉上像是胶囊本身向下展开；收起时恢复。
+     */
+    fun setPanelVisible(visible: Boolean) {
+        panelVisible = visible
+        if (visible) lastPushKey = null // 重新打开时强制推一次完整信息（含封面）
+        val ctrl = ctrlRef?.get()
+        if (ctrl == null) {
+            XposedBridge.log("$TAG: panel visible=$visible (no controller yet)")
+            return
+        }
+        applyCapsuleAlpha(ctrl, if (visible) 0f else 1f)
+        XposedBridge.log("$TAG: panel visible=$visible")
+    }
+
+    /**
+     * 歌词每行刷新都会重设视图，原生可能把 alpha 动画拉回来；
+     * 面板开着时在每次渲染后重新压成 0，保证胶囊不会「闪回来」。
+     * 只动容器视图（见 [capsuleRef]），子视图的 alpha 由容器统一乘算。
+     */
+    fun onLiveViewUpdated() {
+        if (!panelVisible) return
+        val v = capsuleRef?.get() ?: return
+        try {
+            v.animate().cancel()
+            v.alpha = 0f
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun applyCapsuleAlpha(ctrl: Any, alpha: Float) {
+        for (name in CAPSULE_FIELDS) {
+            val v = try {
+                XposedHelpers.getObjectField(ctrl, name) as? View
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+            capsuleRef = WeakReference(v)
+            v.animate().cancel()
+            if (alpha >= 1f) {
+                // 收起面板时淡回来，避免突兀地「啪」一下出现
+                v.animate().alpha(1f).setDuration(160L).start()
+            } else {
+                v.alpha = 0f
+            }
+            XposedBridge.log("$TAG: capsule[$name] alpha=$alpha")
+            return
+        }
+        XposedBridge.log("$TAG: capsule view not found for alpha=$alpha")
+    }
+
+    /**
+     * 面板开着时把当前曲目推过去：
+     *  - 换曲 → 立刻推（带封面）
+     *  - 同曲 → 最多每秒推一次，用来对齐进度（拖动进度条后也能纠正）
+     */
+    private fun pushToPanel(ctx: Context?) {
+        if (!panelVisible) return
+        val c = ctx ?: return
+        val title = trackTitle?.takeIf { it.isNotBlank() } ?: return
+        val artist = trackArtist.orEmpty()
+        val key = "$title|$artist"
+        val now = SystemClock.uptimeMillis()
+        val changed = key != lastPushKey
+        if (!changed && now - lastPushAt < 1_000L) return
+        lastPushKey = key
+        lastPushAt = now
+
+        val session = readMediaSession(c)
+        val progress = session?.position?.takeIf { it >= 0 }?.toInt() ?: trackProgress
+        val duration = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
+        val playing = session?.playing ?: trackPlaying
+
+        sendTrack(c, title, artist, progress, duration, playing, if (changed) trackCover else null)
+        if (changed) {
+            XposedBridge.log("$TAG: push track '$title' pos=$progress/$duration playing=$playing")
+        }
+    }
+
+    /**
+     * 面板按下上一首/下一首后主动来要一次同步：直接从 MediaSession 读
+     * 标题 / 歌手 / 专辑图 / 进度，不等歌词通知刷新，换曲延迟从 1~3 秒降到毫秒级。
+     */
+    fun syncNow(ctx: Context?) {
+        val c = ctx ?: return
+        val s = readMediaSession(c) ?: run {
+            XposedBridge.log("$TAG: sync skipped (no media session)")
+            return
+        }
+        val title = s.title?.takeIf { it.isNotBlank() } ?: trackTitle?.takeIf { it.isNotBlank() }
+            ?: run {
+                XposedBridge.log("$TAG: sync skipped (no title)")
+                return
+            }
+        val artist = s.artist?.takeIf { it.isNotBlank() } ?: trackArtist.orEmpty()
+        val cover = s.art?.let { scaleArt(it) } ?: trackCover
+        val progress = s.position.takeIf { it >= 0 }?.toInt() ?: trackProgress
+        val duration = s.duration.takeIf { it > 0 }?.toInt() ?: trackDuration
+
+        trackTitle = title
+        trackArtist = artist
+        if (cover != null) trackCover = cover
+        lastPushKey = "$title|$artist"
+        lastPushAt = SystemClock.uptimeMillis()
+
+        sendTrack(c, title, artist, progress, duration, s.playing, cover)
+        XposedBridge.log("$TAG: sync '$title' pos=$progress/$duration playing=${s.playing}")
+    }
+
+    private fun sendTrack(
+        ctx: Context,
+        title: String,
+        artist: String,
+        progress: Int,
+        duration: Int,
+        playing: Boolean,
+        cover: Bitmap?
+    ) {
+        val intent = Intent(ArkConstants.ACTION_PANEL_TRACK).apply {
+            setPackage(ArkConstants.APP_PKG)
+            putExtra(ArkConstants.EXTRA_PANEL_TITLE, title)
+            putExtra(ArkConstants.EXTRA_PANEL_ARTIST, artist)
+            putExtra(ArkConstants.EXTRA_PANEL_PROGRESS, progress)
+            putExtra(ArkConstants.EXTRA_PANEL_DURATION, duration)
+            putExtra(ArkConstants.EXTRA_PANEL_PLAYING, playing)
+            cover?.let { putExtra(ArkConstants.EXTRA_PANEL_COVER, it) }
+        }
+        try {
+            ctx.sendBroadcast(intent)
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: push track failed: ${t.message}")
+        }
+    }
+
+    /** MediaSession 里的专辑图 → 面板用的方形圆角缩略图（绑 Binder 事务 1MB 上限） */
+    private fun scaleArt(src: Bitmap): Bitmap? = try {
+        val size = minOf(src.width, src.height)
+        if (size <= 0) {
+            null
+        } else {
+            val square = if (src.width == size && src.height == size) {
+                src
+            } else {
+                Bitmap.createBitmap(src, (src.width - size) / 2, (src.height - size) / 2, size, size)
+            }
+            val target = minOf(size, 240)
+            val scaled = if (size > target) {
+                Bitmap.createScaledBitmap(square, target, target, true)
+            } else {
+                square
+            }
+            val out = Bitmap.createBitmap(scaled.width, scaled.height, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(out)
+            val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+            val r = out.width * 0.16f
+            canvas.drawRoundRect(
+                android.graphics.RectF(0f, 0f, out.width.toFloat(), out.height.toFloat()),
+                r, r, paint
+            )
+            paint.xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC_IN)
+            canvas.drawBitmap(scaled, 0f, 0f, paint)
+            out
+        }
+    } catch (_: Throwable) {
+        null
     }
 
     // ------------------------------------------------------------------
@@ -214,6 +425,7 @@ internal object ArkLiveExpandHook {
     }
 
     private fun launchPanel(ctrl: Any, now: Long) {
+        ctrlRef = WeakReference(ctrl)
         if (now - lastLaunchAt < PANEL_COOLDOWN_MS) {
             XposedBridge.log("$TAG: launch skipped (cooldown)")
             return
@@ -248,9 +460,9 @@ internal object ArkLiveExpandHook {
         // SystemUI 持有 MEDIA_CONTENT_CONTROL，可直接读 MediaSession 的
         // PlaybackState.position 与 MEDIA_KEY_DURATION，拿到真实进度与总时长。
         val session = readMediaSession(ctx)
-        val progressMs = session?.first?.takeIf { it >= 0 }?.toInt() ?: trackProgress
-        val durationMs = session?.second?.takeIf { it > 0 }?.toInt() ?: trackDuration
-        val isPlaying = session?.third ?: playing
+        val progressMs = session?.position?.takeIf { it >= 0 }?.toInt() ?: trackProgress
+        val durationMs = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
+        val isPlaying = session?.playing ?: playing
 
         val intent = Intent().apply {
             setClassName(ArkConstants.APP_PKG, PANEL_ACTIVITY)
@@ -271,6 +483,7 @@ internal object ArkLiveExpandHook {
             ctx.startActivity(intent)
             lastLaunchAt = now
             clickHandledAt = now
+            lastPushKey = null // 面板打开后第一条推送必须带全量信息
             XposedBridge.log(
                 "$TAG: panel launched, title='$title', pos=$progressMs/$durationMs, playing=$isPlaying"
             )
@@ -279,11 +492,21 @@ internal object ArkLiveExpandHook {
         }
     }
 
+    /** 一次 MediaSession 快照（QQ音乐 当前播放） */
+    private class SessionSnapshot(
+        val title: String?,
+        val artist: String?,
+        val position: Long,
+        val duration: Long,
+        val playing: Boolean,
+        val art: Bitmap?
+    )
+
     /**
-     * 读取当前播放会话的 (position, duration, isPlaying)。
-     * 仅在 SystemUI（system uid / 持有 MEDIA_CONTENT_CONTROL）进程内可用。
+     * 读取当前播放会话。仅在 SystemUI（system uid / 持有 MEDIA_CONTENT_CONTROL）内可用。
+     * 除了进度，还能拿到 MediaSession 自己的标题/歌手/专辑图——切歌时比等通知刷新快得多。
      */
-    private fun readMediaSession(ctx: Context): Triple<Long, Long, Boolean>? = try {
+    private fun readMediaSession(ctx: Context): SessionSnapshot? = try {
         val msm = ctx.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
         val ctrl = msm?.getActiveSessions(null)?.firstOrNull { it.packageName == QQ_MUSIC }
         if (ctrl == null) {
@@ -291,10 +514,15 @@ internal object ArkLiveExpandHook {
         } else {
             val ps = ctrl.playbackState
             val md = ctrl.metadata
-            Triple(
-                ps?.position ?: -1L,
-                md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: -1L,
-                ps?.state == PlaybackState.STATE_PLAYING
+            SessionSnapshot(
+                title = md?.getString(MediaMetadata.METADATA_KEY_TITLE),
+                artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+                    ?: md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST),
+                position = ps?.position ?: -1L,
+                duration = md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: -1L,
+                playing = ps?.state == PlaybackState.STATE_PLAYING,
+                art = md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                    ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
             )
         }
     } catch (t: Throwable) {
