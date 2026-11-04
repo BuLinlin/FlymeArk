@@ -45,12 +45,15 @@ private const val PLAY_THROTTLE_MS = 180L
 private const val OPEN_APP_DEBOUNCE_MS = 800L
 
 /**
- * 收藏按钮防抖：收藏是明确动作，防连发即可。
+ * 收藏按钮的点击锁。
  *
- * v3.15.6：600ms → 350ms。系统侧防抖已降到 200ms，这里的旧值会把「收藏后立刻取消」
- * 的第二次点击吞掉（用户反馈的「有概率取消失败」）。350ms 足够挡住误触双击。
+ * 播放器的收藏是 toggle，而且对连续调用有限流：短时间连点，音乐端只会吃下第一次，
+ * 我们这边却已经跟着点了好几次，两边状态必然错位（用户实测「连点只生效一次」）。
+ *
+ * 所以不在"发送"上做文章，直接在点击层锁住：一次点击后 900ms 内不再接受输入，
+ * UI 也不切换。这个窗口覆盖「发请求 + 首次真值校验」，等结果出来再允许下一次。
  */
-private const val FAV_DEBOUNCE_MS = 350L
+private const val FAV_CLICK_LOCK_MS = 900L
 
 /**
  * 点击后多久内不采信推送来的收藏状态。
@@ -58,11 +61,11 @@ private const val FAV_DEBOUNCE_MS = 350L
  * 原本是 6 秒：那会儿真值只有「通知按钮标题」一个来源，滞后 1~5 秒，推送来的是旧值，
  * 会把面板乐观切换的 ❤ 冲掉。
  *
- * v3.15.6：降到 1 秒。真值保护已经上移到 SystemUI 侧（`inFavSettle()` + COLLECT_STATE
- * 闭环校验），它不会再把点击前的旧值推下来；而且校验失败时需要在 ~2 秒内把真实状态
- * 推回面板，锁 6 秒会让面板一直显示错误状态。这里只挡「点击瞬间还在路上的旧推送」。
+ * v3.15.7：2 秒。现在的发送链是「220ms 合并 + 900ms 校验（+700ms 复检 + 重试）」，
+ * 全程都会有心跳/轮询推送带着旧真值过来，锁必须覆盖到首次校验结论出来（~1.2s）。
+ * 失败重试最长约 2.9s，那时 SystemUI 会主动把真实状态推下来，面板已经解锁能接住。
  */
-private const val FAV_PUSH_LOCK_MS = 1_000L
+private const val FAV_PUSH_LOCK_MS = 2_000L
 
 /**
  * v2.6：点击实况胶囊后从状态栏下方展开的播放控制面板。
@@ -139,7 +142,7 @@ class ArkCapsulePanelActivity : Activity() {
     private var paletteCard = 0xFF18181C.toInt()
     private var paletteStroke = 0x24FFFFFF.toInt()
 
-    /** 收藏防抖时间戳（收藏是明确动作，防连发即可，窗口可以稍大） */
+    /** 最近一次点击 ❤ 的时间：既是点击锁，也是「锁定期内不采信推送旧状态」的依据 */
     private var lastFavAt = 0L
 
     /** 输出切换点击防抖（请求路由列表 → SystemUI 回广播 → 弹窗） */
@@ -332,7 +335,8 @@ class ArkCapsulePanelActivity : Activity() {
         clickIntentOf(i)?.let { lastClickIntent = it }
         setNight(i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode))
         if (i.hasExtra(ArkConstants.EXTRA_PANEL_FAV) &&
-            android.os.SystemClock.uptimeMillis() - lastFavAt > FAV_PUSH_LOCK_MS
+            (i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV_FINAL, false) ||
+                android.os.SystemClock.uptimeMillis() - lastFavAt > FAV_PUSH_LOCK_MS)
         ) {
             favState = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
             favKnown = true
@@ -405,7 +409,10 @@ class ArkCapsulePanelActivity : Activity() {
         // 所以点击后 6 秒内忽略推送，只信本地乐观状态；6 秒后推送即可纠正真实漂移。
         if (i.hasExtra(ArkConstants.EXTRA_PANEL_FAV)) {
             val sinceClick = android.os.SystemClock.uptimeMillis() - lastFavAt
-            if (sinceClick > FAV_PUSH_LOCK_MS) {
+            // v3.15.7：FINAL 是 SystemUI 的确认结论（成功/失败都有），必须直接采信；
+            // 否则点击锁期间失败结论会被推送锁挡住，面板一直停在错误状态。
+            val isFinal = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV_FINAL, false)
+            if (isFinal || sinceClick > FAV_PUSH_LOCK_MS) {
                 val s = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
                 favKnown = true
                 if (s != favState) {
@@ -652,10 +659,10 @@ class ArkCapsulePanelActivity : Activity() {
         }
         favBtn.setOnClickListener {
             // v3.13.3：收藏 = 触发播放器通知上的「喜欢」按钮。
-            // v3.15.1：把目标状态一起发给 SystemUI（它据此校准指纹映射）；
-            // 状态未知时点一下按「收藏」处理，真实结果由下一次推送纠正。
+            // v3.15.7：点击锁 —— 播放器的 toggle 有限流，连点只有第一次生效；
+            // 我们若跟着连点，UI 与音乐端必然错位。锁定期内直接不响应（UI 也不动）。
             val now = android.os.SystemClock.uptimeMillis()
-            if (now - lastFavAt < FAV_DEBOUNCE_MS) return@setOnClickListener
+            if (now - lastFavAt < FAV_CLICK_LOCK_MS) return@setOnClickListener
             lastFavAt = now
             val target = if (favKnown) !favState else true
             favState = target

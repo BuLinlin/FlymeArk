@@ -210,6 +210,46 @@ internal object ArkLiveExpandHook {
     @Volatile private var pendingFavTarget: Boolean? = null
     @Volatile private var pendingFavLearnable = false
 
+    /**
+     * v3.15.7：收藏串行泵。
+     *
+     * 之前用「200ms 内直接丢弃」做节流 —— 这是错的：面板已经把 ❤ 乐观切成目标状态，
+     * 而请求被丢弃，音乐端根本没收到，两边就永久错位（用户看到的「连点只有一次生效」）。
+     *
+     * 现在不再丢弃任何点击：
+     *  - [favDesired] 永远保存「用户最后一次想要的状态」，连点 N 次只保留最终值
+     *  - [favGen] 是意图代号，旧的校验回调发现自己过期就直接让位给新目标
+     *  - 发送前先读真值，已等于目标就**不发**（幂等短路）—— 避免在音乐端的
+     *    toggle 限流窗口里反复翻转
+     *  - 串行执行：一次发送 + 校验走完才处理下一个目标，绝不并发 toggle
+     */
+    private var favDesired: Boolean? = null
+    private var favBusy = false
+    private var favGen = 0
+    private var lastFavRecvAt = 0L
+
+    /**
+     * 最近一次**真正发出** toggle 的时间；拿到真值确认后清零。
+     *
+     * 用途：用户连点时，上一次 toggle 可能已经在音乐端翻转、但 metadata 还没刷新。
+     * 这时如果直接读真值做幂等短路，会读到「点击前」的旧值并误判成「已经是目标」，
+     * 于是漏发 → 最终状态反向错位。所以有未确认发送时先等一个确认窗口。
+     */
+    private var lastToggleSentAt = 0L
+
+    /** 上一次 toggle 发出后，等它落地的最短时间（给播放器写 metadata 的时间） */
+    private const val FAV_CONFIRM_WAIT_MS = 1_200L
+
+    /**
+     * 换曲时作废在途的收藏泵：旧目标的校验回调读到的是**新歌**的真值，
+     * 不清掉会把新歌 ❤ 按上一首的目标写错，并且把新目标挤掉。
+     */
+    private fun resetFavPump() {
+        favGen++
+        favDesired = null
+        favBusy = false
+    }
+
     private fun loadFavMap(ctx: Context) {
         if (favMapReady) return
         favMapReady = true
@@ -464,7 +504,7 @@ internal object ArkLiveExpandHook {
      *  - 换曲 → 立刻推（带封面）
      *  - 同曲 → 最多每秒推一次，用来对齐进度（拖动进度条后也能纠正）
      */
-    private fun pushToPanel(ctx: Context?, force: Boolean = false) {
+    private fun pushToPanel(ctx: Context?, force: Boolean = false, favFinal: Boolean = false) {
         if (!panelVisible) return
         val c = ctx ?: return
         // v3.15.3：重入锁必须在最前面 —— 下面的 refreshFavFromActiveNotifications
@@ -492,6 +532,8 @@ internal object ArkLiveExpandHook {
                 lastFavSendAt = 0L
                 pendingFavTarget = null
                 pendingFavHash = null
+                // v3.15.7：作废在途的收藏泵（旧校验会拿新歌真值比对）
+                resetFavPump()
                 // v3.15.5：favIntent 是「通知上的收藏按钮」，换曲后它仍指向上一首。
                 // 不清掉的话，新歌通知还没刷出来时点 ❤ 会去取消收藏**上一首**。
                 // 清空后由 refresh 在「标题匹配当前曲」时重新填充，宁可短暂无响应也不能误操作。
@@ -525,7 +567,7 @@ internal object ArkLiveExpandHook {
 
             sendTrack(
                 c, title, artist, progress, duration, playing,
-                cover, lastClickIntent
+                cover, lastClickIntent, favFinal
             )
             if (changed) {
                 XposedBridge.log("$TAG: push track '$title' pos=$progress/$duration playing=$playing")
@@ -565,6 +607,8 @@ internal object ArkLiveExpandHook {
             lastFavSendAt = 0L
             pendingFavTarget = null
             pendingFavHash = null
+            // v3.15.7：作废在途的收藏泵
+            resetFavPump()
             // v3.15.5：同 pushToPanel —— 旧通知的收藏按钮不能留给新曲用
             favIntent = null
             // v3.15.4：session 没给收藏时用「按曲目记忆」顶上，避免面板先显示未定再点亮
@@ -592,7 +636,8 @@ internal object ArkLiveExpandHook {
         duration: Int,
         playing: Boolean,
         cover: Bitmap?,
-        clickIntent: PendingIntent? = null
+        clickIntent: PendingIntent? = null,
+        favFinal: Boolean = false
     ) {
         val intent = Intent(ArkConstants.ACTION_PANEL_TRACK).apply {
             setPackage(ArkConstants.APP_PKG)
@@ -605,6 +650,8 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
             // v3.13.3：收藏状态（null = 通知按钮不带状态词，推不出）
             favState?.let { putExtra(ArkConstants.EXTRA_PANEL_FAV, it) }
+            // v3.15.7：这是点击后的确认结论，面板应无视推送锁直接采信
+            if (favFinal) putExtra(ArkConstants.EXTRA_PANEL_FAV_FINAL, true)
             // v3.15：当前媒体 App 包名
             currentPkg?.let { putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, it) }
             cover?.let { putExtra(ArkConstants.EXTRA_PANEL_COVER, it) }
@@ -983,17 +1030,61 @@ internal object ArkLiveExpandHook {
         return null
     }
 
-    /** 面板点 ❤ → 触发通知上的收藏按钮（PendingIntent 是播放器自己的，send 无需权限） */
+    /**
+     * 面板点 ❤ → 触发通知上的收藏按钮（PendingIntent 是播放器自己的，send 无需权限）。
+     *
+     * v3.15.7：不再按时间丢弃请求。目标状态记进 [favDesired]，由 [pumpFav] 串行落地。
+     * 这样「连点 5 次」不会变成「只生效 1 次」，也不会在音乐端的 toggle 限流里翻转。
+     */
     fun toggleFavorite(ctx: Context?, target: Boolean) {
         val c = ctx ?: return
-        // v3.15.6：防抖从 800ms 降到 200ms。面板侧已有 350ms 节流，这里只需挡真正的连点抖动；
-        // 原来 800ms 会把「收藏后立刻取消」的第二次点击直接吞掉 —— 用户看到的「有概率取消失败」。
         val now = SystemClock.uptimeMillis()
-        if (now - lastFavSendAt < 200L) {
-            XposedBridge.log("$TAG: favorite throttled")
+        // 只挡同一物理点击产生的重复广播（<150ms 且目标相同），不做语义丢弃
+        if (target == favDesired && now - lastFavRecvAt < 150L) {
+            XposedBridge.log("$TAG: favorite duplicate ignored")
             return
         }
-        sendFavAction(c, target, attempt = 1)
+        lastFavRecvAt = now
+        favDesired = target
+        favGen++
+        // 乐观回显 + 按曲目记账，最终以真值校正
+        lastFavSendAt = now
+        favState = target
+        rememberTrackFav(c, trackFavKey(currentPkg, trackTitle), target)
+        XposedBridge.log("$TAG: favorite request target=$target gen=$favGen busy=$favBusy")
+        if (panelVisible) pushToPanel(c, force = true)
+        if (!favBusy) pumpFav(c)
+    }
+
+    /** 取当前目标并尝试落地；[favBusy] 保证同一时刻只有一条发送/校验链 */
+    private fun pumpFav(ctx: Context) {
+        val target = favDesired
+        if (target == null) {
+            favBusy = false
+            return
+        }
+        if (favBusy) return
+        favBusy = true
+        val gen = favGen
+        // 上一次 toggle 还没确认落地：先等它写进 metadata，再判断"是否已经等于目标"，
+        // 否则读到的是点击前的旧值，会漏发（音乐端其实已经翻转了）
+        val sinceSend = SystemClock.uptimeMillis() - lastToggleSentAt
+        if (lastToggleSentAt > 0L && sinceSend < FAV_CONFIRM_WAIT_MS) {
+            mainHandler.postDelayed({
+                favBusy = false
+                pumpFav(ctx)
+            }, FAV_CONFIRM_WAIT_MS - sinceSend)
+            return
+        }
+        // 幂等短路：真值已经是目标（连点偶数次会回到原状态），根本不需要 toggle。
+        // 既省掉一次音乐端操作，也避开它的 toggle 限流。
+        val actual = readFavFromSession(ctx)
+        if (actual == target) {
+            XposedBridge.log("$TAG: fav already=$target, skip send")
+            finishFav(ctx, gen, target)
+            return
+        }
+        sendFavAction(ctx, target, gen, attempt = 1)
     }
 
     /**
@@ -1006,13 +1097,21 @@ internal object ArkLiveExpandHook {
      * 现在：发完 1.2s 读一次真值，没变再等 0.8s 读一次，仍然没变才重发（最多重试 1 次）。
      * 真值读不到（null）就放弃，交给通知/记忆表兜底 —— 绝不盲目反复发送导致来回翻转。
      */
-    private fun sendFavAction(ctx: Context, target: Boolean, attempt: Int) {
+    private fun sendFavAction(ctx: Context, target: Boolean, gen: Int, attempt: Int) {
+        // 目标已被新点击覆盖 → 立刻让位，别把过期目标打出去
+        if (gen != favGen) {
+            favBusy = false
+            pumpFav(ctx)
+            return
+        }
         // 重试前先重新取一次按钮：通知可能已经刷新成「另一个语义」的动作
         if (attempt > 1) refreshFavAction(ctx)
 
         val pi = favIntent
         if (pi == null) {
             XposedBridge.log("$TAG: favorite skipped (no like action)")
+            // 没有可点的按钮：不能硬拗，交给真值/记忆表兜底
+            finishFav(ctx, gen, readFavFromSession(ctx))
             return
         }
         lastFavSendAt = SystemClock.uptimeMillis()
@@ -1025,55 +1124,77 @@ internal object ArkLiveExpandHook {
         }
         // 乐观置为目标状态：通知刷新若拿到真值会覆盖它，不会长期错下去
         favState = target
-        // v3.15.4：用户意图立刻按曲目记账 —— 之后再切回这首，❤ 直接就是目标状态
-        rememberTrackFav(ctx, trackFavKey(currentPkg, trackTitle), target)
         try {
             pi.send(ctx, 0, null)
-            XposedBridge.log("$TAG: favorite action sent (target=$target attempt=$attempt)")
+            lastToggleSentAt = SystemClock.uptimeMillis()
+            XposedBridge.log("$TAG: favorite action sent (target=$target gen=$gen attempt=$attempt)")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: favorite send failed: ${t.message}")
         }
 
-        verifyFavLater(ctx, target, attempt, round = 0)
+        verifyFavLater(ctx, target, gen, attempt, round = 0)
     }
 
-    /** 校验调度：1.2s → 再 0.8s；仍未生效才重试（最多 2 次发送） */
-    private fun verifyFavLater(ctx: Context, target: Boolean, attempt: Int, round: Int) {
+    /** 校验调度：900ms → 再 700ms；仍未生效才重试（每次目标最多 2 次发送） */
+    private fun verifyFavLater(ctx: Context, target: Boolean, gen: Int, attempt: Int, round: Int) {
         mainHandler.postDelayed({
+            // 用户又点了别的目标：本次校验作废，交给最新目标（不回退它的 ❤）
+            if (gen != favGen) {
+                XposedBridge.log("$TAG: fav verify stale (gen=$gen now=$favGen)")
+                finishFav(ctx, gen, null)
+                return@postDelayed
+            }
             val actual = readFavFromSession(ctx)
             if (actual == null) {
                 XposedBridge.log("$TAG: fav verify skipped (no metadata)")
+                finishFav(ctx, gen, null)
                 return@postDelayed
             }
             if (actual == target) {
-                // 成功：撤掉沉降窗口，让真值重新可采信
-                favState = actual
-                lastFavSendAt = 0L
-                pendingFavTarget = null
-                pendingFavHash = null
-                rememberTrackFav(ctx, trackFavKey(currentPkg, trackTitle), actual)
+                val ph = pendingFavHash
+                if (ph != null && pendingFavLearnable) learnFav(ctx, ph, target)
                 XposedBridge.log("$TAG: fav verified -> $actual (attempt=$attempt)")
-                if (panelVisible) pushToPanel(ctx, force = true)
+                finishFav(ctx, gen, actual)
                 return@postDelayed
             }
             if (round == 0) {
                 XposedBridge.log("$TAG: fav not applied yet (actual=$actual), recheck")
-                verifyFavLater(ctx, target, attempt, round = 1)
+                verifyFavLater(ctx, target, gen, attempt, round = 1)
                 return@postDelayed
             }
             if (attempt < 2) {
                 XposedBridge.log("$TAG: fav verify failed (actual=$actual), retry")
-                sendFavAction(ctx, target, attempt + 1)
+                sendFavAction(ctx, target, gen, attempt + 1)
             } else {
                 // 两次都失败：以播放器真值为准，不再硬拗
-                favState = actual
-                lastFavSendAt = 0L
-                pendingFavTarget = null
-                pendingFavHash = null
                 XposedBridge.log("$TAG: fav failed twice, accept actual=$actual")
-                if (panelVisible) pushToPanel(ctx, force = true)
+                finishFav(ctx, gen, actual)
             }
-        }, if (round == 0) 1_200L else 800L)
+        }, if (round == 0) 900L else 700L)
+    }
+
+    /**
+     * 收尾：释放串行泵。若期间用户又点了（gen 变了），立刻接着处理最新目标。
+     * [actual] 为 null 表示「没拿到真值」—— 保留乐观状态，不覆盖。
+     */
+    private fun finishFav(ctx: Context, gen: Int, actual: Boolean?) {
+        favBusy = false
+        if (gen != favGen) {
+            pumpFav(ctx)
+            return
+        }
+        favDesired = null
+        pendingFavTarget = null
+        pendingFavHash = null
+        if (actual != null) {
+            // 拿到真值才撤掉沉降窗口：否则随后一次推送会把点击前的旧值采信回来
+            lastFavSendAt = 0L
+            lastToggleSentAt = 0L
+            favState = actual
+            rememberTrackFav(ctx, trackFavKey(currentPkg, trackTitle), actual)
+        }
+        // 把结论明确告诉面板（即使 actual == null 也要推，让面板知道本次点击到此为止）
+        if (panelVisible) pushToPanel(ctx, force = true, favFinal = actual != null)
     }
 
     /**

@@ -112,6 +112,12 @@ object ArkConstants {
     const val EXTRA_PANEL_FAV = "panel_fav"
 
     /**
+     * 收藏结论标记：SystemUI 已经把点击后的搜索结果（成功或失败）确认下来。
+     * 面板收到它时无视「点击后 2 秒内不看推送」的锁 —— 那是防旧值的，不该防结论。
+     */
+    const val EXTRA_PANEL_FAV_FINAL = "panel_fav_final"
+
+    /**
      * 播放面板 → SystemUI：本次点击期望的目标状态（Boolean，v3.15.1）。
      * QQ 音乐的通知按钮是 toggle 语义，只能发「翻转」；把目标一起带上，
      * SystemUI 才能在通知刷新后用目标状态校准指纹映射（自学习双向绑定）。
