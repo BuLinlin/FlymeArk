@@ -100,8 +100,15 @@ class ArkCapsulePanelActivity : Activity() {
     /** v3.13：当前专辑主题色（进度条） */
     private var albumColor: Int? = null
 
-    /** v3.13.3：收藏状态（true=已收藏）。SystemUI 从通知按钮标题推断，null=未知 */
-    private var favState: Boolean? = null
+    /**
+     * v3.13.3：收藏状态（true=已收藏）。
+     *
+     * v3.15.1：加 [favKnown] 三态 —— 没拿到真值时按钮显示「未定」（空心 + 半透明），
+     * 拿到真值（metadata extras / 通知标题 / 指纹学习表）后立即变成确定的实心或空心。
+     * 不再把「未知」直接当成「未收藏」。
+     */
+    private var favState = false
+    private var favKnown = false
 
     /** v3.13：媒体 App 跳转 PendingIntent（SystemUI 从 sessionActivity 带来） */
     private var lastClickIntent: PendingIntent? = null
@@ -277,6 +284,9 @@ class ArkCapsulePanelActivity : Activity() {
             // seek 后立刻向 SystemUI 要一次真实进度，修正播放器实际落点
             handler.postDelayed(syncRequest, 400)
         }
+
+        // v3.15.1：首帧就把收藏图标画出来（默认未收藏），不要等 SystemUI 推收藏状态
+        updateFavIcon()
     }
 
     /** 右上角媒体 App 图标（v3.15：跟随 SystemUI 传来的真实播放 App；取不到则隐藏） */
@@ -315,6 +325,7 @@ class ArkCapsulePanelActivity : Activity() {
             android.os.SystemClock.uptimeMillis() - lastFavAt > FAV_PUSH_LOCK_MS
         ) {
             favState = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
+            favKnown = true
         }
         updateFavIcon()
 
@@ -340,6 +351,8 @@ class ArkCapsulePanelActivity : Activity() {
         var dir = 1
         if (title != null && title != titleView.text.toString()) {
             titleChanged = true
+            // v3.15.1：换曲后收藏状态归零为「未定」，等 SystemUI 推新曲真值，别继承上一首
+            favKnown = false
             // 换曲方向：按用户按的是上一首还是下一首决定封面滑入方向
             dir = pendingDir
             pendingDir = 1
@@ -380,6 +393,7 @@ class ArkCapsulePanelActivity : Activity() {
             val sinceClick = android.os.SystemClock.uptimeMillis() - lastFavAt
             if (sinceClick > FAV_PUSH_LOCK_MS) {
                 val s = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
+                favKnown = true
                 if (s != favState) {
                     favState = s
                     updateFavIcon()
@@ -553,7 +567,7 @@ class ArkCapsulePanelActivity : Activity() {
         outputBtn.imageTintList = ColorStateList.valueOf(icon)
         favBtn.imageTintList = ColorStateList.valueOf(
             // 已收藏：跟专辑主题色走（系统媒体卡同款思路），未收藏用普通图标色
-            if (favState == true) albumColor ?: icon else icon
+            if (favKnown && favState) albumColor ?: icon else icon
         )
         (playBtn.background as? GradientDrawable)?.setColor(playBg)
         progressBar.trackColor = if (nightMode) 0x33FFFFFF.toInt() else 0x26000000
@@ -623,14 +637,17 @@ class ArkCapsulePanelActivity : Activity() {
             restartTicker()
         }
         favBtn.setOnClickListener {
-            // v3.13.3：收藏 = 触发 QQ 音乐通知上的「喜欢」按钮。
-            // 乐观切换图标，真实状态由 SystemUI 下次推送纠正（通知按钮标题会变）。
+            // v3.13.3：收藏 = 触发播放器通知上的「喜欢」按钮。
+            // v3.15.1：把目标状态一起发给 SystemUI（它据此校准指纹映射）；
+            // 状态未知时点一下按「收藏」处理，真实结果由下一次推送纠正。
             val now = android.os.SystemClock.uptimeMillis()
             if (now - lastFavAt < FAV_DEBOUNCE_MS) return@setOnClickListener
             lastFavAt = now
-            favState = !(favState ?: false)
+            val target = if (favKnown) !favState else true
+            favState = target
+            favKnown = true
             updateFavIcon()
-            sendFavorite()
+            sendFavorite(target)
         }
         outputBtn.setOnClickListener {
             // v3.15：请求 SystemUI 列出当前媒体 App 的输出路由（MediaRouter2Manager）
@@ -692,19 +709,22 @@ class ArkCapsulePanelActivity : Activity() {
     }
 
     /** 收藏请求 → SystemUI（system uid）send QQ 音乐通知 action */
-    private fun sendFavorite() {
+    private fun sendFavorite(target: Boolean) {
         try {
             sendBroadcast(
                 Intent(ArkConstants.ACTION_PANEL_FAVORITE)
                     .setPackage(ArkConstants.SYSTEMUI_PKG)
+                    .putExtra(ArkConstants.EXTRA_FAV_TARGET, target)
             )
         } catch (_: Throwable) {
         }
     }
 
     private fun updateFavIcon() {
-        val faved = favState == true
+        val faved = favKnown && favState
         favBtn.setImageResource(if (faved) R.drawable.ic_ark_fav_filled else R.drawable.ic_ark_fav)
+        // 状态未定：空心 + 半透明，明确表达「还没拿到真值」，而不是假装修未收藏
+        favBtn.alpha = if (favKnown) 1f else 0.42f
         // 已收藏用专辑主题色点亮（系统媒体卡同款思路）；未收藏用普通图标色
         val plain = if (nightMode) Color.WHITE else 0xE6000000.toInt()
         favBtn.imageTintList = ColorStateList.valueOf(

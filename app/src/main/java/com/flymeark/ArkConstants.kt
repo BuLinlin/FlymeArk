@@ -108,8 +108,15 @@ object ArkConstants {
      */
     const val ACTION_PANEL_FAVORITE = "com.flymeark.PANEL_FAVORITE"
 
-    /** SystemUI → 播放面板：当前收藏状态（Boolean，从通知按钮标题推断；缺省=未知） */
+    /** SystemUI → 播放面板：当前收藏状态（Boolean，真值来源见 ArkLiveExpandHook.favOf） */
     const val EXTRA_PANEL_FAV = "panel_fav"
+
+    /**
+     * 播放面板 → SystemUI：本次点击期望的目标状态（Boolean，v3.15.1）。
+     * QQ 音乐的通知按钮是 toggle 语义，只能发「翻转」；把目标一起带上，
+     * SystemUI 才能在通知刷新后用目标状态校准指纹映射（自学习双向绑定）。
+     */
+    const val EXTRA_FAV_TARGET = "fav_target"
 
     /**
      * SystemUI → 播放面板：媒体 App 的点击跳转 PendingIntent（v3.13）。

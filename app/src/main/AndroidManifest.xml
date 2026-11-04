@@ -28,7 +28,7 @@
 
         <!-- LSPosed 模块元数据 -->
         <meta-data android:name="xposedmodule" android:value="true" />
-        <meta-data android:name="xposeddescription" android:value="FlymeArk：把播放器自己的实况通知变成带封面的灵动胶囊（只 hook，不自己发通知）" />
+        <meta-data android:name="xposeddescription" android:value="一个针对魅族实况通知优化插件模块，使用方法安装插件激活后去设置-通知与状态栏-实况通知开启对应app开关&#10;开发者：多爱梦" />
         <meta-data android:name="xposedminversion" android:value="82" />
         <!-- 推荐作用域；system_server 需在管理器里手动勾选「系统框架」 -->
         <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />

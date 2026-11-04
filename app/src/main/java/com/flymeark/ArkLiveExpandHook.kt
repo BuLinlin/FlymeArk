@@ -1,6 +1,7 @@
 package com.flymeark
 
 import android.app.Notification
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
@@ -53,6 +54,9 @@ import kotlin.math.hypot
 internal object ArkLiveExpandHook {
 
     private const val TAG = "liveExpand"
+
+    /** 点击收藏后的沉降窗口：这段时间内通知标题仍是点击前的状态，不能采信 */
+    private const val FAV_SETTLE_MS = 5_000L
     private const val CTRL_CLS =
         "com.flyme.statusbar.livenotification.LiveNotificationController"
     private const val CENTRAL_CLS = "com.android.systemui.statusbar.phone.CentralSurfacesImpl"
@@ -131,19 +135,72 @@ internal object ArkLiveExpandHook {
     @Volatile private var trackDuration: Int = -1
     @Volatile private var trackPlaying: Boolean = false
 
-    // ---------------- 收藏（v3.13.3） ----------------
+    // ---------------- 收藏（v3.13.3 / v3.15.1 双向绑定） ----------------
 
-    /** QQ 音乐播放通知上「喜欢」按钮的 PendingIntent（每首歌刷新） */
+    /** 播放通知上「喜欢」按钮的 PendingIntent（每首歌刷新） */
     @Volatile private var favIntent: PendingIntent? = null
 
-    /** 从按钮标题推断的收藏状态；null=标题不带状态词，无法同步 */
+    /**
+     * 当前曲目的收藏状态（真值）。null = 所有来源都给不出（面板显示「未定」）。
+     * 真值来源优先级：MediaSession metadata extras > 通知按钮标题状态词 > 指纹学习表。
+     */
     @Volatile private var favState: Boolean? = null
+
+    /** 收藏按钮的图标指纹（同一 App 的「已收藏/未收藏」通常是两个资源 id） */
+    private var favHash: String? = null
+
+    /**
+     * 指纹 → 状态 的自学习表（持久化在 SystemUI 数据目录）。
+     *
+     * QQ 音乐不给收藏接口、按钮标题固定「收藏」，唯一能区分两态的只有按钮图标。
+     * 只要有一次从 metadata/标题拿到真值，就把「当前指纹 = 该真值」记下来，
+     * 之后同 App 任意曲目都能按指纹直接判出状态 —— 打开面板即为真实状态。
+     */
+    private val favMap = HashMap<String, Boolean>()
+    private var favMapReady = false
 
     /** 取证日志去重：每首歌只打一轮 action 列表 */
     private var favLogKey: String? = null
 
+    /** metadata extras 的 key 只打一次（用于真机确认播放器有没有暴露收藏字段） */
+    private var metaKeysLogged = false
+
     /** 上次 send 收藏 action 的时间（SystemUI 侧防抖） */
     private var lastFavSendAt = 0L
+
+    /** 上次点击的目标状态（日志用） */
+    @Volatile private var lastFavTarget: Boolean? = null
+
+    /** refreshFavFromActiveNotifications 重入保护 */
+    private var refreshingFav = false
+
+    /** SystemUI 主线程 handler（切歌后短轮询收藏状态用） */
+    private val mainHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+
+    /** 点击闭环：点击前图标指纹 + 本次目标（仅当点击前状态已知时才用于学习） */
+    @Volatile private var pendingFavHash: String? = null
+    @Volatile private var pendingFavTarget: Boolean? = null
+    @Volatile private var pendingFavLearnable = false
+
+    private fun loadFavMap(ctx: Context) {
+        if (favMapReady) return
+        favMapReady = true
+        try {
+            val sp = ctx.getSharedPreferences("flymeark_fav", Context.MODE_PRIVATE)
+            for ((k, v) in sp.all) if (v is Boolean) favMap[k] = v
+            XposedBridge.log("$TAG: fav map loaded (${favMap.size} entries)")
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun rememberFav(ctx: Context, key: String, value: Boolean) {
+        favMap[key] = value
+        try {
+            ctx.getSharedPreferences("flymeark_fav", Context.MODE_PRIVATE)
+                .edit().putBoolean(key, value).apply()
+        } catch (_: Throwable) {
+        }
+    }
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         if (lpp.packageName != ArkConstants.SYSTEMUI_PKG) return
@@ -251,7 +308,7 @@ internal object ArkLiveExpandHook {
 
             trackPlaying = (notif.flags and Notification.FLAG_ONGOING_EVENT) != 0
 
-            inspectFavoriteActions(notif)
+            inspectFavoriteActions(notif, ctx)
             pushToPanel(ctx)
         } catch (_: Throwable) {
         }
@@ -340,6 +397,17 @@ internal object ArkLiveExpandHook {
         lastPushAt = now
 
         val session = readMediaSession(c)
+        // v3.15.1：换曲后旧曲的收藏状态不能继承；随后用 metadata / 通知真值覆盖
+        if (changed) {
+            favState = null
+            favHash = null
+            refreshFavFromActiveNotifications(c)
+        }
+        session?.fav?.let { truth ->
+            favState = truth
+            loadFavMap(c)
+            favHash?.let { h -> learnFav(c, h, truth) }
+        }
         val progress = session?.position?.takeIf { it >= 0 }?.toInt() ?: trackProgress
         val duration = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
         val playing = session?.playing ?: trackPlaying
@@ -371,8 +439,17 @@ internal object ArkLiveExpandHook {
         val progress = s.position.takeIf { it >= 0 }?.toInt() ?: trackProgress
         val duration = s.duration.takeIf { it > 0 }?.toInt() ?: trackDuration
         s.clickIntent?.let { lastClickIntent = it }
+        // v3.15.1：同步收藏真值（换曲时旧值作废）
+        val trackChanged = s.title != null && s.title != trackTitle
+        if (trackChanged) {
+            favState = s.fav
+            favHash = null
+        } else {
+            s.fav?.let { favState = it }
+        }
 
         trackTitle = title
+        if (trackChanged) pollFavAfterTrackChange(c)
         trackArtist = artist
         if (cover != null) trackCover = cover
         lastPushKey = "$title|$artist"
@@ -496,44 +573,206 @@ internal object ArkLiveExpandHook {
      * 谁拿到都能 send()，正好借 SystemUI 进程代触发。
      *
      * 每首歌只打一轮全量日志（取证用），之后只做静默匹配。
-     * 状态推断：按钮标题带「已/取消」= 已收藏；只有「喜欢/收藏」= 未收藏；
-     * 标题不带状态词（固定文案）时返回 null，面板只能乐观切换。
+     *
+     * 状态真值（v3.15.1 真机日志确认）：QQ 音乐按钮标题会在「收藏」/「已收藏」之间切换，
+     * 所以标题本身就是真值 —— 「已…」= 已收藏，「喜欢/收藏」= 未收藏。
+     * 唯一坑是它滞后 1~5 秒才随通知刷新，因此点击后的沉降窗口内不采信标题。
      */
-    private fun inspectFavoriteActions(notif: Notification) {
+    private fun inspectFavoriteActions(notif: Notification, ctx: Context?) {
         val acts = notif.actions
         if (acts.isNullOrEmpty()) return
+        ctx?.let { loadFavMap(it) }
         val key = notif.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()
         if (key != null && key != favLogKey) {
             favLogKey = key
             acts.forEachIndexed { i, a ->
-                XposedBridge.log("$TAG: notif action[$i] title='${a.title}'")
+                XposedBridge.log(
+                    "$TAG: notif action[$i] title='${a.title}' icon=${a.icon}"
+                )
             }
         }
         var found: PendingIntent? = null
-        var state: Boolean? = null
+        var titleState: Boolean? = null
+        var hit: Notification.Action? = null
         for (a in acts) {
             val t = a.title?.toString()?.trim() ?: continue
-            if (t.contains("已喜欢") || t.contains("已收藏") || t.contains("取消喜欢")) {
+            if (t.contains("已喜欢") || t.contains("已收藏") ||
+                t.contains("取消喜欢") || t.contains("取消收藏")
+            ) {
                 found = a.actionIntent
-                state = true
+                titleState = true
+                hit = a
                 break
             }
             if (t.contains("喜欢") || t.contains("收藏")) {
                 found = a.actionIntent
-                state = false
+                titleState = false
+                hit = a
             }
         }
-        if (found != null) {
-            favIntent = found
-            if (state != null && state != favState) {
-                favState = state
-                XposedBridge.log("$TAG: favorite state=$state")
+        if (found == null) return
+        favIntent = found
+
+        // 图标指纹：同一 App 的「已收藏/未收藏」通常是两个资源 id
+        val hash = hit?.let { "${currentPkg ?: "?"}#${it.icon}" }
+        if (hash != null && hash != favHash) {
+            favHash = hash
+            XposedBridge.log("$TAG: fav fingerprint=$hash (title=$titleState)")
+        }
+
+        // 点击闭环：图标指纹变了说明翻转确实发生，新指纹对应的就是本次目标状态
+        val pt = pendingFavTarget
+        val ph = pendingFavHash
+        if (pt != null && hash != null && hash != ph) {
+            if (pendingFavLearnable && ctx != null) learnFav(ctx, hash, pt)
+            XposedBridge.log(
+                "$TAG: fav click closed (${ph}->$hash target=$pt learn=${pendingFavLearnable})"
+            )
+            pendingFavTarget = null
+            pendingFavHash = null
+        }
+
+        // 点击后的沉降窗口内不采信标题（标题更新滞后，这一轮反映的是点击前状态）
+        val settle = SystemClock.uptimeMillis() - lastFavSendAt < FAV_SETTLE_MS
+        if (settle) {
+            XposedBridge.log("$TAG: fav title ignored in settle window (title=$titleState)")
+            return
+        }
+
+        val learned = hash?.let { favMap[it] }
+        val state = titleState ?: learned
+        if (state != favState) {
+            favState = state
+            XposedBridge.log("$TAG: favorite state=$state (title=$titleState learned=$learned)")
+        }
+
+        // 只有拿到真值才写入学习表，避免「方向猜反」把整张表污染
+        if (titleState != null && hash != null && ctx != null) learnFav(ctx, hash, titleState)
+    }
+
+    /**
+     * v3.15.1：打开面板前主动查一次在播通知，立刻拿到最新收藏状态。
+     *
+     * 通知刷新有 1~5 秒延迟，等推送会让面板先显示「未定」。SystemUI 持有通知访问权，
+     * 可以直接读 activeNotifications 里的 action 标题，把真值同步上。
+     */
+    private fun refreshFavFromActiveNotifications(ctx: Context?) {
+        val c = ctx ?: return
+        if (refreshingFav) return   // pushToPanel(changed) 会回调本函数，防重入
+        refreshingFav = true
+        try {
+            val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            val list = nm?.activeNotifications
+            if (list != null) for (sbn in list) {
+                val pkg = sbn?.packageName ?: continue
+                if (!ArkConstants.isMediaApp(pkg)) continue
+                val n = sbn.notification ?: continue
+                if (n.actions.isNullOrEmpty()) continue
+                // 通知可能还是上一首的（切歌后 1~5 秒才刷新）：标题对不上就跳过，
+                // 否则会把上一首的收藏状态错安到新曲上。
+                val nt = n.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+                val cur = trackTitle?.trim()
+                if (!nt.isNullOrEmpty() && !cur.isNullOrEmpty() &&
+                    !nt.contains(cur) && !cur.contains(nt)
+                ) {
+                    XposedBridge.log("$TAG: fav refresh skipped (notif='$nt' cur='$cur')")
+                    continue
+                }
+                if (pkg != currentPkg) currentPkg = pkg
+                inspectFavoriteActions(n, c)
+                XposedBridge.log("$TAG: fav refreshed from active notif pkg=$pkg state=$favState")
+                break
             }
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: active notif query failed: ${t.message}")
+        } finally {
+            refreshingFav = false
+        }
+        // 状态变了要马上告诉面板（否则要等下一次歌词通知推送）
+        if (panelVisible) {
+            lastPushKey = null
+            pushToPanel(c)
         }
     }
 
-    /** 面板点 ❤ → 触发通知上的收藏按钮（PendingIntent 是 QQ 音乐自己的，send 无需权限） */
-    fun toggleFavorite(ctx: Context?) {
+    /**
+     * v3.15.1：切歌后短轮询收藏状态。
+     *
+     * 播放器通知刷新滞后 1~5 秒，切歌瞬间查到的往往还是旧通知。这里按
+     * 250/700/1500/2500ms 查几次，谁先对上曲目标题就用谁，把「延迟切状态」压到最短。
+     */
+    private fun pollFavAfterTrackChange(ctx: Context?) {
+        val c = ctx ?: return
+        val title = trackTitle ?: return
+        listOf(250L, 700L, 1_500L, 2_500L).forEach { delay ->
+            mainHandler.postDelayed({
+                if (trackTitle != title) return@postDelayed   // 又换曲了，交给新一轮轮询
+                refreshFavFromActiveNotifications(c)
+            }, delay)
+        }
+    }
+
+    /**
+     * 学到真值 → 写入指纹表（v3.15.1）。
+     *
+     * 同一 App 的图标语义是全局一致的：若本次真值与已记录的映射相反，
+     * 说明之前的映射方向反了，把该 App 的整张表取反重写（自动纠错）。
+     */
+    private fun learnFav(ctx: Context, hash: String, truth: Boolean) {
+        val pkg = hash.substringBefore('#')
+        val known = favMap[hash]
+        if (known != null && known != truth) {
+            val keys = favMap.keys.filter { it.substringBefore('#') == pkg }
+            val snapshot = keys.mapNotNull { k -> favMap[k]?.let { k to it } }
+            snapshot.forEach { (k, v) -> rememberFav(ctx, k, !v) }
+            XposedBridge.log("$TAG: fav map flipped for $pkg (${snapshot.size} entries, truth=$truth)")
+        }
+        if (favMap[hash] != truth) {
+            rememberFav(ctx, hash, truth)
+            XposedBridge.log("$TAG: fav learn '$hash' -> $truth")
+        }
+    }
+
+    /**
+     * 从 MediaSession 的 metadata extras 里找收藏字段（v3.15.1）。
+     *
+     * 播放器常把业务状态塞进 metadata.extras（key 五花八门）。这里只认
+     * 含 fav/favourite/favorite/collect/liked 的键，且值必须是可解释的
+     * Boolean/数字/字符串；找不到返回 null，不影响其他来源。
+     */
+    private fun favFromMetadata(md: MediaMetadata?): Boolean? {
+        // compileSdk 36 的公开 stub 里 MediaMetadata 没有 getExtras，运行时却有 —— 走反射取
+        val ex = try {
+            md?.let { XposedHelpers.callMethod(it, "getExtras") as? android.os.Bundle }
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        if (!metaKeysLogged) {
+            metaKeysLogged = true
+            XposedBridge.log("$TAG: metadata extras keys=${ex.keySet()}")
+        }
+        for (k in ex.keySet()) {
+            val lk = k.lowercase()
+            val hit = lk.contains("favor") || lk.contains("collect") ||
+                lk.contains("liked") || lk.endsWith(".like") || lk == "like"
+            if (!hit) continue
+            val v = ex.get(k)
+            val state = when (v) {
+                is Boolean -> v
+                is Number -> v.toInt() != 0
+                is String -> v == "1" || v.equals("true", true)
+                else -> null
+            }
+            if (state != null) {
+                XposedBridge.log("$TAG: fav from metadata '$k'=$v -> $state")
+                return state
+            }
+        }
+        return null
+    }
+
+    /** 面板点 ❤ → 触发通知上的收藏按钮（PendingIntent 是播放器自己的，send 无需权限） */
+    fun toggleFavorite(ctx: Context?, target: Boolean) {
         // v3.14.1：收藏按钮是 toggle 语义，连点会在"收藏/取消"之间抖动；
         // SystemUI 侧再兜一道 800ms 防抖（面板 600ms 之后的窗口期）
         val now = SystemClock.uptimeMillis()
@@ -541,15 +780,22 @@ internal object ArkLiveExpandHook {
             XposedBridge.log("$TAG: favorite throttled")
             return
         }
-        lastFavSendAt = now
         val pi = favIntent
         if (pi == null) {
             XposedBridge.log("$TAG: favorite skipped (no like action)")
             return
         }
+        lastFavSendAt = now
+        lastFavTarget = target
+        // 点击闭环：记下点击前的指纹与目标。只有点击前状态已知时，翻转结果才可断言
+        pendingFavHash = favHash
+        pendingFavTarget = target
+        pendingFavLearnable = favState != null
+        // 乐观置为目标状态：通知刷新若拿到真值会覆盖它，不会长期错下去
+        favState = target
         try {
             pi.send(ctx, 0, null)
-            XposedBridge.log("$TAG: favorite action sent (state=$favState)")
+            XposedBridge.log("$TAG: favorite action sent (target=$target from=${favHash})")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: favorite send failed: ${t.message}")
         }
@@ -789,6 +1035,14 @@ internal object ArkLiveExpandHook {
         val durationMs = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
         val isPlaying = session?.playing ?: playing
         session?.clickIntent?.let { lastClickIntent = it }
+        // v3.15.1：打开面板前先刷新一次收藏真值（主动查在播通知，其次 metadata，最后指纹表）
+        loadFavMap(ctx)
+        refreshFavFromActiveNotifications(ctx)
+        session?.fav?.let { truth ->
+            favState = truth
+            favHash?.let { h -> learnFav(ctx, h, truth) }
+        }
+        if (session?.fav == null) favHash?.let { favMap[it] }?.let { favState = it }
 
         val intent = Intent().apply {
             setClassName(ArkConstants.APP_PKG, PANEL_ACTIVITY)
@@ -809,6 +1063,8 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
             // v3.15：当前媒体 App 包名（右上角图标 + 跳转兜底）
             pkg?.let { putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, it) }
+            // v3.15.1：收藏真值（没有就不带，面板显示「未定」）
+            favState?.let { putExtra(ArkConstants.EXTRA_PANEL_FAV, it) }
             // 胶囊矩形：面板以它为展开动画起点（长大）与收起终点（缩回）
             capsuleRectOnScreen(ctrl)?.let { r ->
                 putExtra(ArkConstants.EXTRA_CAPSULE_LEFT, r[0])
@@ -840,7 +1096,9 @@ internal object ArkLiveExpandHook {
         val playing: Boolean,
         val art: Bitmap?,
         /** 媒体 App 的跳转 PendingIntent（v3.13，点面板卡片空白处拉起 App） */
-        val clickIntent: PendingIntent? = null
+        val clickIntent: PendingIntent? = null,
+        /** v3.15.1：metadata extras 里的收藏真值（没有则为 null） */
+        val fav: Boolean? = null
     )
 
     /**
@@ -863,7 +1121,8 @@ internal object ArkLiveExpandHook {
                 playing = ps?.state == PlaybackState.STATE_PLAYING,
                 art = md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
                     ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART),
-                clickIntent = ctrl.sessionActivity
+                clickIntent = ctrl.sessionActivity,
+                fav = favFromMetadata(md)
             )
         }
     } catch (t: Throwable) {

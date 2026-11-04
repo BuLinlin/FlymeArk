@@ -80,7 +80,10 @@ internal object SystemUILiveHost {
                     )
 
                     // v3.13.3：收藏 → 触发 QQ 音乐通知上的「喜欢」按钮
-                    ArkConstants.ACTION_PANEL_FAVORITE -> ArkLiveExpandHook.toggleFavorite(context)
+                    ArkConstants.ACTION_PANEL_FAVORITE -> ArkLiveExpandHook.toggleFavorite(
+                        context,
+                        intent.getBooleanExtra(ArkConstants.EXTRA_FAV_TARGET, true)
+                    )
 
                     // v3.15：输出切换 —— 列出/切换当前媒体 App 的音频输出路由
                     ArkConstants.ACTION_PANEL_OUTPUT_LIST ->
