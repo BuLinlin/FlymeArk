@@ -1417,3 +1417,39 @@ fav already=false, skip send                       ← 幂等短路
 
 - LSPosed 管理器里的模块信息是缓存的，重新打开管理器或下拉刷新才会看到新描述。
 - versionCode 33 / 3.15.12
+
+## 2026-11-04 · v3.15.13｜实况开关判定加时长防抖，修「点收藏概率导致胶囊丢失」
+
+**起因**：用户反馈「在音乐端点收藏/取消，会概率触发胶囊重绘导致胶囊丢失」。
+
+### 取证（真机日志两次复现，同一现象）
+
+```
+18:22:11.563 allowLive(com.netease.cloudmusic) = true        ← 正常
+18:22:17.510 raw=false uid=10213 ...                          ← 瞬时抖动：false
+18:22:17.511 allowLive(com.netease.cloudmusic) = false
+18:22:17.511 liveLyric: switch OFF -> capsule released       ← 胶囊被释放！
+18:22:21.679 raw=true  ...
+18:22:21.680 liveLyric: mIsMediaShow forced true             ← 4 秒后才重建
+```
+
+18:05:21（QQ 音乐）同样出现 `raw=false → 1.6s 后 raw=true`。
+
+### 根因
+
+在音乐端点收藏/取消，会触发**播放通知重建**；此时 `getNotificationLiveAllowForPackage`
+在 system_server 侧会短暂返回一次 `false`（实测 1.6s~4.2s 后自己恢复 true），
+而用户的实况开关根本没动。旧门控逻辑把这次瞬时 false 当成「用户关了开关」，
+立即执行 `switch OFF -> capsule released` 释放胶囊 —— 这就是「点收藏概率导致胶囊丢失」。
+
+### 修复（LiveAllowGate 时长防抖）
+
+- 关闭判定从「读到 false 就关」改为**时长防抖**：从第一次读到 false 起计时，
+  **持续超过 6 秒仍为 false 才认定真关闭**（覆盖实测最大 4.2s 抖动窗口）。
+- 抖动窗口内仍按「开着」返回，日志打 `false hold xxxms/6000ms`，胶囊不释放。
+- 防抖计时按**包名隔离**（`offHoldPkg`），避免网易云/QQ音乐切换时共用计时互相污染。
+- 读到 true 立即清零待确认关闭计时。
+
+用户真实关开关是持久性 false，6 秒后仍会正确释放胶囊，不影响「关开关 → 胶囊消失」的正常行为。
+
+- versionCode 34 / 3.15.13
