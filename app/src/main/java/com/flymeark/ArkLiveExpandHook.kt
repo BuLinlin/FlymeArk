@@ -119,6 +119,16 @@ internal object ArkLiveExpandHook {
 
     private var lastPushAt = 0L
 
+    /**
+     * v3.15.3：pushToPanel 重入锁。
+     *
+     * v3.15.2 的致命 bug：pushToPanel(changed) → refreshFavFromActiveNotifications()
+     * → 结尾 lastPushKey=null 后回推 pushToPanel(changed 必为 true) → 无限互递归，
+     * SystemUI 主线程卡死 5s 触发 ANR，随后被系统反复杀死（表现为「上一首/下一首/
+     * 暂停全部失效 + 系统界面崩溃」）。这里把推送本身做成不可重入。
+     */
+    private var pushing = false
+
     // ---------------- 曲目缓存（由 ArkLiveCoverHook 在每次歌词刷新时写入） ----------------
 
     @Volatile private var trackTitle: String? = null
@@ -384,38 +394,53 @@ internal object ArkLiveExpandHook {
      *  - 换曲 → 立刻推（带封面）
      *  - 同曲 → 最多每秒推一次，用来对齐进度（拖动进度条后也能纠正）
      */
-    private fun pushToPanel(ctx: Context?) {
+    private fun pushToPanel(ctx: Context?, force: Boolean = false) {
         if (!panelVisible) return
         val c = ctx ?: return
+        // v3.15.3：重入锁必须在最前面 —— 下面的 refreshFavFromActiveNotifications
+        // 会回调回来，没有它就会无限互递归（见 pushing 字段注释）。
+        if (pushing) return
         val title = trackTitle?.takeIf { it.isNotBlank() } ?: return
         val artist = trackArtist.orEmpty()
         val key = "$title|$artist"
         val now = SystemClock.uptimeMillis()
-        val changed = key != lastPushKey
+        // 曲目变化 → 必须让面板换封面、重查收藏；强制推送（收藏轮询）只是刷新同一首
+        val trackChanged = key != lastPushKey
+        val changed = force || trackChanged
         if (!changed && now - lastPushAt < 1_000L) return
         lastPushKey = key
         lastPushAt = now
 
-        val session = readMediaSession(c)
-        // v3.15.1：换曲后旧曲的收藏状态不能继承；随后用 metadata / 通知真值覆盖
-        if (changed) {
-            favState = null
-            favHash = null
-            refreshFavFromActiveNotifications(c)
-        }
-        session?.fav?.let { truth ->
-            favState = truth
-            loadFavMap(c)
-            favHash?.let { h -> learnFav(c, h, truth) }
-        }
-        val progress = session?.position?.takeIf { it >= 0 }?.toInt() ?: trackProgress
-        val duration = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
-        val playing = session?.playing ?: trackPlaying
-        session?.clickIntent?.let { lastClickIntent = it }
+        pushing = true
+        try {
+            val session = readMediaSession(c)
+            // v3.15.1：换曲后旧曲的收藏状态不能继承；随后用 metadata / 通知真值覆盖
+            if (trackChanged) {
+                favState = null
+                favHash = null
+                refreshFavFromActiveNotifications(c)
+            }
+            session?.fav?.let { truth ->
+                favState = truth
+                loadFavMap(c)
+                favHash?.let { h -> learnFav(c, h, truth) }
+            }
+            val progress = session?.position?.takeIf { it >= 0 }?.toInt() ?: trackProgress
+            val duration = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
+            val playing = session?.playing ?: trackPlaying
+            session?.clickIntent?.let { lastClickIntent = it }
 
-        sendTrack(c, title, artist, progress, duration, playing, if (changed) trackCover else null, lastClickIntent)
-        if (changed) {
-            XposedBridge.log("$TAG: push track '$title' pos=$progress/$duration playing=$playing")
+            sendTrack(
+                c, title, artist, progress, duration, playing,
+                if (changed) trackCover else null, lastClickIntent
+            )
+            if (changed) {
+                XposedBridge.log("$TAG: push track '$title' pos=$progress/$duration playing=$playing")
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: pushToPanel failed: ${t.message}")
+        } finally {
+            pushing = false
         }
     }
 
@@ -688,11 +713,10 @@ internal object ArkLiveExpandHook {
         } finally {
             refreshingFav = false
         }
-        // 状态变了要马上告诉面板（否则要等下一次歌词通知推送）
-        if (panelVisible) {
-            lastPushKey = null
-            pushToPanel(c)
-        }
+        // v3.15.3：这里**不能**再回推面板。
+        // v3.15.2 在这里写 pushToPanel(c) 并把 lastPushKey 清空，等于强制 changed=true，
+        // 而 pushToPanel(changed) 又会回调本函数 → 无限互递归 → SystemUI 主线程 ANR 崩溃。
+        // 现在本函数只负责刷新状态，推送由调用方按需发起（pushToPanel 顺带、轮询后显式 force 推）。
     }
 
     /**
@@ -708,6 +732,8 @@ internal object ArkLiveExpandHook {
             mainHandler.postDelayed({
                 if (trackTitle != title) return@postDelayed   // 又换曲了，交给新一轮轮询
                 refreshFavFromActiveNotifications(c)
+                // v3.15.3：refresh 不再自己回推（那会无限递归），由这里显式推一次
+                if (panelVisible) pushToPanel(c, force = true)
             }, delay)
         }
     }

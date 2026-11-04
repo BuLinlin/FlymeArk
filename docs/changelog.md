@@ -960,3 +960,54 @@ dumpsys 发现**网易云的 MediaSession 带 custom actions**：
 - 已收藏的歌 → 打开面板 ❤ 即点亮；切到未收藏的歌 → ❤ 数百 ms 内变空心/未定
 - 点 ❤ 收藏 / 取消，5 秒后 ❤ 与 QQ 音乐状态一致
 - 收藏若干首后重启手机，打开面板 ❤ 状态仍正确（学习表持久化）
+
+## 2026-11-04 · v3.15.3｜紧急修复：面板一点就 ANR，系统界面崩溃
+
+**现象**（真机）：打开面板后点上一首/下一首/暂停**全部无响应**，随后 SystemUI 报
+「系统界面已停止运行」，反复重启。
+
+**取证**：`/data/anr/anr_2026-11-04-17-18-29-678`
+
+```
+"main" prio=5 tid=1 Runnable
+  at java.lang.Character.isWhitespace(...)
+  at com.flymeark.ArkLiveExpandHook.pushToPanel
+  at com.flymeark.ArkLiveExpandHook.refreshFavFromActiveNotifications
+  at com.flymeark.ArkLiveExpandHook.pushToPanel
+  at com.flymeark.ArkLiveExpandHook.refreshFavFromActiveNotifications
+  ...（同一对栈帧重复数百层）
+```
+
+`ANR in com.android.systemui` / `Reason: Input dispatching timed out (Waited 5016ms)`，
+随后 `Process com.android.systemui has crashed too many times, killing!`
+
+### 根因：两个方法无限互递归
+
+v3.15.2 为了让「切歌后收藏状态尽快更新」加了两处互相调用的逻辑：
+
+1. `pushToPanel(changed=true)` → `refreshFavFromActiveNotifications()`
+2. `refreshFavFromActiveNotifications()` 结尾 → `lastPushKey = null; pushToPanel()`
+
+`lastPushKey = null` 让第 2 步的 `pushToPanel` 一定判成 `changed=true`，
+又回到第 1 步。而 `refreshingFav` 这个"重入保护"写在 `finally` 里、**在回调
+`pushToPanel` 之前就已复位**，等于完全没生效 → 主线程原地打转，5 秒后 ANR，
+被系统判为反复崩溃直接杀掉系统界面。按钮"全部失效"是主线程已经卡死的结果，
+不是三个按钮各自的问题。
+
+### 修复（三道防线）
+
+1. **`pushToPanel` 加真正的重入锁 `pushing`**：进入即置位、`finally` 复位，
+   重入直接 return。递归链在这一步被切断。
+2. **`refreshFavFromActiveNotifications` 不再回推面板**：它只负责刷新
+   `favState/favHash/favIntent`，推送由调用方发起（`pushToPanel` 自身顺带；
+   切歌轮询在 refresh 后显式 `pushToPanel(c, force = true)`）。职责分离后
+   不存在 A↔B 环。
+3. **`SystemUILiveHost.onReceive` 整体 try-catch**：这是 SystemUI 主线程的广播
+   回调，任何未捕获异常都会直接打死系统界面。现在异常只记日志，不影响系统。
+
+### 顺带修正
+
+- `pushToPanel` 增加 `force` 参数，区分「换曲」（清收藏、带封面）与「同曲刷新」
+  （只为更新收藏状态，不清 favState），避免收藏轮询把状态打回「未定」。
+- 收藏轮询仍保留 250/700/1500/2500ms 四档，双向绑定的实时性不变。
+

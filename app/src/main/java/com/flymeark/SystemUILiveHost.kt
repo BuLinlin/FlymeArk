@@ -69,45 +69,58 @@ internal object SystemUILiveHost {
                 // v2.6：只接播放面板的媒体键请求。
                 // v2.2 的「播放器媒体事件 → SystemUI 代发实况通知」已废弃：
                 // 方舟不再自己发胶囊，避免与 QQ音乐 原生 ticker 胶囊冲突。
-                when (intent.action) {
-                    ArkConstants.ACTION_PANEL_MEDIA_KEY -> dispatchPanelKey(context, intent)
+                //
+                // v3.15.3：整体兜底 —— 这是 SystemUI 主线程上的广播回调，任何未捕获异常
+                // 都会直接打死系统界面（面板上按钮「点了就崩」就是这个后果）。
+                try {
+                    when (intent.action) {
+                        ArkConstants.ACTION_PANEL_MEDIA_KEY -> dispatchPanelKey(context, intent)
 
-                    // v3.13.2：播放/暂停改为显式目标状态，不再发 toggle 媒体键
-                    // （连点 PLAY_PAUSE 会被判成双击切歌）
-                    ArkConstants.ACTION_PANEL_PLAYBACK -> ArkLiveExpandHook.setPlayback(
-                        context,
-                        intent.getBooleanExtra(ArkConstants.EXTRA_PLAY_TARGET, true)
-                    )
-
-                    // v3.13.3：收藏 → 触发 QQ 音乐通知上的「喜欢」按钮
-                    ArkConstants.ACTION_PANEL_FAVORITE -> ArkLiveExpandHook.toggleFavorite(
-                        context,
-                        intent.getBooleanExtra(ArkConstants.EXTRA_FAV_TARGET, true)
-                    )
-
-                    // v3.15：输出切换 —— 列出/切换当前媒体 App 的音频输出路由
-                    ArkConstants.ACTION_PANEL_OUTPUT_LIST ->
-                        ArkLiveExpandHook.outputRoutes(context)
-
-                    ArkConstants.ACTION_PANEL_OUTPUT_TRANSFER ->
-                        ArkLiveExpandHook.transferOutput(
+                        // v3.13.2：播放/暂停改为显式目标状态，不再发 toggle 媒体键
+                        // （连点 PLAY_PAUSE 会被判成双击切歌）
+                        ArkConstants.ACTION_PANEL_PLAYBACK -> ArkLiveExpandHook.setPlayback(
                             context,
-                            intent.getStringExtra(ArkConstants.EXTRA_ROUTE_ID)
+                            intent.getBooleanExtra(ArkConstants.EXTRA_PLAY_TARGET, true)
                         )
 
-                    // v3.1：面板展开/收起 → 淡出/恢复状态栏胶囊
-                    ArkConstants.ACTION_PANEL_STATE -> {
-                        val visible =
-                            intent.getBooleanExtra(ArkConstants.EXTRA_PANEL_VISIBLE, false)
-                        ArkLiveExpandHook.setPanelVisible(visible)
+                        // v3.13.3：收藏 → 触发 QQ 音乐通知上的「喜欢」按钮
+                        ArkConstants.ACTION_PANEL_FAVORITE -> ArkLiveExpandHook.toggleFavorite(
+                            context,
+                            intent.getBooleanExtra(ArkConstants.EXTRA_FAV_TARGET, true)
+                        )
+
+                        // v3.15：输出切换 —— 列出/切换当前媒体 App 的音频输出路由
+                        ArkConstants.ACTION_PANEL_OUTPUT_LIST ->
+                            ArkLiveExpandHook.outputRoutes(context)
+
+                        ArkConstants.ACTION_PANEL_OUTPUT_TRANSFER ->
+                            ArkLiveExpandHook.transferOutput(
+                                context,
+                                intent.getStringExtra(ArkConstants.EXTRA_ROUTE_ID)
+                            )
+
+                        // v3.1：面板展开/收起 → 淡出/恢复状态栏胶囊
+                        ArkConstants.ACTION_PANEL_STATE -> {
+                            val visible =
+                                intent.getBooleanExtra(ArkConstants.EXTRA_PANEL_VISIBLE, false)
+                            ArkLiveExpandHook.setPanelVisible(visible)
+                        }
+
+                        // v3.1：面板要求立即同步曲目（切歌后不用等歌词通知刷新）
+                        ArkConstants.ACTION_PANEL_SYNC -> ArkLiveExpandHook.syncNow(context)
+
+                        // v3.13：面板拖动进度条 → seekTo（需 system uid）
+                        ArkConstants.ACTION_PANEL_SEEK ->
+                            ArkLiveExpandHook.seekTo(
+                                context,
+                                intent.getLongExtra(ArkConstants.EXTRA_SEEK_POSITION, -1L)
+                            )
                     }
-
-                    // v3.1：面板要求立即同步曲目（切歌后不用等歌词通知刷新）
-                    ArkConstants.ACTION_PANEL_SYNC -> ArkLiveExpandHook.syncNow(context)
-
-                    // v3.13：面板拖动进度条 → seekTo（需 system uid）
-                    ArkConstants.ACTION_PANEL_SEEK ->
-                        ArkLiveExpandHook.seekTo(context, intent.getLongExtra(ArkConstants.EXTRA_SEEK_POSITION, -1L))
+                } catch (t: Throwable) {
+                    XposedBridge.log(
+                        "[${ArkConstants.LOG_TAG}] onReceive ${intent.action} failed: " +
+                            Log.getStackTraceString(t)
+                    )
                 }
             }
         }
