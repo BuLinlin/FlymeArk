@@ -212,6 +212,58 @@ internal object ArkLiveExpandHook {
         }
     }
 
+    // ---------------- 按曲目记忆收藏状态（v3.15.4） ----------------
+
+    /**
+     * 曲目 → 收藏状态 的本地记忆表，key = `pkg#标题`。
+     *
+     * 为什么需要它：播放器的**通知**才带收藏真值，而通知刷新比切歌慢 1~5 秒
+     * （QQ 音乐要在自己的主线程里重建通知）。切歌瞬间我们只能清空状态等通知，
+     * 用户看到的就是「明明是收藏的歌，❤ 却要过好几秒才亮」。
+     *
+     * 这里把每首歌**已知的真值**（来自通知、metadata 或用户点击）按曲目存下来：
+     *  · 切歌/打开面板时先查本表 → 立即显示正确状态（0 延迟）
+     *  · 通知真值到达后仍然覆盖（用户在 QQ 音乐里改过收藏也能纠正）
+     * 只对「从没见过的曲目」保留一次等待，之后永久命中。
+     */
+    private val trackFavMap = HashMap<String, Boolean>()
+    private var trackFavLoaded = false
+
+    private fun trackFavKey(pkg: String?, title: String?): String? {
+        val p = pkg?.takeIf { it.isNotBlank() } ?: return null
+        val t = title?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return "$p#$t"
+    }
+
+    private fun loadTrackFav(ctx: Context) {
+        if (trackFavLoaded) return
+        trackFavLoaded = true
+        try {
+            val sp = ctx.getSharedPreferences("flymeark_track_fav", Context.MODE_PRIVATE)
+            for ((k, v) in sp.all) if (v is Boolean) trackFavMap[k] = v
+            XposedBridge.log("$TAG: track fav loaded (${trackFavMap.size} entries)")
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun rememberTrackFav(ctx: Context, key: String?, value: Boolean) {
+        key ?: return
+        if (trackFavMap[key] == value) return
+        trackFavMap[key] = value
+        try {
+            ctx.getSharedPreferences("flymeark_track_fav", Context.MODE_PRIVATE)
+                .edit().putBoolean(key, value).apply()
+            XposedBridge.log("$TAG: track fav memo '$key' -> $value")
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun trackFavOf(ctx: Context, key: String?): Boolean? {
+        key ?: return null
+        loadTrackFav(ctx)
+        return trackFavMap[key]
+    }
+
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         if (lpp.packageName != ArkConstants.SYSTEMUI_PKG) return
 
@@ -416,8 +468,15 @@ internal object ArkLiveExpandHook {
             val session = readMediaSession(c)
             // v3.15.1：换曲后旧曲的收藏状态不能继承；随后用 metadata / 通知真值覆盖
             if (trackChanged) {
-                favState = null
                 favHash = null
+                // v3.15.4：换曲作废「点击后沉降窗口」与点击闭环 —— 那是上一首的语境，
+                // 不清掉会让新歌的标题真值被静默 5 秒、❤ 白等
+                lastFavSendAt = 0L
+                pendingFavTarget = null
+                pendingFavHash = null
+                // v3.15.4：先用「按曲目记忆」立刻给出状态（这首听过就 0 延迟），
+                // 再用通知真值校正 —— 通知要 1~5 秒才刷到新歌，不能让用户干等
+                favState = trackFavOf(c, trackFavKey(currentPkg, title))
                 refreshFavFromActiveNotifications(c)
             }
             session?.fav?.let { truth ->
@@ -467,8 +526,13 @@ internal object ArkLiveExpandHook {
         // v3.15.1：同步收藏真值（换曲时旧值作废）
         val trackChanged = s.title != null && s.title != trackTitle
         if (trackChanged) {
-            favState = s.fav
             favHash = null
+            // v3.15.4：换曲作废点击沉降窗口/闭环（上一首的语境）
+            lastFavSendAt = 0L
+            pendingFavTarget = null
+            pendingFavHash = null
+            // v3.15.4：session 没给收藏时用「按曲目记忆」顶上，避免面板先显示未定再点亮
+            favState = s.fav ?: trackFavOf(c, trackFavKey(currentPkg, title))
         } else {
             s.fav?.let { favState = it }
         }
@@ -673,6 +737,11 @@ internal object ArkLiveExpandHook {
 
         // 只有拿到真值才写入学习表，避免「方向猜反」把整张表污染
         if (titleState != null && hash != null && ctx != null) learnFav(ctx, hash, titleState)
+        // v3.15.4：真值同时按曲目记账 —— 下次切到这首无需再等通知刷新
+        if (titleState != null && ctx != null) {
+            val nt = notif.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+            rememberTrackFav(ctx, trackFavKey(currentPkg, nt), titleState)
+        }
     }
 
     /**
@@ -728,7 +797,7 @@ internal object ArkLiveExpandHook {
     private fun pollFavAfterTrackChange(ctx: Context?) {
         val c = ctx ?: return
         val title = trackTitle ?: return
-        listOf(250L, 700L, 1_500L, 2_500L).forEach { delay ->
+        listOf(250L, 700L, 1_500L, 2_500L, 4_000L).forEach { delay ->
             mainHandler.postDelayed({
                 if (trackTitle != title) return@postDelayed   // 又换曲了，交给新一轮轮询
                 refreshFavFromActiveNotifications(c)
@@ -819,6 +888,8 @@ internal object ArkLiveExpandHook {
         pendingFavLearnable = favState != null
         // 乐观置为目标状态：通知刷新若拿到真值会覆盖它，不会长期错下去
         favState = target
+        // v3.15.4：用户意图立刻按曲目记账 —— 之后再切回这首，❤ 直接就是目标状态
+        if (ctx != null) rememberTrackFav(ctx, trackFavKey(currentPkg, trackTitle), target)
         try {
             pi.send(ctx, 0, null)
             XposedBridge.log("$TAG: favorite action sent (target=$target from=${favHash})")
@@ -1069,6 +1140,8 @@ internal object ArkLiveExpandHook {
             favHash?.let { h -> learnFav(ctx, h, truth) }
         }
         if (session?.fav == null) favHash?.let { favMap[it] }?.let { favState = it }
+        // v3.15.4：通知还没刷到这首时，用按曲目记忆兜底（比指纹表更准，直接对应这首歌）
+        if (favState == null) favState = trackFavOf(ctx, trackFavKey(pkg, title))
 
         val intent = Intent().apply {
             setClassName(ArkConstants.APP_PKG, PANEL_ACTIVITY)

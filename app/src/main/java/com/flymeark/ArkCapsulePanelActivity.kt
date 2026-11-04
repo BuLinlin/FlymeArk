@@ -353,6 +353,10 @@ class ArkCapsulePanelActivity : Activity() {
             titleChanged = true
             // v3.15.1：换曲后收藏状态归零为「未定」，等 SystemUI 推新曲真值，别继承上一首
             favKnown = false
+            // v3.15.4：换曲即作废「点击后 5 秒不看推送」的锁。
+            // 那把锁只防「同一首」通知滞后把刚点的 ❤ 冲掉；换到新歌还锁着，
+            // 会让新歌的状态白等 5 秒（用户实测「切歌后要好几秒」的成因之一）。
+            lastFavAt = 0L
             // 换曲方向：按用户按的是上一首还是下一首决定封面滑入方向
             dir = pendingDir
             pendingDir = 1
