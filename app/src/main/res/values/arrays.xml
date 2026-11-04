@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- LSPosed 推荐作用域：安装后管理器据此提示勾选。
-         注意：系统框架（system_server）无法通过 xposedscope 声明，需在管理器手动勾选「系统框架」。 -->
+         「android」= 系统框架（system_server），用于感知用户切换「实况通知」开关的动作，
+         让关闭开关实时生效（hook setNotificationLiveAllowForPackage）。 -->
     <string-array name="xposed_scope">
+        <!-- 系统框架（system_server）：感知实况通知开关的「用户动作」，关闭实时生效 -->
+        <item>android</item>
         <!-- 目标播放器：QQ音乐（打开魅族状态栏歌词通道） -->
         <item>com.tencent.qqmusic</item>
         <!-- 目标播放器：网易云音乐（同为魅族状态栏歌词协议，v3.15 起支持） -->

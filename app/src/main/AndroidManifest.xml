@@ -39,7 +39,7 @@
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription" android:value="一个针对魅族实况通知的优化模块插件。在 LSPosed 中勾选并启用推荐应用，然后到 设置-通知与状态栏-实况通知 里打开对应 App 的开关即可&#10;开发者：多爱梦" />
         <meta-data android:name="xposedminversion" android:value="82" />
-        <!-- 推荐作用域；system_server 需在管理器里手动勾选「系统框架」 -->
+        <!-- 推荐作用域（含系统框架 android，安装时即可勾选） -->
         <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
     </application>
 </manifest>
