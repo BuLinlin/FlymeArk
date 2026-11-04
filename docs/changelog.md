@@ -2,6 +2,45 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-04 晚 · v3.15.18 补丁（进行中，待真机验证）
+
+### 一、消息胶囊头像修复（已验证生效）
+
+真机验证发现左侧图标显示的是微信/QQ 的 APP 图标而非发送者头像。根因：微信把发送者
+头像放在 `extras["android.largeIcon"]`（`Icon` 对象，约 140~144px），**不在**
+`n.getLargeIcon()` 返回的 Bitmap 上。修复 `ArkMessageLiveInjector.messageIcon`：
+优先读 `extras["android.largeIcon"]`（现成 `Icon`，直接 putParcelable 进 capsule
+子 Bundle 的 `notification.live.capsuleIcon`），不再从 Bitmap 重新构造。
+
+用户已确认：**头像正确显示**。
+
+### 二、消息文字显示修复（已编译，待验证）
+
+真机 dump 确认 `LiveNotificationInfo.showText` 有完整内容（如 `玄圭互联-chihiro: 111`），
+但视觉上不显示。根因（反编译 `LiveNotificationView.setLiveNotificationInfo`）：
+
+- showType=0/2/3/4/5 → 用 `showText` 渲染（各自内容，正确）
+- showType=1/6 → 用 `topDisplayText` 渲染，而该值是 `updateStatusBarIcons` 里的
+  **全局共享变量**（第 1420 行 `getTopLyricsDisplayText("")` 的返回值），
+  消息通知无歌词属性 → 为空 → 副显示位胶囊文字空白
+
+修复：新增 `ArkMessageLiveTextHook`（SystemUI 侧），hook
+`LiveNotificationInfo.setShowType`：当 `packageName` 是微信/QQ 且传入 showType=1
+（副显示位）时改为 0，让消息胶囊始终走 showText 分支显示各自内容。
+
+> 中间废弃方案：曾 hook `getTopLyricsDisplayText` 回填第一条消息的正文，但 r4 全局
+> 共享会导致所有副显示位胶囊显示同一条消息的内容（QQ 胶囊显示微信消息），已重写。
+
+### 三、遗留问题（明天继续）
+
+1. **消息与音乐胶囊共存**：`updateStatusBarIcons` 第 1416 行 `mNotificationEntries`
+   非空时跳过 `getTopLyricsDisplayText`，但**结尾第 1506 行还有一次无条件调用**，
+   音乐胶囊理论上应能共存（进副显示位），需真机验证共存表现再定是否需要 hook。
+2. **滑动销毁**：消息胶囊目前只能点进消息才销毁，应支持滑动销毁，未开始。
+3. 该补丁 APK 编译成功但**安装/重启被打断，尚未装机验证**。
+
+---
+
 ## 2026-11-04 · v3.15.18｜新增微信/QQ 消息实况通知（参考「魅况」，本版收尾）
 
 ### 一、微信/QQ 消息实况胶囊

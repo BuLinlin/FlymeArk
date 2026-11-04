@@ -101,20 +101,22 @@ internal object ArkMessageLiveInjector {
     }
 
     /**
-     * 取消息发送者头像。优先 largeIcon（Bitmap 转 Icon），兜底 smallIcon（已是 Icon）。
-     * largeIcon 为 null 时用 smallIcon；两者都无则返回 null（胶囊左侧留空，只有文字）。
+     * 取消息发送者头像。优先取 extras 里现成的 `android.largeIcon`（已经是 Icon 类型，
+     * 微信/QQ 消息通知把发送者头像放这里，跨进程 parcel 不会丢）；其次 `getLargeIcon()`
+     * 拿 Bitmap 构造；最后兜底 `getSmallIcon()`。
+     *
+     * 注意：不要用 `Icon.createWithBitmap` 重新构造——实测该 Icon 跨进程 parcel 到
+     * SystemUI 后 `getCapsuleIcon()` 读回为 null（Bitmap 类型序列化丢失），导致胶囊
+     * 左侧回退成 APP 图标。直接用通知里现成的 `android.largeIcon`（Icon）最稳。
      */
     private fun messageIcon(n: Notification): Icon? {
-        val large = try { n.getLargeIcon() } catch (_: Throwable) { null }
-        if (large is Bitmap && !large.isRecycled) {
-            try {
-                return Icon.createWithBitmap(large)
-            } catch (_: Throwable) {
-            }
+        // 1) extras 里现成的 android.largeIcon（Icon 类型，最稳）
+        try {
+            val fromExtras = n.extras?.getParcelable<Icon>("android.largeIcon")
+            if (fromExtras != null) return fromExtras
+        } catch (_: Throwable) {
         }
-        val small = try { n.getSmallIcon() } catch (_: Throwable) { null }
-        if (small != null) return small
-        // 兜底：extras 里的 EXTRA_LARGE_ICON_BIG 或 EXTRA_PICTURE
+        // 2) EXTRA_LARGE_ICON_BIG 里的 Bitmap
         try {
             val extraLarge = n.extras?.getParcelable<Bitmap>(Notification.EXTRA_LARGE_ICON_BIG)
             if (extraLarge != null && !extraLarge.isRecycled) {
@@ -122,7 +124,16 @@ internal object ArkMessageLiveInjector {
             }
         } catch (_: Throwable) {
         }
-        return null
+        // 3) getLargeIcon() 拿 Bitmap 构造
+        val large = try { n.getLargeIcon() } catch (_: Throwable) { null }
+        if (large is Bitmap && !large.isRecycled) {
+            try {
+                return Icon.createWithBitmap(large)
+            } catch (_: Throwable) {
+            }
+        }
+        // 4) 兜底 smallIcon
+        return try { n.getSmallIcon() } catch (_: Throwable) { null }
     }
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {

@@ -36,6 +36,8 @@ class ArkEntry : IXposedHookLoadPackage {
                 SystemUILiveHost.install(lpp)
                 // 放开歌词胶囊门控（mIsMediaShow 恒 false）
                 ArkLiveLyricHook.install(lpp)
+                // 微信/QQ 消息胶囊文字渲染补丁（副显示位 topDisplayText 空白修复）
+                ArkMessageLiveTextHook.install(lpp)
                 // 专辑封面写入 smallIcon + 清 showType=5 单色滤镜
                 ArkLiveCoverHook.install(lpp)
                 // 胶囊宽度收窄 + 歌词横向滑入
