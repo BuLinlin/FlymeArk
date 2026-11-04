@@ -18,16 +18,11 @@
     android:focusable="true">
 
     <!--
-      v3.13：音乐壁纸背景 —— 专辑封面放大模糊 + 提饱和 + 噪点（ArkBackdrop 生成）。
-      放在卡片之下全屏铺开，点空白收起的透明区域也盖着它。
+      v3.13.3：背景改成系统同款玻璃。
+      模糊由窗口 blurBehindRadius（真实壁纸）完成；玻璃染色 scrim 在代码里
+      根据 SystemUI 推来的深浅模式铺在 panel_root 上（对齐媒体卡 0xB2 染色）。
+      v3.13 的「专辑封面糊满全屏」背景整体移除。
     -->
-    <ImageView
-        android:id="@+id/panel_backdrop"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:contentDescription="@null"
-        android:importantForAccessibility="no"
-        android:scaleType="centerCrop" />
 
     <FrameLayout
         android:id="@+id/panel_card"
@@ -147,41 +142,84 @@
                     android:text="00:00" />
             </LinearLayout>
 
-            <!-- 控制按钮 -->
+            <!--
+              控制按钮（v3.13.3）：❤ 上一首 播放 下一首，对齐系统媒体卡布局。
+              四个按钮用 weight 均匀分布，播放键仍是视觉中心（尺寸更大）。
+            -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
-                android:gravity="center"
+                android:baselineAligned="false"
                 android:orientation="horizontal">
 
-                <ImageView
-                    android:id="@+id/panel_prev"
-                    android:layout_width="46dp"
-                    android:layout_height="46dp"
-                    android:background="?android:attr/selectableItemBackgroundBorderless"
-                    android:contentDescription="@string/ark_panel_prev"
-                    android:padding="11dp"
-                    android:src="@drawable/ic_ark_prev" />
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:orientation="horizontal">
 
-                <ImageView
-                    android:id="@+id/panel_play"
-                    android:layout_width="58dp"
-                    android:layout_height="58dp"
-                    android:layout_marginHorizontal="26dp"
-                    android:background="@drawable/bg_ark_play_btn"
-                    android:contentDescription="@string/ark_panel_play"
-                    android:padding="16dp"
-                    android:src="@drawable/ic_ark_play" />
+                    <ImageView
+                        android:id="@+id/panel_fav"
+                        android:layout_width="46dp"
+                        android:layout_height="46dp"
+                        android:background="?android:attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="@string/ark_panel_fav"
+                        android:padding="11dp"
+                        android:src="@drawable/ic_ark_fav" />
+                </LinearLayout>
 
-                <ImageView
-                    android:id="@+id/panel_next"
-                    android:layout_width="46dp"
-                    android:layout_height="46dp"
-                    android:background="?android:attr/selectableItemBackgroundBorderless"
-                    android:contentDescription="@string/ark_panel_next"
-                    android:padding="11dp"
-                    android:src="@drawable/ic_ark_next" />
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:orientation="horizontal">
+
+                    <ImageView
+                        android:id="@+id/panel_prev"
+                        android:layout_width="46dp"
+                        android:layout_height="46dp"
+                        android:background="?android:attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="@string/ark_panel_prev"
+                        android:padding="11dp"
+                        android:src="@drawable/ic_ark_prev" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:orientation="horizontal">
+
+                    <ImageView
+                        android:id="@+id/panel_play"
+                        android:layout_width="58dp"
+                        android:layout_height="58dp"
+                        android:background="@drawable/bg_ark_play_btn"
+                        android:contentDescription="@string/ark_panel_play"
+                        android:padding="16dp"
+                        android:src="@drawable/ic_ark_play" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:orientation="horizontal">
+
+                    <ImageView
+                        android:id="@+id/panel_next"
+                        android:layout_width="46dp"
+                        android:layout_height="46dp"
+                        android:background="?android:attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="@string/ark_panel_next"
+                        android:padding="11dp"
+                        android:src="@drawable/ic_ark_next" />
+                </LinearLayout>
             </LinearLayout>
         </LinearLayout>
     </FrameLayout>

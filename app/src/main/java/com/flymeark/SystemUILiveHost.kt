@@ -79,6 +79,9 @@ internal object SystemUILiveHost {
                         intent.getBooleanExtra(ArkConstants.EXTRA_PLAY_TARGET, true)
                     )
 
+                    // v3.13.3：收藏 → 触发 QQ 音乐通知上的「喜欢」按钮
+                    ArkConstants.ACTION_PANEL_FAVORITE -> ArkLiveExpandHook.toggleFavorite(context)
+
                     // v3.1：面板展开/收起 → 淡出/恢复状态栏胶囊
                     ArkConstants.ACTION_PANEL_STATE -> {
                         val visible =
@@ -100,6 +103,7 @@ internal object SystemUILiveHost {
             addAction(ArkConstants.ACTION_PANEL_SYNC)
             addAction(ArkConstants.ACTION_PANEL_SEEK)
             addAction(ArkConstants.ACTION_PANEL_PLAYBACK)
+            addAction(ArkConstants.ACTION_PANEL_FAVORITE)
         }
         try {
             if (Build.VERSION.SDK_INT >= 33) {

@@ -8,4 +8,6 @@
     <string name="ark_panel_play">播放</string>
     <string name="ark_panel_pause">暂停</string>
     <string name="ark_panel_unknown">正在播放</string>
+    <string name="ark_panel_fav">收藏</string>
+    <string name="ark_panel_faved">已收藏</string>
 </resources>

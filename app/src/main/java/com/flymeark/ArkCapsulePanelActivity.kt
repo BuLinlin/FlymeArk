@@ -42,6 +42,9 @@ private const val PLAY_THROTTLE_MS = 180L
 /** 点卡片跳转的防抖窗口：避免连点拉起多个实例 */
 private const val OPEN_APP_DEBOUNCE_MS = 800L
 
+/** 收藏按钮防抖：收藏是明确动作，防连发即可 */
+private const val FAV_DEBOUNCE_MS = 600L
+
 /**
  * v2.6：点击实况胶囊后从状态栏下方展开的播放控制面板。
  *
@@ -58,7 +61,6 @@ private const val OPEN_APP_DEBOUNCE_MS = 800L
 class ArkCapsulePanelActivity : Activity() {
 
     private lateinit var root: View
-    private lateinit var backdrop: ImageView
     private lateinit var card: View
     private lateinit var content: View
     private lateinit var coverSlot: View
@@ -72,6 +74,7 @@ class ArkCapsulePanelActivity : Activity() {
     private lateinit var playBtn: ImageView
     private lateinit var prevBtn: ImageView
     private lateinit var nextBtn: ImageView
+    private lateinit var favBtn: ImageView
 
     private lateinit var morph: ArkMorphAnim
 
@@ -83,14 +86,14 @@ class ArkCapsulePanelActivity : Activity() {
     /** v3.13：系统深色模式（配色与背景定标都跟它走） */
     private var nightMode = false
 
-    /** v3.13：当前专辑主题色（进度条 + 背景兜底色） */
+    /** v3.13：当前专辑主题色（进度条） */
     private var albumColor: Int? = null
+
+    /** v3.13.3：收藏状态（true=已收藏）。SystemUI 从通知按钮标题推断，null=未知 */
+    private var favState: Boolean? = null
 
     /** v3.13：媒体 App 跳转 PendingIntent（SystemUI 从 sessionActivity 带来） */
     private var lastClickIntent: PendingIntent? = null
-
-    /** 最近一次封面（深浅模式切换时重新生成背景用） */
-    private var lastCover: Bitmap? = null
 
     /** 媒体键节流时间戳（按按键分开记，暂停和切歌互不干扰） */
     private val lastKeyAt = HashMap<Int, Long>(4)
@@ -105,8 +108,8 @@ class ArkCapsulePanelActivity : Activity() {
     private var paletteCard = 0xFF18181C.toInt()
     private var paletteStroke = 0x24FFFFFF.toInt()
 
-    /** v3.13：背景生成任务计数，防止换曲过快时旧任务覆盖新背景 */
-    private var backdropJob = 0
+    /** 收藏防抖时间戳（收藏是明确动作，防连发即可，窗口可以稍大） */
+    private var lastFavAt = 0L
 
     /** 封面轮播：当前露在前面的是 A 还是 B */
     private var frontIsA = true
@@ -157,6 +160,7 @@ class ArkCapsulePanelActivity : Activity() {
             width = WindowManager.LayoutParams.MATCH_PARENT
             height = WindowManager.LayoutParams.MATCH_PARENT
         }
+        applySystemGlass()
 
         setContentView(R.layout.activity_capsule_panel)
         registerTrackReceiver()
@@ -177,6 +181,44 @@ class ArkCapsulePanelActivity : Activity() {
             }
         }
     }
+
+    /**
+     * v3.13.3：系统同款玻璃背景（对齐下拉栏媒体卡）。
+     *
+     * 两层结构，与 MzBlurUtils 的系统玻璃同构：
+     *  1. blurBehindRadius —— 窗口背后的真实壁纸/启动器被模糊（系统媒体卡是
+     *     BackgroundBlurDrawable 180，Activity 没有那个 API，用 blurBehind 等价实现）；
+     *  2. 玻璃染色 scrim —— 铺在 root 上，浅色 70% 白 / 深色 70% 深灰，
+     *     色值与系统 0xB2 染色完全一致。
+     *
+     * 降级：系统关闭跨窗口模糊（省电模式/开发者选项）时 scrim 加深到 88%，
+     * 保证面板依然可读，只是没有「透」的感觉。
+     */
+    private fun applySystemGlass() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
+                window.attributes = window.attributes.apply {
+                    blurBehindRadius = px(24)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    /** 玻璃染色层：blur 可用 = 系统同款 70%；不可用 = 88% 实底保可读。须在 bindViews 之后调用 */
+    private fun updateGlassScrim() {
+        val blurOk = try {
+            if (Build.VERSION.SDK_INT >= 31) window.windowManager.isCrossWindowBlurEnabled else false
+        } catch (_: Throwable) {
+            false
+        }
+        val alpha = if (blurOk) 0xB2 else 0xE1
+        val color = if (nightMode) (alpha shl 24) or 0x1A1A1A else (alpha shl 24) or 0xFFFFFF
+        root.background = android.graphics.drawable.ColorDrawable(color)
+    }
+
+    private fun px(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
     /** SystemUI 传来的胶囊屏幕矩形；缺失时交给 [ArkMorphAnim] 用兜底尺寸 */
     private fun capsuleRect(): Rect? {
@@ -204,7 +246,6 @@ class ArkCapsulePanelActivity : Activity() {
 
     private fun bindViews() {
         root = findViewById(R.id.panel_root)
-        backdrop = findViewById(R.id.panel_backdrop)
         card = findViewById(R.id.panel_card)
         content = findViewById(R.id.panel_content)
         coverSlot = findViewById(R.id.panel_cover_slot)
@@ -218,13 +259,14 @@ class ArkCapsulePanelActivity : Activity() {
         playBtn = findViewById(R.id.panel_play)
         prevBtn = findViewById(R.id.panel_prev)
         nextBtn = findViewById(R.id.panel_next)
+        favBtn = findViewById(R.id.panel_fav)
 
         // v3.13：样式对齐系统媒体卡 —— 配色按深浅模式一套走
         nightMode =
             (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
-        android.util.Log.d("FlymeArk", "panel init nightMode=$nightMode uiMode=0x${Integer.toHexString(resources.configuration.uiMode)}")
         applyPalette()
+        updateGlassScrim()
 
         // 点空白收起；点卡片跳转音乐 App（对齐系统媒体卡行为）
         root.setOnClickListener { dismiss() }
@@ -259,6 +301,10 @@ class ArkCapsulePanelActivity : Activity() {
         playing = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_PLAYING, true)
         clickIntentOf(i)?.let { lastClickIntent = it }
         setNight(i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode))
+        if (i.hasExtra(ArkConstants.EXTRA_PANEL_FAV)) {
+            favState = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
+        }
+        updateFavIcon()
 
         if (durationMs <= 0) {
             // 时长未知时不画进度条，避免展示假进度
@@ -305,6 +351,14 @@ class ArkCapsulePanelActivity : Activity() {
         playing = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_PLAYING, playing)
         clickIntentOf(i)?.let { lastClickIntent = it }
         setNight(i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode))
+        // v3.13.3：SystemUI 从通知按钮标题推来的收藏状态（缺省=未推送，保持现状）
+        if (i.hasExtra(ArkConstants.EXTRA_PANEL_FAV)) {
+            val s = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
+            if (s != favState) {
+                favState = s
+                updateFavIcon()
+            }
+        }
 
         if (durationMs <= 0) {
             progressBar.visibility = View.GONE
@@ -421,73 +475,22 @@ class ArkCapsulePanelActivity : Activity() {
         }, COVER_SLIDE_MS + 60)
     }
 
-    /** 专辑取色 → 进度条主题色 + 音乐壁纸背景（取不出时背景用纯色渐变兜底） */
+    /** 专辑取色 → 进度条主题色 */
     private fun applyAlbumColor(bmp: Bitmap) {
-        lastCover = bmp
         val color = ArkAlbumColor.vibrantOf(bmp)
         albumColor = color
         color?.let { progressBar.barColor = it }
-        applyBackdrop(bmp)
     }
 
     /**
      * SystemUI 推来的深浅模式（与媒体卡玻璃同源：SystemUICommonUtils.sIsNightMode）。
-     * 变化时整套配色 + 背景定标一起重刷。
+     * 变化时整套配色 + 玻璃染色一起重刷。
      */
     private fun setNight(night: Boolean) {
-        android.util.Log.d("FlymeArk", "panel setNight($night) was=$nightMode")
         if (night == nightMode) return
         nightMode = night
         applyPalette()
-        applyBackdrop(lastCover)
-    }
-
-    // ------------------------------------------------------------------
-    // 音乐壁纸背景（v3.13）
-    // ------------------------------------------------------------------
-
-    /** 生成专辑模糊背景并 crossfade 替换；一次性计算放后台线程 */
-    private fun applyBackdrop(cover: Bitmap?) {
-        val dm = resources.displayMetrics
-        val w = root.width.takeIf { it > 0 } ?: dm.widthPixels
-        val h = root.height.takeIf { it > 0 } ?: dm.heightPixels
-        val night = nightMode
-        val job = ++backdropJob
-        val fallback = albumColor
-        Thread {
-            val bmp = try {
-                ArkBackdrop.build(cover, fallback, w, h, night)
-            } catch (t: Throwable) {
-                android.util.Log.w("FlymeArk", "panel backdrop build failed", t)
-                null
-            }
-            android.util.Log.d("FlymeArk", "panel backdrop job=$job w=$w h=$h cover=${cover != null} -> ${bmp?.width}x${bmp?.height}")
-            handler.post {
-                if (job != backdropJob || closing) return@post
-                if (bmp != null) swapBackdrop(bmp)
-            }
-        }.start()
-    }
-
-    /** 已有背景时做一次淡出→替换→淡入，没有则直接铺 */
-    private fun swapBackdrop(bmp: Bitmap) {
-        if (backdrop.drawable == null) {
-            backdrop.setImageBitmap(bmp)
-            return
-        }
-        backdrop.animate().cancel()
-        backdrop.animate()
-            .alpha(0f)
-            .setDuration(170L)
-            .withEndAction {
-                backdrop.setImageBitmap(bmp)
-                backdrop.animate()
-                    .alpha(1f)
-                    .setDuration(220L)
-                    .setInterpolator(DecelerateInterpolator())
-                    .start()
-            }
-            .start()
+        updateGlassScrim()
     }
 
     // ------------------------------------------------------------------
@@ -521,6 +524,10 @@ class ArkCapsulePanelActivity : Activity() {
         prevBtn.imageTintList = ColorStateList.valueOf(icon)
         nextBtn.imageTintList = ColorStateList.valueOf(icon)
         playBtn.imageTintList = ColorStateList.valueOf(icon)
+        favBtn.imageTintList = ColorStateList.valueOf(
+            // 已收藏：跟专辑主题色走（系统媒体卡同款思路），未收藏用普通图标色
+            if (favState == true) albumColor ?: icon else icon
+        )
         (playBtn.background as? GradientDrawable)?.setColor(playBg)
         progressBar.trackColor = if (nightMode) 0x33FFFFFF.toInt() else 0x26000000
     }
@@ -586,6 +593,39 @@ class ArkCapsulePanelActivity : Activity() {
             updatePlayIcon()
             restartTicker()
         }
+        favBtn.setOnClickListener {
+            // v3.13.3：收藏 = 触发 QQ 音乐通知上的「喜欢」按钮。
+            // 乐观切换图标，真实状态由 SystemUI 下次推送纠正（通知按钮标题会变）。
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastFavAt < FAV_DEBOUNCE_MS) return@setOnClickListener
+            lastFavAt = now
+            favState = !(favState ?: false)
+            updateFavIcon()
+            sendFavorite()
+        }
+    }
+
+    /** 收藏请求 → SystemUI（system uid）send QQ 音乐通知 action */
+    private fun sendFavorite() {
+        try {
+            sendBroadcast(
+                Intent(ArkConstants.ACTION_PANEL_FAVORITE)
+                    .setPackage(ArkConstants.SYSTEMUI_PKG)
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun updateFavIcon() {
+        val faved = favState == true
+        favBtn.setImageResource(if (faved) R.drawable.ic_ark_fav_filled else R.drawable.ic_ark_fav)
+        // 已收藏用专辑主题色点亮（系统媒体卡同款思路）；未收藏用普通图标色
+        val plain = if (nightMode) Color.WHITE else 0xE6000000.toInt()
+        favBtn.imageTintList = ColorStateList.valueOf(
+            if (faved) albumColor ?: plain else plain
+        )
+        favBtn.contentDescription =
+            getString(if (faved) R.string.ark_panel_faved else R.string.ark_panel_fav)
     }
 
     /**

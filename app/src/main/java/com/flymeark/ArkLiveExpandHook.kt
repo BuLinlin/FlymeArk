@@ -128,6 +128,17 @@ internal object ArkLiveExpandHook {
     @Volatile private var trackDuration: Int = -1
     @Volatile private var trackPlaying: Boolean = false
 
+    // ---------------- 收藏（v3.13.3） ----------------
+
+    /** QQ 音乐播放通知上「喜欢」按钮的 PendingIntent（每首歌刷新） */
+    @Volatile private var favIntent: PendingIntent? = null
+
+    /** 从按钮标题推断的收藏状态；null=标题不带状态词，无法同步 */
+    @Volatile private var favState: Boolean? = null
+
+    /** 取证日志去重：每首歌只打一轮 action 列表 */
+    private var favLogKey: String? = null
+
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         if (lpp.packageName != ArkConstants.SYSTEMUI_PKG) return
 
@@ -228,6 +239,7 @@ internal object ArkLiveExpandHook {
 
             trackPlaying = (notif.flags and Notification.FLAG_ONGOING_EVENT) != 0
 
+            inspectFavoriteActions(notif)
             pushToPanel(ctx)
         } catch (_: Throwable) {
         }
@@ -377,6 +389,8 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_PANEL_PLAYING, playing)
             // v3.13.1：媒体卡玻璃的深浅判断源就在 SystemUI，面板配色必须同源
             putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
+            // v3.13.3：收藏状态（null = 通知按钮不带状态词，推不出）
+            favState?.let { putExtra(ArkConstants.EXTRA_PANEL_FAV, it) }
             cover?.let { putExtra(ArkConstants.EXTRA_PANEL_COVER, it) }
             clickIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
         }
@@ -441,6 +455,65 @@ internal object ArkLiveExpandHook {
             am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, code))
             am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, code))
         } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * v3.13.3：枚举 QQ 音乐播放通知的 action 按钮，找「喜欢/收藏」。
+     *
+     * MediaSession 帮不上忙（custom actions=[]、rating type=0，见取证），但它的
+     * 播放通知挂了 5 个 action 按钮，其中通常有收藏；action 的 PendingIntent
+     * 谁拿到都能 send()，正好借 SystemUI 进程代触发。
+     *
+     * 每首歌只打一轮全量日志（取证用），之后只做静默匹配。
+     * 状态推断：按钮标题带「已/取消」= 已收藏；只有「喜欢/收藏」= 未收藏；
+     * 标题不带状态词（固定文案）时返回 null，面板只能乐观切换。
+     */
+    private fun inspectFavoriteActions(notif: Notification) {
+        val acts = notif.actions
+        if (acts.isNullOrEmpty()) return
+        val key = notif.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+        if (key != null && key != favLogKey) {
+            favLogKey = key
+            acts.forEachIndexed { i, a ->
+                XposedBridge.log("$TAG: notif action[$i] title='${a.title}'")
+            }
+        }
+        var found: PendingIntent? = null
+        var state: Boolean? = null
+        for (a in acts) {
+            val t = a.title?.toString()?.trim() ?: continue
+            if (t.contains("已喜欢") || t.contains("已收藏") || t.contains("取消喜欢")) {
+                found = a.actionIntent
+                state = true
+                break
+            }
+            if (t.contains("喜欢") || t.contains("收藏")) {
+                found = a.actionIntent
+                state = false
+            }
+        }
+        if (found != null) {
+            favIntent = found
+            if (state != null && state != favState) {
+                favState = state
+                XposedBridge.log("$TAG: favorite state=$state")
+            }
+        }
+    }
+
+    /** 面板点 ❤ → 触发通知上的收藏按钮（PendingIntent 是 QQ 音乐自己的，send 无需权限） */
+    fun toggleFavorite(ctx: Context?) {
+        val pi = favIntent
+        if (pi == null) {
+            XposedBridge.log("$TAG: favorite skipped (no like action)")
+            return
+        }
+        try {
+            pi.send(ctx, 0, null)
+            XposedBridge.log("$TAG: favorite action sent (state=$favState)")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: favorite send failed: ${t.message}")
         }
     }
 

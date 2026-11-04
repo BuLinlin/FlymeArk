@@ -93,6 +93,16 @@ object ArkConstants {
     const val EXTRA_PLAY_TARGET = "play_target"
 
     /**
+     * 播放面板 → SystemUI：收藏请求（v3.13.3）。
+     * QQ 音乐 MediaSession 不暴露收藏接口（custom actions=[], rating type=0），
+     * 只能借它播放通知上的「喜欢」按钮 action（PendingIntent）代触发。
+     */
+    const val ACTION_PANEL_FAVORITE = "com.flymeark.PANEL_FAVORITE"
+
+    /** SystemUI → 播放面板：当前收藏状态（Boolean，从通知按钮标题推断；缺省=未知） */
+    const val EXTRA_PANEL_FAV = "panel_fav"
+
+    /**
      * SystemUI → 播放面板：媒体 App 的点击跳转 PendingIntent（v3.13）。
      * 来源 MediaController.sessionActivity，点卡片空白处时 send() 拉起对应 App，
      * 与下拉栏媒体卡「点卡片进 App」行为对齐。

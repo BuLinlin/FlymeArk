@@ -782,3 +782,45 @@ v3.8 前后已经因为「截取下层纹理导致卡顿」否决过一次。
 - 连点暂停 5~10 次：应停在暂停态，不切歌、不跳曲
 - 暂停 → 立刻播放 → 再暂停：图标与真实状态一致，无延迟
 - 关掉 QQ 音乐进程后再点：日志出现 `playback fallback to media key`
+
+## 2026-11-04 · v3.14.0｜面板收藏 ❤ + 背景改系统玻璃
+
+### 一、收藏歌曲（❤）
+
+**取证**：QQ 音乐 MediaSession 无收藏接口 —— `custom actions=[]`、`rating type=0`
+（dumpsys media_session）。但它的播放通知挂了 5 个 action 按钮（`actions=5`），
+通知 action 的 PendingIntent 谁拿到都能 send()。
+
+- `ArkLiveExpandHook.inspectFavoriteActions()`：每次歌词通知刷新时枚举
+  `notif.actions`，**每首歌打一轮全量日志**（`notif action[i] title='...'`，
+  用于真机确认按钮文案），并按标题匹配收藏按钮：
+  - 含「已喜欢 / 已收藏 / 取消喜欢」→ 已收藏状态
+  - 含「喜欢 / 收藏」→ 未收藏状态
+  - 都不含 → 保存按钮但状态记 null（面板乐观切换，无法同步）
+- `toggleFavorite()`：send 该 PendingIntent（SystemUI 进程内，无需额外权限）。
+- 新广播 `ACTION_PANEL_FAVORITE`（面板 → SystemUI）。
+- 面板：按钮行改为「❤ 上一首 播放 下一首」四键 weight 均布（对齐系统媒体卡）；
+  ❤ 已收藏时用专辑主题色点亮，未收藏普通图标色；600ms 防抖 + 乐观切换，
+  真实状态随 SystemUI 推送（`EXTRA_PANEL_FAV`）纠正。
+
+### 二、背景改系统同款玻璃（v3.13 音乐壁纸背景整体移除）
+
+用户反馈面板背景与下拉栏顶部媒体卡样式不一致（面板是封面糊满的彩色底，
+媒体卡是透壁纸的玻璃）。v3.13.3 起面板背景与系统玻璃同构：
+
+- 窗口层：`FLAG_BLUR_BEHIND` + `blurBehindRadius = 24dp`，模糊面板背后的真实壁纸；
+- 染色层：root 铺 scrim，浅色 `#B2FFFFFF` / 深色 `#B21A1A1A`，与系统玻璃
+  `MzBlurUtils` 的 0xB2 染色**完全同值**；
+- 降级：`isCrossWindowBlurEnabled=false`（省电模式等）时 scrim 提到 88% 保可读；
+- 删除 `ArkBackdrop.kt` 及全部引用（applyBackdrop/swapBackdrop/backdropJob/lastCover），
+  专辑取色仅保留给进度条与收藏点亮色。
+
+### 顺手清理
+
+- 移除面板侧遗留临时日志（`panel init nightMode` / `panel setNight`）
+
+### 待真机验证
+
+- ❤ 点击 → QQ 音乐里当前歌变成「我喜欢」（首次看日志确认按钮文案命中匹配规则）
+- 再点 ❤ → 取消收藏
+- 面板背景：模糊透壁纸、色调与下拉栏媒体卡一致；深浅模式切换跟随
