@@ -38,8 +38,6 @@ class ArkEntry : IXposedHookLoadPackage {
                 ArkLiveCoverHook.install(lpp)
                 // 胶囊宽度收窄 + 歌词横向滑入
                 ArkLiveCapsuleStyleHook.install(lpp)
-                // 下拉栏媒体卡 → 深色液态玻璃
-                ArkMediaCardStyleHook.install(lpp)
                 // 点击胶囊 → 原生播放面板
                 ArkLiveExpandHook.install(lpp)
                 return

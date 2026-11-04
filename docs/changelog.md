@@ -504,3 +504,66 @@ v3.8 用 `saveLayer` 的 `ColorMatrixColorFilter` 提亮/压暗，前提是 Rend
 
 QS 磁贴 / 通知行暂不纳入（`includeQs = false`），需要时把它打开即可，
 名单就是 FlymeMod 那张 palette 表。
+
+## 2026-11-04 · v3.10｜撤回媒体卡的全部单独修改（毛玻璃本来就是全局的）
+
+### 结论：这个组件的玻璃不是我们该管的事
+
+反编译 `MediaCarouseTransitionLayout.setBlurBgForLive()`：
+
+```java
+MzBlurUtils.setBackgroundBlurDrawable(
+    this,
+    /* blurRadius       */ 180,
+    /* cornerRadius     */ -1.0f,
+    /* clipCornerRadius */ mClipCornerRadius,
+    /* color            */ isInNightMode() ? 0xB21A1A1A : 0xB2FFFFFF,
+    /* alpha            */ mTotalAlpha
+);
+```
+
+也就是说卡片本来就是 **180 模糊 + 70% 白（白天）/ 70% 深灰（夜间）** 的磨砂玻璃，
+和 iOS 那套「重模糊 + 高不透明度染色」是同一个配方。
+
+`MzBlurUtils.setBackgroundBlurDrawable` 是**全局工具**，用它的不止媒体卡：
+
+| 调用方 | 用途 |
+|---|---|
+| `MediaCarouseTransitionLayout` | 下拉栏媒体卡 |
+| `NotificationBackgroundView` | 通知行背景 |
+| `LandscapeHeadsUpNotificationView` | 横屏横幅 |
+| `BatteryWarningView` | 低电量提示 |
+| `PluginBlurView` / `PluginLayout` | 锁屏插件 |
+
+**一处调参，所有玻璃面一起变** —— 这才是"全局修改"该待的地方。
+
+### 我们之前错在哪
+
+v3.4 起把这张卡的背景包进 `ArkGlassDrawable`，并且设了 `alpha = 0.86`。
+系统的 70% 白底被乘掉 14%，实际只剩 **60%**，再叠自己的 scrim ——
+等于一边把系统调好的白底削薄，一边又拿半透明色去补，补出来是发灰的。
+
+黑字看着"不显眼"，不是系统色不对，是**我们自己把底压暗了**。
+后面几版（提亮 / 强制标准 / scrim）都是在补偿这个自己造成的偏差。
+
+### 撤回清单
+
+- 删除 `ArkMediaCardStyleHook.kt`（`MediaViewHolder.create` / `setBackground` / 播放键圆盘）
+- 删除 `ArkGlassDrawable.kt`（背景包装、scrim、描边）
+- 删除 `ArkForegroundStandard.kt`（资源层前景强制）
+- `ArkEntry` 的 SystemUI 分支不再安装媒体卡相关 hook
+
+媒体卡回到系统原生：自带模糊玻璃 + 主题资源色前景，我们不碰。
+
+### 下一步（待真机确认后再动）
+
+如果原生玻璃还不够"液态"，正确的改法是在全局入口调参，一处生效：
+
+- `MzBlurUtils.setBackgroundBlurDrawable` —— 统一 blurRadius / color 染色；
+- `setBackgroundBlurDrawableAlpha` —— 统一透明度；
+- 静态壁纸路径另走 `WallpaperBlurDrawableManager`。
+
+### 状态
+
+`versionCode 11 / 3.10.0`，编译通过。**装机时设备断开（adb devices 为空），未安装、未验证。**
+重连后 `adb install -r` + 重启 SystemUI 即可，日志里不应再出现任何 `[FlymeArk/mediaCard]`。
