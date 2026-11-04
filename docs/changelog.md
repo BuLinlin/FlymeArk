@@ -1453,3 +1453,45 @@ fav already=false, skip send                       ← 幂等短路
 用户真实关开关是持久性 false，6 秒后仍会正确释放胶囊，不影响「关开关 → 胶囊消失」的正常行为。
 
 - versionCode 34 / 3.15.13
+
+## 2026-11-04 · v3.15.14｜修网易云收藏失效（like 误判）+ 胶囊释放改延迟复核 + 关闭延迟降到 3s
+
+### 一、网易云收藏失效：`like` 被误判成「未收藏」
+
+真机日志（18:30）锁定根因：
+
+```
+favorite request target=false gen=5 busy=false
+fav action stale (btn=false target=false), wait 0ms   ← 卡死
+fav action stale (btn=false target=false), wait 250ms
+... 一路 wait 到 4750ms 超时，从未真正 send ...
+fav map flipped (truth=false/true 反复横跳)          ← 连锁污染
+```
+
+`favTitleState("like")` 之前把英文泛指词 `like` 归为「未收藏」返回 `false`，
+于是 `sendFavAction` 判定「按钮已是目标状态」进入语义等待死循环，永远不发送。
+网易云的 `like` 是**纯 toggle**（标题恒定、切歌不翻转），方向不可判断，必须返回 `null`。
+
+修复：`favTitleState` 只对**中文状态词**（收藏/已收藏，会翻转）返回 true/false，
+英文泛指 `like/favorite/collect` 一律返回 null → 走「直接 send + metadata 真值校验」的
+toggle 路径（`lastSentSemanticKnown=false`，只发一次不重发，重发=撤销）。
+
+### 二、胶囊释放改延迟复核（上一版 6s 时长防抖未拦住抖动）
+
+真机日志（18:28，pid 31360 = 3.15.13）显示 `raw=false → 2.3s 后 switch OFF`，
+`offSince` 状态机在真实调用序列下失效，防抖没生效，胶囊仍被误释放。
+
+放弃 `LiveAllowGate` 内的 offSince 状态机，改为在 `ArkLiveLyricHook` 层做**延迟复核**：
+
+- 读到 false 不立即释放，记 `pendingOffPkg` + `postDelayed(3s)`；
+- 3s 后重新查开关，仍 false 才真正 `switch OFF`；
+- 期间任何一次读到 true 就取消待关闭任务。
+
+逻辑与「开关真值」解耦、可验证，瞬时抖动（1.6~4.2s）不会再误释放。
+
+### 三、关闭延迟 6s → 3s
+
+用户反馈 6s 太久。3s 既能压过实测 1.6s 抖动（4.2s 那次是罕见长抖，3s 复核时若仍 false
+会正确释放，若已恢复 true 则取消），又让「真关开关 → 胶囊消失」更快响应。
+
+- versionCode 35 / 3.15.14

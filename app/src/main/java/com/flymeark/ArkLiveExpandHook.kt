@@ -1233,7 +1233,14 @@ internal object ArkLiveExpandHook {
         return generic
     }
 
-    /** 标题 → 收藏状态：true = 已收藏（点它=取消），false = 未收藏（点它=收藏），null = 不确定 */
+    /**
+     * 标题 → 收藏状态：true = 已收藏（点它=取消），false = 未收藏（点它=收藏），null = 不确定。
+     *
+     * 关键区分：中文「收藏/喜欢」是状态词（明确=未收藏）；英文单独的 `like`/`favorite`/`collect`
+     * 在网易云这类通知里是**纯 toggle**（标题恒定、切歌不翻转、无「已 like」对应物），
+     * 方向不可判断 —— 必须返回 null，让发送走「直接 send + metadata 真值校验」的 toggle 路径，
+     * 而不是误判成 false 后卡进语义等待死循环（v3.15.13 实测网易云「能读状态但点不动」即此因）。
+     */
     private fun favTitleState(t: String): Boolean? {
         val s = t.lowercase()
         // 「已…」「取消…」都表示当前已收藏
@@ -1244,11 +1251,9 @@ internal object ArkLiveExpandHook {
             s.contains("unlike") || s.contains("unfavorite") || s.contains("uncollect") ||
             s.contains("remove from") || s.contains("added")
         ) return true
-        // 泛指「收藏/喜欢」= 当前未收藏
+        // 中文状态词：泛指「收藏/喜欢」= 当前未收藏（QQ 音乐「收藏」↔「已收藏」会翻转，语义明确）
         if (t.contains("喜欢") || t.contains("收藏")) return false
-        if (s == "like" || s == "favorite" || s == "favourite" || s == "collect" ||
-            s.contains("add to") || s.contains("like song") || s.contains("favorite song")
-        ) return false
+        // 英文单独泛指词（like/favorite/collect 等）语义不可知 → null，交由 toggle 路径处理
         return null
     }
 
