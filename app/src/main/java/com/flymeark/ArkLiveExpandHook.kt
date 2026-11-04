@@ -8,6 +8,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.media.AudioManager
 import android.media.MediaMetadata
+import android.media.Rating
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
@@ -174,6 +175,22 @@ internal object ArkLiveExpandHook {
 
     /** metadata extras 的 key 只打一次（用于真机确认播放器有没有暴露收藏字段） */
     private var metaKeysLogged = false
+
+    /** USER_RATING 的取值签名，变化时才打日志（取证收藏/取消收藏时它怎么变） */
+    private var lastRatingSig: String? = null
+
+    /** QQ 音乐 COLLECT_STATE 的取值签名，变化时才打日志 */
+    private var lastCollectSig: String? = null
+
+    /**
+     * v3.15.5：点击后的沉降窗口。
+     *
+     * 用户点 ❤ 之后，播放器要过一会儿才会把新的收藏状态写回 metadata / 通知。
+     * 这段窗口里读到的都是「点击前」的旧值，采信它会把刚点亮的 ❤ 又打回去。
+     * 换曲时会重置 `lastFavSendAt`，所以窗口不会跨歌。
+     */
+    private fun inFavSettle(): Boolean =
+        SystemClock.uptimeMillis() - lastFavSendAt < FAV_SETTLE_MS
 
     /** 上次 send 收藏 action 的时间（SystemUI 侧防抖） */
     private var lastFavSendAt = 0L
@@ -474,12 +491,18 @@ internal object ArkLiveExpandHook {
                 lastFavSendAt = 0L
                 pendingFavTarget = null
                 pendingFavHash = null
+                // v3.15.5：favIntent 是「通知上的收藏按钮」，换曲后它仍指向上一首。
+                // 不清掉的话，新歌通知还没刷出来时点 ❤ 会去取消收藏**上一首**。
+                // 清空后由 refresh 在「标题匹配当前曲」时重新填充，宁可短暂无响应也不能误操作。
+                favIntent = null
                 // v3.15.4：先用「按曲目记忆」立刻给出状态（这首听过就 0 延迟），
                 // 再用通知真值校正 —— 通知要 1~5 秒才刷到新歌，不能让用户干等
                 favState = trackFavOf(c, trackFavKey(currentPkg, title))
                 refreshFavFromActiveNotifications(c)
             }
             session?.fav?.let { truth ->
+                // v3.15.5：点击后的沉降窗口内不采信（读到的是点击前的旧值）
+                if (inFavSettle()) return@let
                 favState = truth
                 loadFavMap(c)
                 favHash?.let { h -> learnFav(c, h, truth) }
@@ -531,9 +554,11 @@ internal object ArkLiveExpandHook {
             lastFavSendAt = 0L
             pendingFavTarget = null
             pendingFavHash = null
+            // v3.15.5：同 pushToPanel —— 旧通知的收藏按钮不能留给新曲用
+            favIntent = null
             // v3.15.4：session 没给收藏时用「按曲目记忆」顶上，避免面板先显示未定再点亮
             favState = s.fav ?: trackFavOf(c, trackFavKey(currentPkg, title))
-        } else {
+        } else if (!inFavSettle()) {
             s.fav?.let { favState = it }
         }
 
@@ -800,6 +825,8 @@ internal object ArkLiveExpandHook {
         listOf(250L, 700L, 1_500L, 2_500L, 4_000L).forEach { delay ->
             mainHandler.postDelayed({
                 if (trackTitle != title) return@postDelayed   // 又换曲了，交给新一轮轮询
+                // v3.15.5：先读 metadata（COLLECT_STATE，随切歌即时更新），再查通知兜底
+                if (!inFavSettle()) readFavFromSession(c)?.let { favState = it }
                 refreshFavFromActiveNotifications(c)
                 // v3.15.3：refresh 不再自己回推（那会无限递归），由这里显式推一次
                 if (panelVisible) pushToPanel(c, force = true)
@@ -835,17 +862,97 @@ internal object ArkLiveExpandHook {
      * 含 fav/favourite/favorite/collect/liked 的键，且值必须是可解释的
      * Boolean/数字/字符串；找不到返回 null，不影响其他来源。
      */
-    private fun favFromMetadata(md: MediaMetadata?): Boolean? {
-        // compileSdk 36 的公开 stub 里 MediaMetadata 没有 getExtras，运行时却有 —— 走反射取
-        val ex = try {
-            md?.let { XposedHelpers.callMethod(it, "getExtras") as? android.os.Bundle }
+    /**
+     * 取 MediaMetadata 的原始 Bundle。
+     *
+     * v3.15.5：`getExtras()` 是 hidden/@SystemApi，公开 stub 里没有，反射调用会抛异常
+     * （上一版因此一直没打出 key）。`mBundle` 才是权威来源 —— 标准字段和播放器自塞的
+     * extras 都在里面。
+     */
+    private fun metaBundle(md: MediaMetadata?): android.os.Bundle? {
+        md ?: return null
+        try {
+            val ex = XposedHelpers.callMethod(md, "getExtras") as? android.os.Bundle
+            if (ex != null) return ex
+        } catch (_: Throwable) {
+        }
+        return try {
+            XposedHelpers.getObjectField(md, "mBundle") as? android.os.Bundle
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * v3.15.5：从 `METADATA_KEY_USER_RATING` 读收藏真值 —— **最优先的真值源**。
+     *
+     * 真机取证（metadata bundle dump）发现 QQ 音乐把「喜欢」写在这个标准字段里：
+     * `android.media.metadata.USER_RATING:Rating`。
+     *
+     * 相比「通知按钮标题」这条路，metadata 是**随切歌即时更新**的（MediaSession 的
+     * setMetadata 与切歌同一个动作），而通知要重建 RemoteViews、要 1~5 秒。
+     * 这就是系统媒体卡没有延迟的原因 —— 它读的也是 metadata。
+     */
+    private fun favFromRating(md: MediaMetadata?): Boolean? {
+        md ?: return null
+        val r = try {
+            md.getRating(MediaMetadata.METADATA_KEY_USER_RATING)
         } catch (_: Throwable) {
             null
         } ?: return null
+        val style = r.ratingStyle
+        val state = when (style) {
+            Rating.RATING_HEART -> r.hasHeart()
+            Rating.RATING_THUMB_UP_DOWN -> r.isThumbUp
+            Rating.RATING_3_STARS, Rating.RATING_4_STARS, Rating.RATING_5_STARS ->
+                r.starRating > 0f
+            Rating.RATING_PERCENTAGE -> r.percentRating > 0f
+            else -> null
+        }
+        val raw = when (style) {
+            Rating.RATING_HEART -> "heart=${r.hasHeart()}"
+            Rating.RATING_THUMB_UP_DOWN -> "thumb=${r.isThumbUp}"
+            Rating.RATING_PERCENTAGE -> "percent=${r.percentRating}"
+            Rating.RATING_3_STARS, Rating.RATING_4_STARS, Rating.RATING_5_STARS ->
+                "star=${r.starRating}"
+            else -> "unsupported"
+        }
+        val sig = "style=$style $raw"
+        if (sig != lastRatingSig) {
+            lastRatingSig = sig
+            XposedBridge.log("$TAG: USER_RATING $sig -> $state")
+        }
+        return state
+    }
+
+    private fun favFromMetadata(md: MediaMetadata?): Boolean? {
+        val ex = metaBundle(md) ?: return null
         if (!metaKeysLogged) {
             metaKeysLogged = true
-            XposedBridge.log("$TAG: metadata extras keys=${ex.keySet()}")
+            val dump = ex.keySet().joinToString("; ") { k ->
+                "$k:${ex.get(k)?.javaClass?.simpleName}"
+            }
+            XposedBridge.log("$TAG: metadata bundle (${ex.size()}): $dump")
         }
+        // ① QQ 音乐（UCAR 内核）明确暴露的收藏位：ucar.media.metadata.COLLECT_STATE = "1"/"0"
+        //    真机取证 2026-11-04 17:35：这条与 QQ 音乐界面的 ❤ 完全一致，且随切歌即时更新
+        val collect = try {
+            ex.getString("ucar.media.metadata.COLLECT_STATE")
+        } catch (_: Throwable) {
+            null
+        }
+        if (collect != null) {
+            val state = collect == "1" || collect.equals("true", true)
+            val sig = "COLLECT_STATE=$collect"
+            if (sig != lastCollectSig) {
+                lastCollectSig = sig
+                XposedBridge.log("$TAG: fav from $sig -> $state")
+            }
+            return state
+        }
+        // ② 标准 USER_RATING（其它播放器可能用这个表达「喜欢」）
+        favFromRating(md)?.let { return it }
+        // ③ 兜底：extras 里任何像收藏的键
         for (k in ex.keySet()) {
             val lk = k.lowercase()
             val hit = lk.contains("favor") || lk.contains("collect") ||
@@ -1136,6 +1243,7 @@ internal object ArkLiveExpandHook {
         loadFavMap(ctx)
         refreshFavFromActiveNotifications(ctx)
         session?.fav?.let { truth ->
+            if (inFavSettle()) return@let
             favState = truth
             favHash?.let { h -> learnFav(ctx, h, truth) }
         }
@@ -1201,11 +1309,23 @@ internal object ArkLiveExpandHook {
     )
 
     /**
+     * v3.15.5：只取收藏真值（metadata → COLLECT_STATE / RATING），**不解码封面**。
+     *
+     * 切歌轮询要连查几次，`readMediaSession` 每次都跨进程搬一张几百 KB 的位图，
+     * 主线程扛不住；收藏判断只需要 metadata，所以单独开这条轻量路径。
+     */
+    private fun readFavFromSession(ctx: Context): Boolean? = try {
+        activeController(ctx)?.metadata?.let { favFromMetadata(it) }
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: readFavFromSession failed: ${t.message}")
+        null
+    }
+
+    /**
      * 读取当前播放会话。仅在 SystemUI（system uid / 持有 MEDIA_CONTENT_CONTROL）内可用。
      * 除了进度，还能拿到 MediaSession 自己的标题/歌手/专辑图——切歌时比等通知刷新快得多。
      */
-    private fun readMediaSession(ctx: Context): SessionSnapshot? = try {
-        val ctrl = activeController(ctx)
+    private fun readMediaSession(ctx: Context): SessionSnapshot? = try {        val ctrl = activeController(ctx)
         if (ctrl == null) {
             null
         } else {

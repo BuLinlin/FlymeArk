@@ -1056,4 +1056,56 @@ action 按钮标题里 —— QQ 音乐重建那条通知要 1~5 秒。我们读
 若其中含收藏字段，就能彻底甩开通知延迟。已在 `favFromMetadata` 打了 `metadata extras keys=`
 日志，下次真机确认。
 
+## 2026-11-04 · v3.15.5｜找到真正的快源：metadata 里的 COLLECT_STATE
+
+**线索**：用户指出「顶部系统自带的栏换歌没有延迟」。系统媒体卡读的是
+**MediaSession 的 metadata**（setMetadata 与切歌是同一个动作），而我们一直盯着
+**播放通知的按钮标题**（要重建 RemoteViews，慢 1~5 秒）。读错数据源了。
+
+### 取证：QQ 音乐把收藏写在 metadata 里
+
+前几版一直读不到 metadata extras，原因是 `MediaMetadata.getExtras()` 是 hidden API，
+反射必然失败（`favFromMetadata` 直接 return）。改用内部字段 `mBundle` 后拿到完整 20 键：
+
+```
+android.media.metadata.ALBUM_ART:Bitmap
+android.media.metadata.RATING:Rating          ← 用户评分
+ucar.media.metadata.COLLECT_STATE:String      ← ★ 收藏状态，值 "1"/"0"
+ucar.media.metadata.PLAY_MODE:Long
+ucar.media.metadata.VIP:String
+...（共 20 项）
+```
+
+真机日志验证（随歌切换实时变化）：
+
+```
+fav from COLLECT_STATE=1 -> true
+fav from COLLECT_STATE=0 -> false
+```
+
+**这就是 0 延迟的真值源**：`ucar.media.metadata.COLLECT_STATE`，QQ 音乐（UCAR 内核）
+直接给字符串 "1"/"0"，且随切歌即时更新。
+
+### 改动
+
+1. **`metaBundle()`**：先试 `getExtras()`，失败则反射内部 `mBundle`（真正能用的路径）。
+2. **`favFromMetadata()` 三级真值源**：
+   - ① `ucar.media.metadata.COLLECT_STATE`（QQ 音乐，最准最快）
+   - ② `METADATA_KEY_USER_RATING`（标准字段，其它播放器可能用）
+   - ③ extras 里任何像收藏的键（原有模糊匹配，兜底）
+3. **`readFavFromSession()`**：只读 metadata、**不解码封面**。切歌轮询用它，
+   避免每次跨进程搬几百 KB 位图。
+4. **`inFavSettle()` 统一沉降窗口**：点 ❤ 后 5 秒内不采信外部真值（读到的是点击前旧值），
+   所有真值入口（metadata / 通知 / session）统一走这个判断。换曲时 `lastFavSendAt` 归零，
+   窗口不跨歌。
+5. **切歌清空 `favIntent`**（安全修复）：它是「通知上的收藏按钮」，换曲后仍指向上一首。
+   不清掉的话，新歌通知还没刷出时点 ❤ 会去**取消收藏上一首**。清空后由 refresh 在
+   「通知标题匹配当前曲」时重新填充 —— 宁可短暂无响应，也不能误操作别人的歌。
+
+### 保留
+
+v3.15.4 的 `trackFavMap`（按曲目记忆）保留为兜底：metadata 读不到时（缓存、异常、
+其它播放器）仍能立即给出上次已知状态。
+
+
 
