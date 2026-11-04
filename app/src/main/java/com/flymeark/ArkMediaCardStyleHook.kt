@@ -2,47 +2,49 @@ package com.flymeark
 
 import android.content.Context
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.view.View
 import android.widget.ImageView
+import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import java.util.WeakHashMap
 
 /**
- * 下拉栏媒体卡：**只接管背景**，前景色完全交还给系统。
+ * 下拉栏媒体卡：**只接管背景**，前景色完全由系统决定。
  *
- * ## 为什么不需要自己算颜色
- *
- * 系统本来就有完整的一套标准，链路是：
+ * ## 系统本来就有标准（所以不要去覆盖）
  *
  * ```
- * Icon artwork                                   ← 专辑封面（不是壁纸）
- *   → WallpaperColors.fromDrawable(artwork)       ← MediaControlPanel.getWallpaperColor()
- *   → new ColorScheme(colors, false, 6)           ← Monet 生成调和色板
- *   → MediaColorSchemesKt.textPrimaryFromScheme()  ← neutral1.s50
- *     textSecondaryFromScheme()                    ← neutral2.s200
- *     textTertiaryFromScheme()                     ← neutral2.s400
+ * Icon artwork                                    ← 专辑封面（不是壁纸）
+ *   → WallpaperColors.fromDrawable(artwork)        ← MediaControlPanel.getWallpaperColor()
+ *   → new ColorScheme(colors, false, 6)            ← Monet 生成调和色板
+ *   → MediaColorSchemesKt.textPrimaryFromScheme()   ← neutral1.s50
+ *     textSecondaryFromScheme()                     ← neutral2.s200
+ *     textTertiaryFromScheme()                      ← neutral2.s400
  *     accentPrimary / accentSecondary / primary / onPrimary ...
  *   → AnimatingColorTransition（333ms ValueAnimator）
  *   → setPlayerTextColor / setPlayerButtonStyle / setProgressBarStyle
  * ```
  *
- * 所以换歌、换壁纸、改主题，颜色都会自己跟着变，还带过渡动画。
- *
- * 之前那套「读下拉栏时钟色 → 覆盖整卡 → 拦截 setTextColor 别被刷回去 →
- * 把位图图标换成 extractAlpha 剪影 → 绘制前再校正一次」是在覆盖系统已经算好的结果，
- * 遇到的所有问题（颜色被刷回、图标不生效、切歌变黑）都是自己造出来的，已整体移除。
+ * 换歌、换壁纸、改主题，颜色都会自己跟着走，还带过渡动画。
+ * 之前那套「读时钟色 → 覆盖整卡 → 拦截 setTextColor 别被刷回去 → 换剪影图标 →
+ * 绘制前再校正」，是在覆盖系统已经算好的结果，遇到的问题全是自己造的，已整体移除。
  *
  * ## 现在只做两件事
  *
- * 1. 把系统给的实时模糊底包一层 [ArkGlassDrawable]（调透明度 + 轮廓高光），
- *    不采样下层纹理 —— 采样会卡顿且与实时模糊不同步；
- * 2. 播放键的玻璃圆盘，在系统重设 background 时保住。
+ * 1. **背景**：把系统给的实时模糊底包一层 [ArkGlassDrawable]；
+ * 2. **让背景跟上系统前景色的明暗** —— 见下。
+ *
+ * 系统前景色来自**专辑封面**，玻璃背景来自**壁纸**，两者不保证一致。
+ * 所以我们不碰前景色，而是反过来把背景拉进安全区间：
+ * 读到系统要用白字就把玻璃压暗，要用黑字就把玻璃提亮（[ArkGlassDrawable.setForegroundColor]）。
+ *
+ * 这个前景色只是**读**（`ColorSchemeTransition.textPrimary.targetColor`，
+ * 系统最终值，不受 333ms 动画影响），一个字都不改。
  */
 object ArkMediaCardStyleHook {
 
@@ -61,10 +63,13 @@ object ArkMediaCardStyleHook {
     /** 卡片圆角兜底（读不到 mClipCornerRadius 时用），与 qs_media_player_radius 一致 */
     private const val FALLBACK_RADIUS_DP = 24f
 
-    /** 播放键底盘：按「系统给图标上的色」决定明暗两套，保证在对应背景上可见 */
+    /** 播放键底盘：按系统前景明暗给两套，保证在对应背景上可见 */
     private class PlayStyle(val drawable: RippleDrawable, val light: Boolean)
 
     private val playGlass = WeakHashMap<View, PlayStyle>()
+
+    /** 上一次读到的系统前景色。create 时 panel 还没建好，用这个兜底 */
+    private var lastFg = 0
 
     fun install(lpp: de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam) {
         // 1) 视图创建：把卡片背景换成玻璃
@@ -78,22 +83,24 @@ object ArkMediaCardStyleHook {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val holder = param.result ?: return
-                        style(holder)
+                        style(holder, null)
                     }
                 }
             )
             XposedBridge.log("[$TAG] installing (glass only, 前景色交给系统)")
         }
 
-        // 2) 每次 bind 之后补一次（holder 可能被复用，背景会被重设）
+        // 2) 每次绑定之后补一次：holder 会被复用，背景可能被重设
         ArkHooks.quiet("mediaCard.panel") {
             val clazz = XposedHelpers.findClass(MEDIA_CONTROL_PANEL, lpp.classLoader)
-            ArkHooks.quiet("mediaCard.bindPlayer") {
-                XposedBridge.hookAllMethods(clazz, "bindPlayer", object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        styleOf(param.thisObject)
-                    }
-                })
+            listOf("setPlayerTextColor", "bindPlayer", "setPlayerButtonStyle").forEach { m ->
+                ArkHooks.quiet("mediaCard.$m") {
+                    XposedBridge.hookAllMethods(clazz, m, object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            styleOf(param.thisObject)
+                        }
+                    })
+                }
             }
         }
 
@@ -116,45 +123,93 @@ object ArkMediaCardStyleHook {
 
                         if (v.javaClass.name != CARD_ROOT) return
                         val raw = param.args[0] as? Drawable ?: return
-                        param.args[0] = wrapBackground(v, raw)
+                        val glass = glassOf(v, raw) ?: return
+                        glass.setForegroundColor(lastFg)
+                        param.args[0] = glass
                     }
                 }
             )
         }
     }
 
-    private fun style(holder: Any) {
+    // ---------------------------------------------------------------
+    // 样式
+    // ---------------------------------------------------------------
+
+    private fun style(holder: Any, panel: Any?) {
         try {
-            (field(holder, "player") as? View)?.let { player ->
-                // create 返回时背景已由 onFinishInflate 设好，这里补包一次；
-                // 之后系统重设背景由 setBackground 钩子接管。
-                player.background?.let { player.background = wrapBackground(player, it) }
+            val fg = systemForeground(panel).let { if (it != 0) it else lastFg }
+            if (fg != 0 && fg != lastFg) {
+                lastFg = fg
+                XposedBridge.log(
+                    "[$TAG] system foreground = #${Integer.toHexString(fg)} " +
+                        if (isLightColor(fg)) "(白字 → 玻璃压暗)" else "(黑字 → 玻璃提亮)"
+                )
             }
-            (field(holder, "actionPlayPause") as? ImageView)?.let { ensurePlayGlass(it) }
+
+            (field(holder, "player") as? View)?.let { player ->
+                val raw = player.background ?: return@let
+                val glass = glassOf(player, raw) ?: return@let
+                glass.setForegroundColor(fg)
+                if (raw !== glass) player.background = glass
+            }
+
+            (field(holder, "actionPlayPause") as? ImageView)?.let { ensurePlayGlass(it, fg) }
         } catch (t: Throwable) {
             XposedBridge.log("[$TAG] style failed: $t")
         }
     }
 
     private fun styleOf(panel: Any?) {
+        if (panel == null) return
         val holder = try {
             XposedHelpers.getObjectField(panel, "mMediaViewHolder")
         } catch (_: Throwable) {
             null
         } ?: return
-        style(holder)
+        style(holder, panel)
+    }
+
+    /**
+     * 读系统实际用在卡片上的前景色。
+     *
+     * 实测 `AnimatingColorTransition` **没有任何更新 `targetColor` 的方法** ——
+     * 构造时把 `sourceColor` / `currentColor` / `targetColor` 都设成默认色，之后再也不动，
+     * `valueAnimator` 也没人 start。也就是说那套 Monet 色板动画在这台机器上是**静止的**。
+     *
+     * 真正决定颜色的是 `MediaControlPanel.setPlayerTextColor()`（**无参**）：
+     * 它把标题设成 `R.color.qs_mediapalyer_titleText_color` 这个主题资源色，
+     * 深色主题给白、浅色主题给黑。所以直接读标题当前颜色就是系统真正在用的值，
+     * 而且 `setPlayerTextColor` 之后读是同步生效的。
+     *
+     * 读不到时退回 `ColorSchemeTransition.textPrimary.targetColor`（等于同一个默认色）。
+     */
+    private fun systemForeground(panel: Any?): Int {
+        if (panel == null) return 0
+
+        try {
+            val holder = XposedHelpers.getObjectField(panel, "mMediaViewHolder")
+            val t = field(holder, "titleText") as? TextView
+            if (t != null && t.currentTextColor != 0) return t.currentTextColor
+        } catch (_: Throwable) {
+        }
+
+        return try {
+            val cst = XposedHelpers.getObjectField(panel, "mColorSchemeTransition") ?: return 0
+            val tp = XposedHelpers.getObjectField(cst, "textPrimary") ?: return 0
+            XposedHelpers.getIntField(tp, "targetColor")
+        } catch (_: Throwable) {
+            0
+        }
     }
 
     // ---------------------------------------------------------------
     // 背景
     // ---------------------------------------------------------------
 
-    /**
-     * 把系统给的模糊壁纸背景包一层：只调节透明度 + 补一条轮廓高光，
-     * 不采样任何下层纹理（采样会卡顿、且与实时模糊不同步）。
-     */
-    private fun wrapBackground(v: View, base: Drawable): Drawable {
-        if (base is ArkGlassDrawable) return base
+    /** 包成玻璃层；已经是玻璃的直接返回（避免嵌套） */
+    private fun glassOf(v: View, base: Drawable): ArkGlassDrawable? {
+        (base as? ArkGlassDrawable)?.let { return it }
         return try {
             val ctx = v.context
             ArkGlassDrawable(
@@ -164,7 +219,7 @@ object ArkMediaCardStyleHook {
             )
         } catch (t: Throwable) {
             XposedBridge.log("[$TAG] wrap failed: $t")
-            base
+            null
         }
     }
 
@@ -183,19 +238,17 @@ object ArkMediaCardStyleHook {
     /**
      * 播放键的玻璃圆盘。
      *
-     * 明暗判定直接用**系统给这个图标设的 tint**（`imageTintList`）——
-     * 那正是 ColorSchemeTransition 算出来的前景色，不需要我们另外去猜。
-     * 读不到时按浅色前景处理。
+     * 明暗跟着系统前景色走：前景浅（深背景）用亮白圆盘，前景深（浅背景）用淡黑圆盘，
+     * 保证两种情况都有对比。
      */
-    private fun ensurePlayGlass(play: ImageView) {
-        val tint = play.imageTintList?.defaultColor ?: 0
-        val light = tint == 0 || isLight(tint)
+    private fun ensurePlayGlass(play: ImageView, fg: Int) {
+        val base = if (fg != 0) fg else (play.imageTintList?.defaultColor ?: 0)
+        val light = base == 0 || isLightColor(base)
 
         val made = playGlass[play]
         if (made != null && made.light == light && play.background === made.drawable) return
 
         val ctx = play.context
-        // 前景浅（深背景）→ 亮白圆盘；前景深（浅背景）→ 淡黑圆盘
         val body = if (light) 0x40FFFFFF else 0x14000000
         val edge = if (light) 0x66FFFFFF else 0x2E000000
         val press = if (light) 0x33FFFFFF else 0x1F000000
@@ -226,12 +279,6 @@ object ArkMediaCardStyleHook {
         } catch (_: Throwable) {
             null
         }
-    }
-
-    private fun isLight(color: Int): Boolean {
-        val lum =
-            (0.2126 * Color.red(color) + 0.7152 * Color.green(color) + 0.0722 * Color.blue(color)) / 255.0
-        return lum > 0.55
     }
 
     private fun dp(ctx: Context, value: Float): Int =

@@ -343,3 +343,77 @@ Icon artwork                                    ← 专辑封面（不是壁纸�
 ### 状态
 
 `versionCode 8 / 3.7.0`，编译通过。设备电量不足，**未做真机验证**，待用户自测。
+
+## 2026-11-04 · v3.8｜玻璃层亮度安全窗（前景色仍完全交给系统）
+
+### 要解决的矛盾
+
+v3.7 把前景色交回系统后，暴露出一个结构性冲突：
+
+- 系统前景色来自**专辑封面**的 Monet 色板；
+- 我们的玻璃背景来自**壁纸**。
+
+两者不保证一致。封面亮 → 系统给黑字，但壁纸可能很暗；
+封面暗 → 白字配亮壁纸同理。表现就是「字和背景糊在一起」。
+
+### 处理方向：改背景，不改前景
+
+系统的活是决定黑/白，我们的活是让背景跟上这个明暗。所以：
+
+| 系统前景 | 玻璃处理 | 结果 |
+|---|---|---|
+| 浅色（白字） | `ColorMatrix` 整体压暗 `×0.58` | 背景明度 ≤ 0.55，白字有对比 |
+| 深色（黑字） | 提亮到 `[0.36, 0.98]` | 黑字有对比 |
+
+用 `ColorMatrix` 做线性映射而不是叠纯色遮罩：**色相全部保留**，只是明暗被规范。
+所以玻璃依然是透的，只是透出来的画面不会把文字吃掉。
+
+### 前景色怎么读（只读不改）
+
+先说一个反编译时才发现的坑：
+
+`AnimatingColorTransition` **没有任何更新 `targetColor` 的方法** ——
+构造时把 `sourceColor` / `currentColor` / `targetColor` 全设成默认色，之后再也不动，
+`valueAnimator` 也没人 `start()`。`MediaControlPanel` 里除了两个 getter，没有任何地方
+调用 `mColorSchemeTransition` 的成员。**那套 Monet 色板动画在这台机器上是静止的。**
+
+真正决定颜色的是 `MediaControlPanel.setPlayerTextColor()`（**无参**）：
+它把标题设成 `R.color.qs_mediapalyer_titleText_color` 这个主题资源色 ——
+深色主题给白、浅色主题给黑，与壁纸无关。
+
+所以读 `titleText.currentTextColor` 就是系统真正在用的值，且 `setPlayerTextColor`
+之后同步生效；取不到才退回 `ColorSchemeTransition.textPrimary.targetColor`（同一个默认色）。
+
+这也解释了之前一直没想通的现象：换成浅色壁纸后白字看不清，
+不是我们取色取错了，而是**系统本来就只看主题、不看壁纸**。
+
+### 为什么不需要感知壁纸
+
+压暗 / 提亮是把背景亮度**区间规范化**，不是按壁纸明暗做补偿：
+
+- 白字 → 背景明度一律 ≤ 0.55 → 深壁纸更暗、浅壁纸压到 0.55 → 都够读；
+- 黑字 → 背景明度一律 ≥ 0.36 → 反向同理。
+
+所以换壁纸不需要重新判断，规则本身就把结果锁在安全区间里。
+
+### 实现要点
+
+- `ArkGlassDrawable.setForegroundColor(color)`：按明暗换 `ColorMatrixColorFilter`，
+  相同值直接 return，避免每帧重建；
+- 绘制改成 `canvas.saveLayer(bounds, layerPaint)`，`layerPaint` 同时承载整体透明度
+  和亮度映射 —— `BackgroundBlurDrawable` 走 RenderNode，只有落在 layer paint 上的
+  `alpha` / `colorFilter` 才会被真正读到；
+- 播放键圆盘的明暗也改成跟同一个前景色，前景深时改用淡黑圆盘（原来浅色背景上看不见）。
+
+### 状态
+
+`versionCode 9 / 3.8.0`，编译通过。**未真机验证**。
+
+验证时看日志这一行确认取色成功：
+
+```
+[FlymeArk/mediaCard] system foreground = #ff000000 (黑字 → 玻璃提亮)
+```
+
+若日志出现但画面明暗没有变化，说明 `saveLayer` 的 `colorFilter` 对系统模糊层不生效，
+需要改用离屏重绘或轻量 scrim 兜底。
