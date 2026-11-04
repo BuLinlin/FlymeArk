@@ -417,3 +417,90 @@ v3.7 把前景色交回系统后，暴露出一个结构性冲突：
 
 若日志出现但画面明暗没有变化，说明 `saveLayer` 的 `colorFilter` 对系统模糊层不生效，
 需要改用离屏重绘或轻量 scrim 兜底。
+
+## 2026-11-04 · v3.9｜前景色改成「资源层强制标准」，玻璃改 scrim
+
+### 参考：FlymeMod 怎么做全局修改
+
+`dev.rikumi.flymemod` 1.4.3（设备上已安装，作用域含 SystemUI）走的是**绘制时改写**：
+
+- hook `android.widget.TextView.onDraw` 与 `android.widget.ImageView.onDraw`（框架基类）；
+- 每次绘制前向上遍历父容器，判断这一坨文字/图标属于通知行、锁屏横幅还是媒体卡；
+- 属于就把前景强制成常量 `WHITE` / `BLACK`，原值存进 `WeakHashMap` 便于恢复；
+- QS 磁贴走另一套：把「白天资源色 → 对应夜间资源色」建一张 palette 表，绘制时按值替换。
+
+这比逐个 View 打补丁稳——**系统写回去也没用，因为最后一帧还是它说了算**。
+
+但它这组 hook 受 `shouldDarken(context)` 门控。设备日志：
+
+```
+Control center settings loaded: ... darken=false ...
+```
+
+即 **FlymeMod 当前并没有在改前景**，媒体卡的黑字不是它给的，是资源本身就是黑。
+
+### 我们的落点：再往下一层，改资源
+
+反编译 `MediaControlPanel` 可以看到，卡片所有前景都从同一族资源流出来：
+
+```java
+getColor(R.color.qs_mediapalyer_titleText_color)      // 标题
+getColor(R.color.qs_mediapalyer_artistText_color)     // 歌手
+getColor(R.color.qs_mediapalyer_seamlessText_color)   // 无缝播放
+getColor(R.color.qs_mediaplayer_play_button_color)    // 播控按钮 → setColorFilter
+getColor(R.color.qs_mediapalyer_progressbar_tint)     // 进度 / 底色 / 滑块 → Drawable.setTint
+```
+
+`getColor(int)` 内部就是 `Resources.getColor(id)`。所以**在出口处拦截**即可：
+
+- 不需要每帧参与绘制（FlymeMod 是每帧每 TextView 一次）；
+- 连它管不到的 `progressbar_*`、`seekbar thumb` 也一起统一；
+- 不跟系统的重绑打架——`setPlayerButtonStyle()` 里那句 `setColorFilter(getColor(...))`
+  拿到的已经是我们给的值，所以「点播放键变回 #333」从源头消失。
+
+`ArkForegroundStandard` 按资源名分三层，只认 `com.android.systemui:color/qs_mediapalyer_*`
+和 `qs_mediaplayer_*`（Flyme 少写了个 e，两种拼写都存在）：
+
+| 层级 | 覆盖资源 | 浅色模式 | 深色模式 |
+|---|---|---|---|
+| primary | 标题 / 播控按钮 / 进度 / 滑块 | `#000000` | `#FFFFFF` |
+| secondary | 歌手 / 无缝播放 / 时间 | `#99000000` | `#B3FFFFFF` |
+| tertiary | 进度条底色（`*_background_tint`） | `#4D000000` | `#59FFFFFF` |
+
+id → 层级的判定结果缓存在 `SparseIntArray`，命中后是一次数组查，未命中才加锁补算。
+
+### 玻璃：ColorFilter 换成 scrim
+
+v3.8 用 `saveLayer` 的 `ColorMatrixColorFilter` 提亮/压暗，前提是 RenderNode 播放时
+会读 layer paint 上的 colorFilter —— 属于实现细节，不可预期。
+
+改成 scrim（半透明纯色盖在模糊层上，也在文字之下）：
+
+- 由我们自己的 Canvas 画，结果 100% 确定；
+- 这本来就是磨砂玻璃的做法：模糊 + 染色两层；
+- 浅色模式盖 `#57FFFFFF`（黑字），深色模式盖 `#73000000`（白字）；
+- 描边同步换色：深色玻璃用白描边，浅色玻璃用极淡的深色（白描边在白底上等于没有）。
+
+`ALPHA` 仍为 0.86，模糊底留一丝透出。
+
+### 与 FlymeMod 的边界
+
+两边都在改前景时，**以绘制时改写为准**（它在我们后面、且每帧都压一次）。所以：
+
+- 想让标准只有一套 → FlymeMod 里「深色背景（darken）」保持关闭，由我们这层负责；
+- 想交给它 → 我们把 `ArkForegroundStandard` 撤掉，只留玻璃跟随。
+
+### 状态
+
+`versionCode 10 / 3.9.0`，已装机（MEIZU 21 Pro）。SystemUI 重启后日志：
+
+```
+[FlymeArk/fg] 前景标准已接管（资源层），includeQs=false
+[FlymeArk/mediaCard] 标准 = 浅色(黑字 + 亮玻璃)
+[FlymeArk/fg] 命中 #7f06074c tier=1 → 浅色模式(黑字)
+```
+
+`#7f06074c` = `qs_mediapalyer_titleText_color`，命中 primary 层，返回 `#000000`。
+
+QS 磁贴 / 通知行暂不纳入（`includeQs = false`），需要时把它打开即可，
+名单就是 FlymeMod 那张 palette 表。
