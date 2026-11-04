@@ -139,6 +139,9 @@ internal object ArkLiveExpandHook {
     /** 取证日志去重：每首歌只打一轮 action 列表 */
     private var favLogKey: String? = null
 
+    /** 上次 send 收藏 action 的时间（SystemUI 侧防抖） */
+    private var lastFavSendAt = 0L
+
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         if (lpp.packageName != ArkConstants.SYSTEMUI_PKG) return
 
@@ -504,6 +507,14 @@ internal object ArkLiveExpandHook {
 
     /** 面板点 ❤ → 触发通知上的收藏按钮（PendingIntent 是 QQ 音乐自己的，send 无需权限） */
     fun toggleFavorite(ctx: Context?) {
+        // v3.14.1：收藏按钮是 toggle 语义，连点会在"收藏/取消"之间抖动；
+        // SystemUI 侧再兜一道 800ms 防抖（面板 600ms 之后的窗口期）
+        val now = SystemClock.uptimeMillis()
+        if (now - lastFavSendAt < 800L) {
+            XposedBridge.log("$TAG: favorite throttled")
+            return
+        }
+        lastFavSendAt = now
         val pi = favIntent
         if (pi == null) {
             XposedBridge.log("$TAG: favorite skipped (no like action)")

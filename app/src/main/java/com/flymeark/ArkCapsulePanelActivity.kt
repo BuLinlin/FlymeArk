@@ -46,6 +46,13 @@ private const val OPEN_APP_DEBOUNCE_MS = 800L
 private const val FAV_DEBOUNCE_MS = 600L
 
 /**
+ * 点击后锁定收藏推送状态的时长。
+ * QQ 音乐通知按钮标题滞后 1~5 秒才反映真实收藏状态，期间推送的是旧状态，
+ * 会把面板乐观切换的 ❤ 重置（v3.14.0 实测「取消收藏失败」即此因）。
+ */
+private const val FAV_PUSH_LOCK_MS = 6_000L
+
+/**
  * v2.6：点击实况胶囊后从状态栏下方展开的播放控制面板。
  *
  * 触发方：[ArkLiveExpandHook] 在 SystemUI 进程拦截胶囊点击后 startActivity，
@@ -75,6 +82,7 @@ class ArkCapsulePanelActivity : Activity() {
     private lateinit var prevBtn: ImageView
     private lateinit var nextBtn: ImageView
     private lateinit var favBtn: ImageView
+    private lateinit var appIconView: ImageView
 
     private lateinit var morph: ArkMorphAnim
 
@@ -183,42 +191,16 @@ class ArkCapsulePanelActivity : Activity() {
     }
 
     /**
-     * v3.13.3：系统同款玻璃背景（对齐下拉栏媒体卡）。
+     * v3.14.1：背景改回透明。
      *
-     * 两层结构，与 MzBlurUtils 的系统玻璃同构：
-     *  1. blurBehindRadius —— 窗口背后的真实壁纸/启动器被模糊（系统媒体卡是
-     *     BackgroundBlurDrawable 180，Activity 没有那个 API，用 blurBehind 等价实现）；
-     *  2. 玻璃染色 scrim —— 铺在 root 上，浅色 70% 白 / 深色 70% 深灰，
-     *     色值与系统 0xB2 染色完全一致。
-     *
-     * 降级：系统关闭跨窗口模糊（省电模式/开发者选项）时 scrim 加深到 88%，
-     * 保证面板依然可读，只是没有「透」的感觉。
+     * v3.14.0 试过「窗口 blurBehind + 全屏 scrim」，但面板窗口是全屏的，
+     * blur 作用于整个屏幕（用户反馈「整个页面都变成毛玻璃」）。
+     * 普通 App 没有局部背后模糊的 API，所以只保留卡片的玻璃配色，
+     * 卡片外完全透明（点空白收起的手势区域也保持原样）。
      */
     private fun applySystemGlass() {
-        if (Build.VERSION.SDK_INT >= 31) {
-            try {
-                window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
-                window.attributes = window.attributes.apply {
-                    blurBehindRadius = px(24)
-                }
-            } catch (_: Throwable) {
-            }
-        }
+        // 背景：无模糊、无染色；玻璃质感只由 panel_card 自身承担
     }
-
-    /** 玻璃染色层：blur 可用 = 系统同款 70%；不可用 = 88% 实底保可读。须在 bindViews 之后调用 */
-    private fun updateGlassScrim() {
-        val blurOk = try {
-            if (Build.VERSION.SDK_INT >= 31) window.windowManager.isCrossWindowBlurEnabled else false
-        } catch (_: Throwable) {
-            false
-        }
-        val alpha = if (blurOk) 0xB2 else 0xE1
-        val color = if (nightMode) (alpha shl 24) or 0x1A1A1A else (alpha shl 24) or 0xFFFFFF
-        root.background = android.graphics.drawable.ColorDrawable(color)
-    }
-
-    private fun px(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
     /** SystemUI 传来的胶囊屏幕矩形；缺失时交给 [ArkMorphAnim] 用兜底尺寸 */
     private fun capsuleRect(): Rect? {
@@ -260,13 +242,22 @@ class ArkCapsulePanelActivity : Activity() {
         prevBtn = findViewById(R.id.panel_prev)
         nextBtn = findViewById(R.id.panel_next)
         favBtn = findViewById(R.id.panel_fav)
+        appIconView = findViewById(R.id.panel_app_icon)
+
+        // v3.14.1：右上角显示当前媒体 App 图标（参考图四排版）
+        try {
+            appIconView.setImageDrawable(
+                packageManager.getApplicationIcon(ArkConstants.MEDIA_APP_PKG)
+            )
+        } catch (_: Throwable) {
+            appIconView.visibility = View.GONE
+        }
 
         // v3.13：样式对齐系统媒体卡 —— 配色按深浅模式一套走
         nightMode =
             (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
         applyPalette()
-        updateGlassScrim()
 
         // 点空白收起；点卡片跳转音乐 App（对齐系统媒体卡行为）
         root.setOnClickListener { dismiss() }
@@ -301,7 +292,9 @@ class ArkCapsulePanelActivity : Activity() {
         playing = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_PLAYING, true)
         clickIntentOf(i)?.let { lastClickIntent = it }
         setNight(i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode))
-        if (i.hasExtra(ArkConstants.EXTRA_PANEL_FAV)) {
+        if (i.hasExtra(ArkConstants.EXTRA_PANEL_FAV) &&
+            android.os.SystemClock.uptimeMillis() - lastFavAt > FAV_PUSH_LOCK_MS
+        ) {
             favState = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
         }
         updateFavIcon()
@@ -351,12 +344,18 @@ class ArkCapsulePanelActivity : Activity() {
         playing = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_PLAYING, playing)
         clickIntentOf(i)?.let { lastClickIntent = it }
         setNight(i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode))
-        // v3.13.3：SystemUI 从通知按钮标题推来的收藏状态（缺省=未推送，保持现状）
+        // v3.13.3：SystemUI 从通知按钮标题推来的收藏状态。
+        // QQ 音乐按钮标题变化滞后 1~5 秒（随通知刷新才更新），点击后的首轮推送
+        // 反映的是「点击前」的状态，会把你刚点亮的 ❤ 重置回去（实测 bug）。
+        // 所以点击后 6 秒内忽略推送，只信本地乐观状态；6 秒后推送即可纠正真实漂移。
         if (i.hasExtra(ArkConstants.EXTRA_PANEL_FAV)) {
-            val s = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
-            if (s != favState) {
-                favState = s
-                updateFavIcon()
+            val sinceClick = android.os.SystemClock.uptimeMillis() - lastFavAt
+            if (sinceClick > FAV_PUSH_LOCK_MS) {
+                val s = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_FAV, false)
+                if (s != favState) {
+                    favState = s
+                    updateFavIcon()
+                }
             }
         }
 
@@ -490,7 +489,6 @@ class ArkCapsulePanelActivity : Activity() {
         if (night == nightMode) return
         nightMode = night
         applyPalette()
-        updateGlassScrim()
     }
 
     // ------------------------------------------------------------------

@@ -44,12 +44,17 @@
             android:paddingTop="18dp"
             android:paddingBottom="16dp">
 
-            <!-- 封面 + 曲目信息 -->
-            <LinearLayout
+            <!-- 封面 + 曲目信息（v3.14.1：右上角显示媒体 App 图标，参考用户提供的参考图） -->
+            <FrameLayout
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
+                android:layout_height="wrap_content">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="30dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
 
                 <!--
                   v3.12：封面位改成「双图插槽」做左右轮播。
@@ -102,7 +107,19 @@
                         android:layout_marginTop="3dp"
                         android:text="" />
                 </LinearLayout>
-            </LinearLayout>
+
+                <!-- 当前媒体 App 图标（右上角，参考图四排版） -->
+                </LinearLayout>
+
+                <!-- 当前媒体 App 图标（右上角，参考图四排版） -->
+                <ImageView
+                    android:id="@+id/panel_app_icon"
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:layout_gravity="top|end"
+                    android:importantForAccessibility="no"
+                    android:scaleType="fitCenter" />
+            </FrameLayout>
 
             <!--
               进度条：v3.13 起可拖动 seek。
@@ -143,21 +160,23 @@
             </LinearLayout>
 
             <!--
-              控制按钮（v3.13.3）：❤ 上一首 播放 下一首，对齐系统媒体卡布局。
-              四个按钮用 weight 均匀分布，播放键仍是视觉中心（尺寸更大）。
+              控制按钮（v3.14.1）：播放键绝对居中（用户反馈跑偏）。
+              左区 ❤ + 上一首（靠拢播放键），右区下一首（对称位置），
+              与参考图四一致；右侧留白给后续的输出切换/歌词按钮。
             -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:baselineAligned="false"
+                android:gravity="center_vertical"
                 android:orientation="horizontal">
 
                 <LinearLayout
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:gravity="center"
+                    android:gravity="end|center_vertical"
                     android:orientation="horizontal">
 
                     <ImageView
@@ -168,53 +187,39 @@
                         android:contentDescription="@string/ark_panel_fav"
                         android:padding="11dp"
                         android:src="@drawable/ic_ark_fav" />
-                </LinearLayout>
-
-                <LinearLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:gravity="center"
-                    android:orientation="horizontal">
 
                     <ImageView
                         android:id="@+id/panel_prev"
                         android:layout_width="46dp"
                         android:layout_height="46dp"
+                        android:layout_marginEnd="18dp"
                         android:background="?android:attr/selectableItemBackgroundBorderless"
                         android:contentDescription="@string/ark_panel_prev"
                         android:padding="11dp"
                         android:src="@drawable/ic_ark_prev" />
                 </LinearLayout>
 
-                <LinearLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:gravity="center"
-                    android:orientation="horizontal">
-
-                    <ImageView
-                        android:id="@+id/panel_play"
-                        android:layout_width="58dp"
-                        android:layout_height="58dp"
-                        android:background="@drawable/bg_ark_play_btn"
-                        android:contentDescription="@string/ark_panel_play"
-                        android:padding="16dp"
-                        android:src="@drawable/ic_ark_play" />
-                </LinearLayout>
+                <ImageView
+                    android:id="@+id/panel_play"
+                    android:layout_width="58dp"
+                    android:layout_height="58dp"
+                    android:background="@drawable/bg_ark_play_btn"
+                    android:contentDescription="@string/ark_panel_play"
+                    android:padding="16dp"
+                    android:src="@drawable/ic_ark_play" />
 
                 <LinearLayout
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:gravity="center"
+                    android:gravity="start|center_vertical"
                     android:orientation="horizontal">
 
                     <ImageView
                         android:id="@+id/panel_next"
                         android:layout_width="46dp"
                         android:layout_height="46dp"
+                        android:layout_marginStart="18dp"
                         android:background="?android:attr/selectableItemBackgroundBorderless"
                         android:contentDescription="@string/ark_panel_next"
                         android:padding="11dp"
