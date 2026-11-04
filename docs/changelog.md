@@ -220,3 +220,71 @@ liveLyric: mIsMediaShow forced true
 > （日志 `70 -> 2604 -> 3094 -> 3584` 一路跑飞），改 `leftMargin` 同样成环。
 > 结论：Flyme 原生状态栏歌词本身也是「胶囊占位、时钟让开」这套逻辑，保持一致即可。
 > 当前代码里没有这条链路（`ArkStatusBarClockHook` 已删除）。
+
+## 2026-11-04 · v3.4｜下拉栏媒体卡换成液态玻璃
+
+**目标**：`MediaCarousel` 顶部那张媒体卡不再用系统磨砂底色，改成透出壁纸的玻璃面板。
+
+- 新增 `ArkMediaCardStyleHook`：从 `MediaViewHolder.Companion.create` 拿到 holder，
+  把 `player`（`MediaCarouseTransitionLayout`）的背景包一层 `ArkGlassDrawable`。
+- **不再采样下层纹理**：实测截屏取色会有 1~2 帧延迟，与实时模糊对不上，还会卡。
+  改为在系统 `WallpaperBlurDrawable` 之上只做「调透明度 + 轮廓高光」，底子仍是系统实时模糊。
+- `ArkGlassDrawable` 用 AGSL（`RuntimeShader`）画圆角矩形：曲面折射扰动 + 弱色散 +
+  菲涅尔高光 + 非均匀透明度（中心更透、边缘收暗）。
+- `MediaControlPanel` 的 `setPlayerTextColor` / `setPlayerButtonStyle` /
+  `setProgressBarStyle` / `bindPlayer` 之后反复应用，避免被 bind 覆盖。
+
+## 2026-11-04 · v3.5｜整卡前景色跟随系统时钟
+
+**起因**：卡片原来用的是 `R.color.qs_mediapalyer_*`（夜间模式主题色），深色壁纸下依然是黑字。
+
+- 新增 `ArkShadeTint`：从视图树里找字号最大的 `HH:mm` 文本（下拉栏大时钟），
+  直接读它的 `currentTextColor` —— 那就是 SystemUI 按壁纸明暗算好的前景色。
+- 标题 / 歌手 / 时间 / 图标 / 进度条统一用这个颜色，只靠透明度分层。
+- 播放键加玻璃圆盘底盘（`RippleDrawable`），并在 `View.setBackground` 钩子里顶掉系统重设。
+
+## 2026-11-04 · v3.6｜前景色跟随系统时钟，切歌/播放不再刷回黑色
+
+**现象**：在 QQ 音乐里点播放/暂停/上一首/下一首，卡片文字与底部图标变回深色（`#333`）。
+
+### 根因一：前景色来源取错了
+
+最初从视图树里找 `<HH:mm>` 文本读颜色，但 Flyme 下拉栏展开时存在两个同形文本：
+状态栏小钟（约 42px，白）和 header 大时钟（约 112px，黑），时序交错，
+取到的经常是错的那个 —— 表现就是「浅色壁纸配白字」。
+
+也试过 `Clock.onDarkChanged(regions, darkIntensity, rootViewTint)` 的第三个参数，
+但实测它给的是**状态栏图标**的颜色（展开后恒为 `#e6ffffff`），
+和大时钟实际的 `#e6000000` 不一致，直接用会复现同一个问题。
+
+**修复**：在 `TextView.setTextColor` 的 after 里抓「谁被赋色」——
+文本形如 `HH:mm` 且字号 ≥ 60px 的那个才是用户看到的大时钟（卡片里的 `00:20` 只有 36px，
+靠字号即可排除），读它被赋的实际颜色。用户在主题里自定义时钟颜色也走这条路。
+`onDarkChanged` 保留作兜底（时钟实现被主题替换时）。颜色变化后 500ms 防抖再采纳，
+避免开合动画抖动；采纳后通知所有卡片重刷。
+
+### 根因二：按钮图标是位图，颜色滤镜改不到像素
+
+`action0..action4` / `seamlessIcon` 的 `src` 是 75×75 的 `BitmapDrawable`。
+`setColorFilter` / `imageTintList` 都设上了（日志 `cf=#e6ffffff tint=#e6ffffff`），
+但画面仍是原图的黑色 —— 滤镜没有落到共享 ConstantState 的位图像素上。
+
+**修复**：不再靠滤镜，改成**换图**：
+
+- `SilhouetteDrawable`：把原图标渲染一次，`extractAlpha()` 抽出 alpha 蒙版，
+  再用目标色重填，得到同形状的纯色剪影；
+- `intrinsicWidth/Height` 原样转发给源 drawable，绘制时把剪影拉伸到 bounds ——
+  直接返回 `BitmapDrawable` 会被 density 换算，图标缩水约 1/3；
+- 在 `ImageView.setImageDrawable` 的 before 里拦截，系统换播放↔暂停图标时自动重新生成剪影；
+- 保留 `onDraw` 前的校正和 `setColorFilter` 拦截作为兜底。
+
+### 真机验证（MEIZU 21 Pro / `481QHGFN226P5`，7 / 3.6.0）
+
+依次点击播放、下一首、上一首，每次截图对比：
+
+```
+z1 diff=6.5   z2 diff=9.4   z3 diff=6.7     （画面确实变了 = 点击生效）
+标题 / 歌手 / 时间 / 进度条 / 5 个按钮        全程白色
+```
+
+图标在播放↔暂停之间切换后仍是白色，说明 `setImageDrawable` 拦截生效。
