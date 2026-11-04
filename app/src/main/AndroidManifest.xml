@@ -37,7 +37,7 @@
 
         <!-- LSPosed 模块元数据 -->
         <meta-data android:name="xposedmodule" android:value="true" />
-        <meta-data android:name="xposeddescription" android:value="一个针对魅族实况通知优化插件模块。在 LSPosed 中启用并勾选 系统界面 / QQ音乐 / 网易云音乐 即可使用，无需在系统设置里额外开启实况通知&#10;开发者：多爱梦" />
+        <meta-data android:name="xposeddescription" android:value="一个针对魅族实况通知优化插件模块。在 LSPosed 中启用并勾选 系统界面 / QQ音乐 / 网易云音乐，然后到 设置-通知与状态栏-实况通知 里打开对应 App 的开关（两个 App 的开关互相独立）&#10;开发者：多爱梦" />
         <meta-data android:name="xposedminversion" android:value="82" />
         <!-- 推荐作用域；system_server 需在管理器里手动勾选「系统框架」 -->
         <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
