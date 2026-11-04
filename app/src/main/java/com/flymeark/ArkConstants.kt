@@ -18,8 +18,17 @@ object ArkConstants {
     /** SystemUI 进程包名（面板媒体键定向广播目标） */
     const val SYSTEMUI_PKG = "com.android.systemui"
 
-    /** 媒体 App 包名（QQ 音乐）。跳转兜底：session 没给 sessionActivity 时按包名拉主界面 */
+    /**
+     * 支持的媒体 App（v3.15 起）。QQ音乐 与 网易云音乐 都走魅族状态栏歌词
+     * （ticker 协议），SystemUI 侧链路对二者通用，只是各自包名不同。
+     */
     const val MEDIA_APP_PKG = "com.tencent.qqmusic"
+    const val NETEASE_MUSIC_PKG = "com.netease.cloudmusic"
+
+    val MEDIA_APP_PKGS: Set<String> = setOf(MEDIA_APP_PKG, NETEASE_MUSIC_PKG)
+
+    /** 是否为本模块支持的媒体 App 包名（网易云/QQ音乐） */
+    fun isMediaApp(pkg: String?): Boolean = pkg != null && pkg in MEDIA_APP_PKGS
 
     /** 设置进程包名（把 QQ音乐登记进「实况通知」设置页） */
     const val SETTINGS_PKG = "com.android.settings"
@@ -108,6 +117,30 @@ object ArkConstants {
      * 与下拉栏媒体卡「点卡片进 App」行为对齐。
      */
     const val EXTRA_PANEL_CLICK_INTENT = "panel_click_intent"
+
+    /**
+     * SystemUI → 播放面板：当前媒体 App 的包名（v3.15）。
+     * 来自歌词通知的归属包名；面板用它显示右上角 App 图标 + 跳转兜底。
+     */
+    const val EXTRA_PANEL_APP_PKG = "panel_app_pkg"
+
+    // ------------------------------------------------------------------
+    // 输出切换（v3.15）：面板 → SystemUI 列出/切换音频输出路由。
+    // SystemUI（system uid）内反射调用 MediaRouter2Manager，面板普通 uid 拿不到。
+    // ------------------------------------------------------------------
+
+    /** 面板 → SystemUI：请求列出当前媒体 App 可用的输出路由 */
+    const val ACTION_PANEL_OUTPUT_LIST = "com.flymeark.PANEL_OUTPUT_LIST"
+
+    /** SystemUI → 面板：路由列表回复。extras：routes_names / routes_ids / routes_selected */
+    const val ACTION_OUTPUT_ROUTES = "com.flymeark.OUTPUT_ROUTES"
+    const val EXTRA_ROUTE_NAMES = "route_names"
+    const val EXTRA_ROUTE_IDS = "route_ids"
+    const val EXTRA_ROUTE_SELECTED = "route_selected"
+
+    /** 面板 → SystemUI：切换输出路由（extra：EXTRA_ROUTE_ID） */
+    const val ACTION_PANEL_OUTPUT_TRANSFER = "com.flymeark.PANEL_OUTPUT_TRANSFER"
+    const val EXTRA_ROUTE_ID = "route_id"
 
     /**
      * SystemUI → 播放面板：SystemUI 侧判断的深色模式（v3.13.1）。

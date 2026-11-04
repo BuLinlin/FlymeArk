@@ -26,8 +26,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
  */
 internal object ArkLiveAllowHook {
 
-    /** 目标播放器包名（后续可扩展） */
-    private val TARGET_PKGS = setOf("com.tencent.qqmusic")
+    /** 目标播放器包名（v3.15：QQ音乐 + 网易云音乐，均走魅族状态栏歌词协议） */
+    private val TARGET_PKGS = ArkConstants.MEDIA_APP_PKGS
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         // 仅在 system_server 进程（包名 "android"）安装

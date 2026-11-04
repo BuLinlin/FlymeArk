@@ -41,7 +41,6 @@ internal object ArkLiveCoverHook {
         "com.flyme.statusbar.livenotification.LiveNotificationController"
     private const val VIEW_CLS = "com.flyme.statusbar.livenotification.LiveNotificationView"
     private const val INFO_CLS = "com.android.systemui.shared.livenotification.LiveNotificationInfo"
-    private const val QQ_MUSIC = "com.tencent.qqmusic"
 
     /** 圆角半径占边长的比例（接近实况胶囊图标的 22% 圆角视觉） */
     private const val CORNER_RATIO = 0.24f
@@ -72,7 +71,7 @@ internal object ArkLiveCoverHook {
                             val entry = param.args[2] ?: return
                             val sbn = XposedHelpers.callMethod(entry, "getSbn") ?: return
                             val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String
-                            if (pkg != QQ_MUSIC) return
+                            if (!ArkConstants.isMediaApp(pkg)) return
 
                             val ctrl = param.thisObject
                             val info = XposedHelpers.getObjectField(ctrl, "mLyricsInofo") ?: return

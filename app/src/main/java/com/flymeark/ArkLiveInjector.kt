@@ -30,19 +30,29 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 internal object ArkLiveInjector {
 
     private const val TAG = "liveInject"
-    private const val QQ_MUSIC = "com.tencent.qqmusic"
 
-    /** QQ音乐 侧「魅族状态栏歌词」开关广播（RemoteLyricController.LyricSwitchReceiver 接收） */
-    private const val ACTION_MEIZU_LYRIC_ON =
-        "com.tencent.qqmusic.ACTION_MEIZU_LYRIC_TURN_ON.QQMusicPhone"
+    /**
+     * 各播放器侧「魅族状态栏歌词」开关广播（RemoteLyricController.LyricSwitchReceiver 接收）。
+     *  - QQ音乐：action 确认（反编译）。
+     *  - 网易云：action 无公开文档，按 QQ音乐 的 `<pkg>.ACTION_MEIZU_LYRIC_TURN_ON.<进程>`
+     *    模式探测两种常见形式；收不到就是无效果（无接收者广播是 no-op），用户仍可在
+     *    网易云【设置 → 状态栏歌词】手动开启（官方支持，一次性）。
+     */
+    private val LYRIC_ON_ACTIONS: Map<String, List<String>> = mapOf(
+        "com.tencent.qqmusic" to listOf(
+            "com.tencent.qqmusic.ACTION_MEIZU_LYRIC_TURN_ON.QQMusicPhone"
+        ),
+        "com.netease.cloudmusic" to listOf(
+            "com.netease.cloudmusic.ACTION_MEIZU_LYRIC_TURN_ON",
+            "com.netease.cloudmusic.ACTION_MEIZU_LYRIC_TURN_ON.com.netease.cloudmusic"
+        )
+    )
 
-    /** 上次请求开启歌词的时间戳（节流，避免每条通知都发广播） */
-    @Volatile
-    private var lastLyricRequestAt = 0L
+    /** 上次请求开启歌词的时间戳（按包分记，节流 60s） */
+    private val lastLyricRequestAt = HashMap<String, Long>(2)
 
-    /** 本进程是否已做过首次歌词通道补发 */
-    @Volatile
-    private var lyricPrimed = false
+    /** 已做过首次歌词通道补发的包 */
+    private val lyricPrimedPkgs = HashSet<String>(2)
 
     /**
      * 判断一条通知是否为媒体通知。
@@ -64,24 +74,29 @@ internal object ArkLiveInjector {
     }
 
     /**
-     * 打开 QQ音乐 的「魅族状态栏歌词」通道。
+     * 打开播放器的「魅族状态栏歌词」通道。
      *
-     * 实况胶囊的歌词来自通知 `tickerText`，而 QQ音乐 只有在收到
-     * `ACTION_MEIZU_LYRIC_TURN_ON.QQMusicPhone` 后才会逐行往播放通知上写 ticker。
+     * 实况胶囊的歌词来自通知 `tickerText`，播放器只有收到自己的
+     * `ACTION_MEIZU_LYRIC_TURN_ON.*` 后才会逐行往播放通知上写 ticker。
      * 这里在播放器首次发媒体通知时补发一次，让用户无需手动触发；
      * 若检测到 ticker 又变空（用户关了歌词开关），60s 后允许重发一次。
      */
-    private fun ensureMeizuLyric() {
+    private fun ensureMeizuLyric(pkg: String) {
         // 取不到 Context 时不写节流时间戳，留待下一次通知重试
         val now = System.currentTimeMillis()
-        if (now - lastLyricRequestAt < 60_000L) return
-        val ctx = ArkHooks.appContext() ?: return
-        try {
-            ctx.sendBroadcast(Intent(ACTION_MEIZU_LYRIC_ON).setPackage(QQ_MUSIC))
-            lastLyricRequestAt = now
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: sent lyric-turn-on")
-        } catch (t: Throwable) {
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: enable lyric failed: ${t.message}")
+        synchronized(lastLyricRequestAt) {
+            if (now - (lastLyricRequestAt[pkg] ?: 0L) < 60_000L) return
+            val ctx = ArkHooks.appContext() ?: return
+            try {
+                val actions = LYRIC_ON_ACTIONS[pkg] ?: listOf("$pkg.ACTION_MEIZU_LYRIC_TURN_ON")
+                for (action in actions) {
+                    ctx.sendBroadcast(Intent(action).setPackage(pkg))
+                }
+                lastLyricRequestAt[pkg] = now
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: sent lyric-turn-on -> $pkg (${actions.size} action)")
+            } catch (t: Throwable) {
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: enable lyric failed: ${t.message}")
+            }
         }
     }
 
@@ -91,7 +106,7 @@ internal object ArkLiveInjector {
      */
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         val pkg = lpp.packageName
-        if (pkg != QQ_MUSIC) return
+        if (pkg !in ArkConstants.MEDIA_APP_PKGS) return
 
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG installing for $pkg (lyric priming only)")
 
@@ -103,11 +118,12 @@ internal object ArkLiveInjector {
 
                     // 进程内首条媒体通知无条件补发一次；
                     // 之后仅在 ticker 为空（歌词被关掉/未就绪）时按 60s 节流重试。
-                    if (!lyricPrimed) {
-                        lyricPrimed = true
-                        ensureMeizuLyric()
+                    val primed = synchronized(lyricPrimedPkgs) { lyricPrimedPkgs.contains(pkg) }
+                    if (!primed) {
+                        synchronized(lyricPrimedPkgs) { lyricPrimedPkgs.add(pkg) }
+                        ensureMeizuLyric(pkg)
                     } else if (n.tickerText == null) {
-                        ensureMeizuLyric()
+                        ensureMeizuLyric(pkg)
                     }
                 } catch (t: Throwable) {
                     XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")

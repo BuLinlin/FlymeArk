@@ -28,7 +28,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 internal object ArkLiveSettingsHook {
 
     private const val TAG = "liveSettings"
-    private const val QQ_MUSIC = "com.tencent.qqmusic"
+
+    /** v3.15：登记进设置页的媒体 App（包名 → 显示名） */
+    private val TARGETS = linkedMapOf(
+        "com.tencent.qqmusic" to "QQ音乐",
+        "com.netease.cloudmusic" to "网易云音乐"
+    )
 
     private const val CLS_FRAGMENT =
         "com.meizu.settings.notification.fragment.FlymeLiveFragmentNew"
@@ -40,7 +45,7 @@ internal object ArkLiveSettingsHook {
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         if (lpp.packageName != ArkConstants.SETTINGS_PKG) return
 
-        // 1) 实况通知主页：initConfigs 结束后往 mConfigs 注入一条 QQ音乐配置
+        // 1) 实况通知主页：initConfigs 结束后往 mConfigs 注入媒体 App 配置（QQ音乐/网易云）
         ArkHooks.quiet("$TAG initConfigs") {
             XposedHelpers.findAndHookMethod(
                 CLS_FRAGMENT, lpp.classLoader, "initConfigs",
@@ -60,7 +65,7 @@ internal object ArkLiveSettingsHook {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
                             val pkg = XposedHelpers.getObjectField(param.thisObject, "mAppPkg") as? String
-                            if (pkg == QQ_MUSIC) {
+                            if (pkg != null && pkg in TARGETS) {
                                 param.result = 0   // BasePreferenceController.AVAILABLE
                                 XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: force AVAILABLE for $pkg")
                             }
@@ -83,39 +88,48 @@ internal object ArkLiveSettingsHook {
                 XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: mConfigs null, skip")
                 return
             }
-            // 去重（initConfigs 每次 onResume 都会重建列表，这里防御性判断）
+            // 去重：已在列表里的包不再注入（initConfigs 每次 onResume 都会重建，防御性判断）
+            val existing = HashSet<String>()
             for (item in list) {
                 val p = XposedHelpers.getObjectField(item, "packageName") as? String
-                if (p == QQ_MUSIC) return
+                if (p != null) existing.add(p)
             }
 
             val cfgClass = XposedHelpers.findClass(CLS_CONFIG, cl)
-            val cfg = newConfig(cfgClass)
             val ctx = fragmentContext(param.thisObject)
-            val uid = resolveUid(param.thisObject, ctx)
+            var injected = 0
+            for ((pkg, title) in TARGETS) {
+                if (pkg in existing) continue
+                val cfg = newConfig(cfgClass)
+                val uid = packageUid(ctx ?: ArkHooks.appContext(), pkg)
+                if (uid <= 0) continue  // App 未安装则不登记
 
-            XposedHelpers.setObjectField(cfg, "packageName", QQ_MUSIC)
-            // delegatedPackageName 留空：updatePreferenceStates 会走最干净的
-            // app_category 非代理分支（回显 getNotificationLiveAllowForPackage(uid, packageName)，
-            // 点击 setNotificationLiveAllowForPackage），避开美团/百度地图等厂商特判。
-            XposedHelpers.setObjectField(cfg, "delegatedPackageName", null)
-            XposedHelpers.setObjectField(cfg, "title", "QQ音乐")
-            XposedHelpers.setObjectField(cfg, "description", "音乐播放实况通知")
-            XposedHelpers.setBooleanField(cfg, "isService", false)  // false → app_category
-            XposedHelpers.setIntField(cfg, "uid", uid)
-            XposedHelpers.setIntField(cfg, "delegatedUid", uid)
+                XposedHelpers.setObjectField(cfg, "packageName", pkg)
+                // delegatedPackageName 留空：updatePreferenceStates 会走最干净的
+                // app_category 非代理分支（回显 getNotificationLiveAllowForPackage(uid, packageName)，
+                // 点击 setNotificationLiveAllowForPackage），避开美团/百度地图等厂商特判。
+                XposedHelpers.setObjectField(cfg, "delegatedPackageName", null)
+                XposedHelpers.setObjectField(cfg, "title", title)
+                XposedHelpers.setObjectField(cfg, "description", "音乐播放实况通知")
+                XposedHelpers.setBooleanField(cfg, "isService", false)  // false → app_category
+                XposedHelpers.setIntField(cfg, "uid", uid)
+                XposedHelpers.setIntField(cfg, "delegatedUid", uid)
 
-            // 图标：取 QQ音乐自身 launcher 图标，与系统扫描出来的条目视觉一致。
-            // sort/action/channelId 留空（app_category 分支不读取）。
-            try {
-                val icon = ctx?.packageManager?.getApplicationIcon(QQ_MUSIC)
-                if (icon != null) XposedHelpers.setObjectField(cfg, "icon", icon)
-            } catch (t: Throwable) {
-                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG icon failed: ${t.message}")
+                // 图标：取播放器自身 launcher 图标，与系统扫描出来的条目视觉一致。
+                // sort/action/channelId 留空（app_category 分支不读取）。
+                try {
+                    val icon = ctx?.packageManager?.getApplicationIcon(pkg)
+                    if (icon != null) XposedHelpers.setObjectField(cfg, "icon", icon)
+                } catch (t: Throwable) {
+                    XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG icon failed: ${t.message}")
+                }
+
+                list.add(cfg)
+                injected++
             }
-
-            list.add(cfg)
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: injected $QQ_MUSIC uid=$uid, mConfigs.size=${list.size}")
+            if (injected > 0) {
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: injected $injected app(s), mConfigs.size=${list.size}")
+            }
         } catch (t: Throwable) {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG inject failed: $t")
         }
@@ -181,23 +195,12 @@ internal object ArkLiveSettingsHook {
         null
     }
 
-    /** 动态取 QQ音乐 uid（重装/多用户后会变，不能硬编码） */
-    private fun resolveUid(thisObj: Any, hint: Context?): Int {
-        // 优先用 Fragment 的 Context
-        try {
-            val ctx = hint ?: fragmentContext(thisObj)
-            if (ctx != null) {
-                @Suppress("DEPRECATION")
-                val uid = ctx.packageManager.getPackageUid(QQ_MUSIC, 0)
-                if (uid > 0) return uid
-            }
-        } catch (_: Throwable) {
-        }
-        // 兜底：当前进程 Application
+    /** 动态取包 uid（重装/多用户后会变，不能硬编码） */
+    private fun packageUid(ctx: Context?, pkg: String): Int {
+        if (ctx == null) return -1
         return try {
-            val ctx = ArkHooks.appContext()
             @Suppress("DEPRECATION")
-            ctx?.packageManager?.getPackageUid(QQ_MUSIC, 0) ?: -1
+            ctx.packageManager.getPackageUid(pkg, 0)
         } catch (_: Throwable) {
             -1
         }

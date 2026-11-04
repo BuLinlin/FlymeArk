@@ -42,7 +42,6 @@ internal object ArkLiveLyricHook {
     private const val TAG = "liveLyric"
     private const val CTRL_CLS =
         "com.flyme.statusbar.livenotification.LiveNotificationController"
-    private const val QQ_MUSIC = "com.tencent.qqmusic"
 
     @Volatile
     private var lastLoggedText: String? = null
@@ -68,7 +67,12 @@ internal object ArkLiveLyricHook {
                             // 否则用户在设置里关掉后，mIsMediaShow 仍是 true，胶囊会一直留着。
                             val ctx = XposedHelpers.getObjectField(ctrl, "mContext")
                                 as? android.content.Context
-                            if (!LiveAllowGate.isAllowed(ctx, QQ_MUSIC)) {
+                            // v3.15：受支持的媒体 App（QQ音乐/网易云）任一放行即可。
+                            // 不同时听两个 App 时实际只有一个在出歌词，这里 OR 判断足够。
+                            val allowed = ArkConstants.MEDIA_APP_PKGS.any {
+                                LiveAllowGate.isAllowed(ctx, it)
+                            }
+                            if (!allowed) {
                                 if (XposedHelpers.getBooleanField(ctrl, "mIsMediaShow")) {
                                     XposedHelpers.setBooleanField(ctrl, "mIsMediaShow", false)
                                     lastLoggedText = null
@@ -107,7 +111,7 @@ internal object ArkLiveLyricHook {
                             val entry = param.args[2] ?: return
                             val sbn = XposedHelpers.callMethod(entry, "getSbn")
                             val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String
-                            if (pkg != QQ_MUSIC) return
+                            if (!ArkConstants.isMediaApp(pkg)) return
                             XposedBridge.log("$TAG: lyrics from $pkg -> '${param.args[0]}'")
                         } catch (_: Throwable) {
                         }

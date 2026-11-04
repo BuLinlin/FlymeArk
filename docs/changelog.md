@@ -864,3 +864,51 @@ v3.14.0 的 `blurBehindRadius` 作用于全屏窗口，把整个启动器都糊�
 - 等 6 秒后 ❤ 状态与 QQ 音乐一致；再点一次 → 取消收藏成功
 - 背景：卡片外完全清晰，不再整页糊；卡片自身玻璃色不变
 - 播放键在卡片正中；右上角有 QQ 音乐图标
+
+## 2026-11-04 · v3.15.0｜网易云音乐适配 + 输出切换 + App 图标动态化
+
+### 一、网易云音乐同步适配（走魅族状态栏歌词协议）
+
+网易云 7.2.10 起原生支持魅族状态栏歌词（ticker 协议与 QQ音乐同款，设置里需手动开启）。
+SystemUI 的歌词胶囊链路对它本来就能跑，卡点只是本模块各处的包名过滤。全部泛化：
+
+- `ArkConstants.MEDIA_APP_PKGS = {QQ音乐, 网易云音乐}` + `isMediaApp()`
+- `ArkLiveCoverHook` / `ArkLiveLyricHook` / `ArkLiveExpandHook.launchPanel`：包名过滤改集合判断
+- `ArkLiveExpandHook`：新增 `currentPkg`（歌词通知归属包名），
+  MediaSession 选取优先级 = 当前歌词 App > 在播的受支持 App > 第一个受支持 App，
+  seek/播放暂停/读 session 跟随真实播放器
+- `ArkLiveInjector`：网易云进程也装歌词通道补发；开关广播按
+  `<pkg>.ACTION_MEIZU_LYRIC_TURN_ON.<进程>` 模式探测两种形式（无公开文档，
+  广播无人接收即 no-op，无害）；探测不中时用户在网易云【设置 → 状态栏歌词】
+  手动开启一次即可
+- `ArkLiveAllowHook` / `ArkLiveSettingsHook`：system_server 准入兜底与设置页登记
+  覆盖两个 App（未安装的自动跳过）
+
+**注意：LSPosed 模块作用域需勾选「网易云音乐」**，否则网易云进程内 hook 不会装载。
+
+### 二、输出切换（右下角投放按钮，参考用户图二）
+
+- 图标 `ic_ark_output.xml`：三条声波弧线 + 实心三角（照用户图二手绘）
+- 布局：右区 = 下一首 + 输出按钮，与左区 ❤+上一首 对称；播放键仍绝对居中
+- 链路：面板点击 → `ACTION_PANEL_OUTPUT_LIST` → SystemUI 反射
+  `MediaRouter2Manager`（@SystemApi，系统媒体卡输出切换同源）取
+  `getAvailableRoutes`/`getSelectedRoute` → `ACTION_OUTPUT_ROUTES` 回面板 →
+  弹窗（深浅主题跟随）单选 → `transferToRoute` 切换
+- 兼容：`getAvailableRoutes`/`getRoutes`、`getName()`/`getName(ctx)`、
+  `transferToRoute(pkg, id)`/`(pkg, MediaRoute2Info)` 全部双签名降级；
+  无路由时 toast「没有可用的输出设备」
+
+### 三、右上角 App 图标动态化（v3.14.1 未显示问题的根治）
+
+v3.14.1 图标固定取 `MEDIA_APP_PKG`，依赖装机时 QQ音乐包名可解析。v3.15 改为：
+SystemUI 随曲目推送 `EXTRA_PANEL_APP_PKG`（歌词通知归属包名），
+面板按真实播放 App 显示图标（bindData/applyTrack 都刷新，换播放器即换图标），
+跳转兜底 `getLaunchIntentForPackage` 同步跟随；解析失败仍隐藏不占位。
+
+### 待真机验证（设备没电，用户稍后测）
+
+- 网易云播放 → 状态栏歌词胶囊出现（先在网易云设置里开「状态栏歌词」；
+  LSPosed 作用域勾选网易云后重启网易云进程）
+- 点胶囊展开面板：右上角显示网易云图标，播放/切歌/seek/收藏正常
+- 右下角投放按钮：弹窗列出「本机/蓝牙设备」，选择后声音切过去
+- QQ音乐回归：面板各功能与 v3.14.1 一致

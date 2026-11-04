@@ -208,6 +208,10 @@
                     android:padding="16dp"
                     android:src="@drawable/ic_ark_play" />
 
+                <!--
+                  右区（v3.15）：下一首 + 输出切换（参考用户图二：右下角投放图标），
+                  与左区 ❤+上一首 对称。
+                -->
                 <LinearLayout
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
@@ -224,6 +228,16 @@
                         android:contentDescription="@string/ark_panel_next"
                         android:padding="11dp"
                         android:src="@drawable/ic_ark_next" />
+
+                    <ImageView
+                        android:id="@+id/panel_output"
+                        android:layout_width="46dp"
+                        android:layout_height="46dp"
+                        android:layout_marginStart="10dp"
+                        android:background="?android:attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="@string/ark_panel_output"
+                        android:padding="11dp"
+                        android:src="@drawable/ic_ark_output" />
                 </LinearLayout>
             </LinearLayout>
         </LinearLayout>

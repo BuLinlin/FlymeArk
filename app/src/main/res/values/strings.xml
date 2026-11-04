@@ -10,4 +10,6 @@
     <string name="ark_panel_unknown">正在播放</string>
     <string name="ark_panel_fav">收藏</string>
     <string name="ark_panel_faved">已收藏</string>
+    <string name="ark_panel_output">播放输出</string>
+    <string name="ark_panel_output_empty">没有可用的输出设备</string>
 </resources>

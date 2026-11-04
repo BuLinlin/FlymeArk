@@ -57,7 +57,6 @@ internal object ArkLiveExpandHook {
         "com.flyme.statusbar.livenotification.LiveNotificationController"
     private const val CENTRAL_CLS = "com.android.systemui.statusbar.phone.CentralSurfacesImpl"
     private const val PANEL_ACTIVITY = "com.flymeark.ArkCapsulePanelActivity"
-    private const val QQ_MUSIC = "com.tencent.qqmusic"
 
     /** 点击最长按压时长 */
     private const val TAP_TIMEOUT_MS = 420L
@@ -121,6 +120,10 @@ internal object ArkLiveExpandHook {
     @Volatile private var trackTitle: String? = null
     @Volatile private var trackArtist: String? = null
     @Volatile private var trackCover: Bitmap? = null
+
+    /** v3.15：当前歌词通知归属的媒体 App 包名（QQ音乐/网易云），面板图标与跳转、路由都以它为准 */
+    @Volatile var currentPkg: String? = null
+        private set
 
     /** v3.13：媒体 App 跳转 PendingIntent（session 读不到时沿用旧值） */
     @Volatile private var lastClickIntent: PendingIntent? = null
@@ -234,6 +237,12 @@ internal object ArkLiveExpandHook {
             trackTitle = t?.takeIf { it.isNotEmpty() } ?: lyric
             trackArtist = a
             if (cover != null) trackCover = cover
+            // v3.15：歌词通知归属包名 = 当前媒体 App
+            currentPkg = try {
+                XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: currentPkg
+            } catch (_: Throwable) {
+                currentPkg
+            }
 
             val p = ex?.getInt(Notification.EXTRA_PROGRESS, -1) ?: -1
             val max = ex?.getInt(Notification.EXTRA_PROGRESS_MAX, -1) ?: -1
@@ -394,6 +403,8 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
             // v3.13.3：收藏状态（null = 通知按钮不带状态词，推不出）
             favState?.let { putExtra(ArkConstants.EXTRA_PANEL_FAV, it) }
+            // v3.15：当前媒体 App 包名
+            currentPkg?.let { putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, it) }
             cover?.let { putExtra(ArkConstants.EXTRA_PANEL_COVER, it) }
             clickIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
         }
@@ -405,6 +416,26 @@ internal object ArkLiveExpandHook {
     }
 
     /**
+     * v3.15：选当前媒体 App 的 MediaController。
+     * 优先级：歌词通知归属 App（currentPkg）> 正在播放的受支持 App > 第一个受支持 App。
+     */
+    private fun activeController(ctx: Context): MediaController? = try {
+        val msm = ctx.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
+        val sessions = msm?.getActiveSessions(null)?.filter { ArkConstants.isMediaApp(it.packageName) }
+        if (sessions.isNullOrEmpty()) {
+            null
+        } else {
+            val cur = currentPkg
+            sessions.firstOrNull { it.packageName == cur }
+                ?: sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                ?: sessions.first()
+        }
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: activeController failed: ${t.message}")
+        null
+    }
+
+    /**
      * v3.13：面板拖动进度条 → seekTo。
      * MediaController.seekTo 需要 system uid（MEDIA_CONTENT_CONTROL），
      * 面板是普通 App uid，统一在这里代派。
@@ -413,15 +444,13 @@ internal object ArkLiveExpandHook {
         val c = ctx ?: return
         if (positionMs < 0) return
         try {
-            val msm = c.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
-            val ctrl: MediaController? =
-                msm?.getActiveSessions(null)?.firstOrNull { it.packageName == QQ_MUSIC }
+            val ctrl = activeController(c)
             if (ctrl == null) {
                 XposedBridge.log("$TAG: seek skipped (no media session)")
                 return
             }
             ctrl.transportControls.seekTo(positionMs)
-            XposedBridge.log("$TAG: seekTo $positionMs")
+            XposedBridge.log("$TAG: seekTo $positionMs (${ctrl.packageName})")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: seekTo failed: ${t.message}")
         }
@@ -440,12 +469,10 @@ internal object ArkLiveExpandHook {
     fun setPlayback(ctx: Context?, playing: Boolean) {
         val c = ctx ?: return
         try {
-            val msm = c.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
-            val ctrl: MediaController? =
-                msm?.getActiveSessions(null)?.firstOrNull { it.packageName == QQ_MUSIC }
+            val ctrl = activeController(c)
             if (ctrl != null) {
                 if (playing) ctrl.transportControls.play() else ctrl.transportControls.pause()
-                XposedBridge.log("$TAG: playback -> $playing (transportControls)")
+                XposedBridge.log("$TAG: playback -> $playing (transportControls ${ctrl.packageName})")
                 return
             }
             XposedBridge.log("$TAG: playback fallback to media key (no session)")
@@ -526,6 +553,122 @@ internal object ArkLiveExpandHook {
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: favorite send failed: ${t.message}")
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 输出切换（v3.15）：反射 MediaRouter2Manager（@SystemApi，不在公共 SDK，
+    // SystemUI 进程内可调用；系统媒体卡的输出切换就是这套 API）
+    // ------------------------------------------------------------------
+
+    /** 面板请求输出路由列表 → 回广播给面板弹窗 */
+    fun outputRoutes(ctx: Context?) {
+        val c = ctx ?: return
+        try {
+            val pkg = currentPkg ?: run {
+                XposedBridge.log("$TAG: output routes skipped (no media app)")
+                return
+            }
+            val routes = reflectRoutes(c, pkg) ?: run {
+                XposedBridge.log("$TAG: output routes reflect failed")
+                return
+            }
+            val selectedId = reflectSelectedRouteId(c, pkg)
+
+            // 排序：当前选中的在最前，其余保持系统顺序
+            val sorted = routes.sortedBy { if (selectedId != null && it.second == selectedId) 0 else 1 }
+            val selectedIndex = if (selectedId != null) sorted.indexOfFirst { it.second == selectedId } else -1
+
+            val intent = Intent(ArkConstants.ACTION_OUTPUT_ROUTES).apply {
+                setPackage(ArkConstants.APP_PKG)
+                putExtra(ArkConstants.EXTRA_ROUTE_NAMES, ArrayList(sorted.map { it.first }))
+                putExtra(ArkConstants.EXTRA_ROUTE_IDS, ArrayList(sorted.map { it.second }))
+                putExtra(ArkConstants.EXTRA_ROUTE_SELECTED, selectedIndex)
+            }
+            c.sendBroadcast(intent)
+            XposedBridge.log("$TAG: output routes -> ${sorted.map { it.first }} selected=$selectedIndex")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: outputRoutes failed: ${t.message}")
+        }
+    }
+
+    /** 面板选定路由 → 切换 */
+    fun transferOutput(ctx: Context?, routeId: String?) {
+        val c = ctx ?: return
+        if (routeId.isNullOrBlank()) return
+        val pkg = currentPkg ?: return
+        try {
+            val mgrCls = Class.forName("android.media.MediaRouter2Manager")
+            val mgr = mgrCls.getMethod("getInstance", Context::class.java).invoke(null, c)
+            // API 31+ 是 transferToRoute(String, String)；更早版本是 (String, MediaRoute2Info)
+            val byId = try {
+                mgrCls.getMethod("transferToRoute", String::class.java, String::class.java)
+            } catch (_: Throwable) {
+                null
+            }
+            if (byId != null) {
+                byId.invoke(mgr, pkg, routeId)
+            } else {
+                val infoCls = Class.forName("android.media.MediaRoute2Info")
+                val route = (reflectRoutes(c, pkg) ?: emptyList())
+                    .firstOrNull { it.second == routeId }?.third ?: return
+                mgrCls.getMethod("transferToRoute", String::class.java, infoCls)
+                    .invoke(mgr, pkg, route)
+            }
+            XposedBridge.log("$TAG: transfer output -> $routeId ($pkg)")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: transferOutput failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 列出 [pkg] 可用的输出路由。
+     * @return List<(显示名, id, MediaRoute2Info)>
+     */
+    private fun reflectRoutes(
+        ctx: Context,
+        pkg: String
+    ): List<Triple<String, String, Any>>? = try {
+        val mgrCls = Class.forName("android.media.MediaRouter2Manager")
+        val mgr = mgrCls.getMethod("getInstance", Context::class.java).invoke(null, ctx)
+        val raw: List<*> = try {
+            mgrCls.getMethod("getAvailableRoutes", String::class.java).invoke(mgr, pkg) as? List<*>
+        } catch (_: Throwable) {
+            mgrCls.getMethod("getRoutes", String::class.java).invoke(mgr, pkg) as? List<*>
+        } ?: return null
+
+        raw.mapNotNull { r ->
+            val id = try {
+                XposedHelpers.callMethod(r, "getId") as? String
+            } catch (_: Throwable) {
+                null
+            } ?: return@mapNotNull null
+            val name = routeName(ctx, r ?: return@mapNotNull null) ?: return@mapNotNull null
+            Triple(name, id, r)
+        }.filter { it.first.isNotBlank() }
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: reflectRoutes error: ${t.message}")
+        null
+    }
+
+    /** MediaRoute2Info.getName() 在低版本需要 Context 参数，两个签名都试 */
+    private fun routeName(ctx: Context, route: Any): String? = try {
+        try {
+            (XposedHelpers.callMethod(route, "getName") as? CharSequence)?.toString()
+        } catch (_: Throwable) {
+            (XposedHelpers.callMethod(route, "getName", ctx) as? CharSequence)?.toString()
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 当前选中路由的 id（取不到返回 null，面板就不高亮） */
+    private fun reflectSelectedRouteId(ctx: Context, pkg: String): String? = try {
+        val mgrCls = Class.forName("android.media.MediaRouter2Manager")
+        val mgr = mgrCls.getMethod("getInstance", Context::class.java).invoke(null, ctx)
+        val route = mgrCls.getMethod("getSelectedRoute", String::class.java).invoke(mgr, pkg)
+        route?.let { XposedHelpers.callMethod(it, "getId") as? String }
+    } catch (_: Throwable) {
+        null
     }
 
     /** MediaSession 里的专辑图 → 面板用的方形圆角缩略图（绑 Binder 事务 1MB 上限） */
@@ -622,7 +765,7 @@ internal object ArkLiveExpandHook {
                 return
             }
         val pkg = XposedHelpers.callMethod(info, "getPackageName") as? String
-        if (pkg != QQ_MUSIC) {
+        if (!ArkConstants.isMediaApp(pkg)) {
             XposedBridge.log("$TAG: launch skipped (pkg=$pkg)")
             return
         }
@@ -664,6 +807,8 @@ internal object ArkLiveExpandHook {
             lastClickIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
             // v3.13.1：SystemUI 同源的深浅模式
             putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
+            // v3.15：当前媒体 App 包名（右上角图标 + 跳转兜底）
+            pkg?.let { putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, it) }
             // 胶囊矩形：面板以它为展开动画起点（长大）与收起终点（缩回）
             capsuleRectOnScreen(ctrl)?.let { r ->
                 putExtra(ArkConstants.EXTRA_CAPSULE_LEFT, r[0])
@@ -686,7 +831,7 @@ internal object ArkLiveExpandHook {
         }
     }
 
-    /** 一次 MediaSession 快照（QQ音乐 当前播放） */
+    /** 一次 MediaSession 快照（当前媒体 App：QQ音乐/网易云音乐） */
     private class SessionSnapshot(
         val title: String?,
         val artist: String?,
@@ -703,8 +848,7 @@ internal object ArkLiveExpandHook {
      * 除了进度，还能拿到 MediaSession 自己的标题/歌手/专辑图——切歌时比等通知刷新快得多。
      */
     private fun readMediaSession(ctx: Context): SessionSnapshot? = try {
-        val msm = ctx.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
-        val ctrl = msm?.getActiveSessions(null)?.firstOrNull { it.packageName == QQ_MUSIC }
+        val ctrl = activeController(ctx)
         if (ctrl == null) {
             null
         } else {

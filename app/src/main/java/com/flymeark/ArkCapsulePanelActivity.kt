@@ -4,6 +4,7 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -27,6 +28,7 @@ import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.Toast
 import com.flymeark.R
 import java.util.Locale
 
@@ -82,6 +84,7 @@ class ArkCapsulePanelActivity : Activity() {
     private lateinit var prevBtn: ImageView
     private lateinit var nextBtn: ImageView
     private lateinit var favBtn: ImageView
+    private lateinit var outputBtn: ImageView
     private lateinit var appIconView: ImageView
 
     private lateinit var morph: ArkMorphAnim
@@ -103,6 +106,9 @@ class ArkCapsulePanelActivity : Activity() {
     /** v3.13：媒体 App 跳转 PendingIntent（SystemUI 从 sessionActivity 带来） */
     private var lastClickIntent: PendingIntent? = null
 
+    /** v3.15：当前媒体 App 包名（SystemUI 从歌词通知带来；右上角图标/跳转兜底都用它） */
+    private var mediaPkg: String? = null
+
     /** 媒体键节流时间戳（按按键分开记，暂停和切歌互不干扰） */
     private val lastKeyAt = HashMap<Int, Long>(4)
 
@@ -118,6 +124,9 @@ class ArkCapsulePanelActivity : Activity() {
 
     /** 收藏防抖时间戳（收藏是明确动作，防连发即可，窗口可以稍大） */
     private var lastFavAt = 0L
+
+    /** 输出切换点击防抖（请求路由列表 → SystemUI 回广播 → 弹窗） */
+    private var lastOutputAt = 0L
 
     /** 封面轮播：当前露在前面的是 A 还是 B */
     private var frontIsA = true
@@ -148,11 +157,13 @@ class ArkCapsulePanelActivity : Activity() {
     /** 主动向 SystemUI 要一次曲目同步（不用等歌词通知刷新） */
     private val syncRequest = Runnable { requestSync() }
 
-    /** SystemUI 推来的曲目更新（换曲 / 进度 / 播放态），面板保持展开实时刷新 */
+    /** SystemUI 推来的曲目更新（换曲 / 进度 / 播放态）+ 输出路由列表回复 */
     private val trackReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != ArkConstants.ACTION_PANEL_TRACK) return
-            applyTrack(intent)
+            when (intent?.action) {
+                ArkConstants.ACTION_PANEL_TRACK -> applyTrack(intent)
+                ArkConstants.ACTION_OUTPUT_ROUTES -> showRouteDialog(intent)
+            }
         }
     }
 
@@ -214,7 +225,9 @@ class ArkCapsulePanelActivity : Activity() {
     }
 
     private fun registerTrackReceiver() {
-        val filter = IntentFilter(ArkConstants.ACTION_PANEL_TRACK)
+        val filter = IntentFilter(ArkConstants.ACTION_PANEL_TRACK).apply {
+            addAction(ArkConstants.ACTION_OUTPUT_ROUTES)
+        }
         try {
             if (Build.VERSION.SDK_INT >= 33) {
                 registerReceiver(trackReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -242,16 +255,8 @@ class ArkCapsulePanelActivity : Activity() {
         prevBtn = findViewById(R.id.panel_prev)
         nextBtn = findViewById(R.id.panel_next)
         favBtn = findViewById(R.id.panel_fav)
+        outputBtn = findViewById(R.id.panel_output)
         appIconView = findViewById(R.id.panel_app_icon)
-
-        // v3.14.1：右上角显示当前媒体 App 图标（参考图四排版）
-        try {
-            appIconView.setImageDrawable(
-                packageManager.getApplicationIcon(ArkConstants.MEDIA_APP_PKG)
-            )
-        } catch (_: Throwable) {
-            appIconView.visibility = View.GONE
-        }
 
         // v3.13：样式对齐系统媒体卡 —— 配色按深浅模式一套走
         nightMode =
@@ -274,6 +279,17 @@ class ArkCapsulePanelActivity : Activity() {
         }
     }
 
+    /** 右上角媒体 App 图标（v3.15：跟随 SystemUI 传来的真实播放 App；取不到则隐藏） */
+    private fun applyAppIcon() {
+        val pkg = mediaPkg ?: ArkConstants.MEDIA_APP_PKG
+        try {
+            appIconView.setImageDrawable(packageManager.getApplicationIcon(pkg))
+            appIconView.visibility = View.VISIBLE
+        } catch (_: Throwable) {
+            appIconView.visibility = View.GONE
+        }
+    }
+
     private fun bindData() {
         val i = intent ?: return
 
@@ -286,6 +302,9 @@ class ArkCapsulePanelActivity : Activity() {
         artistView.visibility = if (artist.isBlank()) View.GONE else View.VISIBLE
 
         coverOf(i)?.let { resetCover(it) }
+
+        i.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)?.let { mediaPkg = it }
+        applyAppIcon()
 
         durationMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_DURATION, -1)
         positionMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_PROGRESS, -1).coerceAtLeast(0)
@@ -338,6 +357,15 @@ class ArkCapsulePanelActivity : Activity() {
 
         // 换曲 → 轮播滑动；同曲补封面 → 直接替换
         coverOf(i)?.let { bmp -> applyCover(bmp, if (titleChanged) dir else 0) }
+
+        // v3.15：换到另一个播放器时更新右上角 App 图标与跳转兜底
+        if (i.hasExtra(ArkConstants.EXTRA_PANEL_APP_PKG)) {
+            val p = i.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)
+            if (p != mediaPkg) {
+                mediaPkg = p
+                applyAppIcon()
+            }
+        }
 
         durationMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_DURATION, -1)
         positionMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_PROGRESS, -1).coerceAtLeast(0)
@@ -522,6 +550,7 @@ class ArkCapsulePanelActivity : Activity() {
         prevBtn.imageTintList = ColorStateList.valueOf(icon)
         nextBtn.imageTintList = ColorStateList.valueOf(icon)
         playBtn.imageTintList = ColorStateList.valueOf(icon)
+        outputBtn.imageTintList = ColorStateList.valueOf(icon)
         favBtn.imageTintList = ColorStateList.valueOf(
             // 已收藏：跟专辑主题色走（系统媒体卡同款思路），未收藏用普通图标色
             if (favState == true) albumColor ?: icon else icon
@@ -565,7 +594,9 @@ class ArkCapsulePanelActivity : Activity() {
             }
         }
         try {
-            packageManager.getLaunchIntentForPackage(ArkConstants.MEDIA_APP_PKG)?.let {
+            packageManager.getLaunchIntentForPackage(
+                mediaPkg ?: ArkConstants.MEDIA_APP_PKG
+            )?.let {
                 it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(it)
             }
@@ -601,6 +632,63 @@ class ArkCapsulePanelActivity : Activity() {
             updateFavIcon()
             sendFavorite()
         }
+        outputBtn.setOnClickListener {
+            // v3.15：请求 SystemUI 列出当前媒体 App 的输出路由（MediaRouter2Manager）
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastOutputAt < 800L) return@setOnClickListener
+            lastOutputAt = now
+            try {
+                sendBroadcast(
+                    Intent(ArkConstants.ACTION_PANEL_OUTPUT_LIST)
+                        .setPackage(ArkConstants.SYSTEMUI_PKG)
+                )
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    /**
+     * SystemUI 回来的输出路由列表 → 弹窗选择。
+     * selected=-1 表示当前路由未知，列表只展示不高亮。
+     */
+    private fun showRouteDialog(i: Intent) {
+        val names = try {
+            i.getStringArrayListExtra(ArkConstants.EXTRA_ROUTE_NAMES).orEmpty()
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        val ids = try {
+            i.getStringArrayListExtra(ArkConstants.EXTRA_ROUTE_IDS).orEmpty()
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        val selected = i.getIntExtra(ArkConstants.EXTRA_ROUTE_SELECTED, -1)
+
+        if (names.isEmpty() || names.size != ids.size) {
+            Toast.makeText(this, R.string.ark_panel_output_empty, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val theme =
+            if (nightMode) android.R.style.Theme_DeviceDefault_Dialog
+            else android.R.style.Theme_DeviceDefault_Light_Dialog
+        AlertDialog.Builder(this, theme)
+            .setTitle(getString(R.string.ark_panel_output))
+            .setSingleChoiceItems(names.toTypedArray(), selected) { d, which ->
+                d.dismiss()
+                if (which != selected && which in ids.indices) {
+                    try {
+                        sendBroadcast(
+                            Intent(ArkConstants.ACTION_PANEL_OUTPUT_TRANSFER)
+                                .setPackage(ArkConstants.SYSTEMUI_PKG)
+                                .putExtra(ArkConstants.EXTRA_ROUTE_ID, ids[which])
+                        )
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     /** 收藏请求 → SystemUI（system uid）send QQ 音乐通知 action */

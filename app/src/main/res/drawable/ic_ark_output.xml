@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  输出切换按钮（v3.15）：喇叭声波弧线 + 实心三角，对应用户参考图（QQ音乐输出样式）。
+  颜色由 imageTintList 控制深浅模式。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 三条声波弧线（圆心约在三角尖上方） -->
+    <path
+        android:pathData="M9.9,12.36 A4.2,4.2 0 0 1 14.1,12.36"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.9"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M8.4,9.77 A7.2,7.2 0 0 1 15.6,9.77"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.9"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M6.9,7.17 A10.2,10.2 0 0 1 17.1,7.17"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.9"
+        android:strokeLineCap="round" />
+
+    <!-- 实心三角（扬声器/播放方向） -->
+    <path
+        android:pathData="M12,14.4 L16.6,20.4 L7.4,20.4 Z"
+        android:fillColor="#FFFFFFFF" />
+</vector>
