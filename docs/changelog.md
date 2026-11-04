@@ -288,3 +288,58 @@ z1 diff=6.5   z2 diff=9.4   z3 diff=6.7     （画面确实变了 = 点击生效
 ```
 
 图标在播放↔暂停之间切换后仍是白色，说明 `setImageDrawable` 拦截生效。
+
+## 2026-11-04 · v3.7｜撤回前景色接管，颜色交回系统 Monet 色板
+
+**结论**：v3.4~v3.6 那套「取时钟色 + 覆盖整卡」是多余且错误的，已整体删除。
+
+### 系统本来就有标准
+
+反编译 `MediaControlPanel` / `ColorSchemeTransition` / `MediaColorSchemesKt` 后确认，
+颜色并不是按壁纸明暗临时算的，而是一条完整的 Monet 链路：
+
+```
+Icon artwork                                    ← 专辑封面（不是壁纸）
+  → WallpaperColors.fromDrawable(artwork)        ← getWallpaperColor(Icon)
+  → new ColorScheme(colors, false, 6)            ← Monet 生成调和色板
+  → MediaColorSchemesKt.textPrimaryFromScheme()   ← neutral1.s50
+    textSecondaryFromScheme()                     ← neutral2.s200
+    textTertiaryFromScheme()                      ← neutral2.s400
+    accentPrimary / accentSecondary / primary / onPrimary ...
+  → AnimatingColorTransition（333ms ValueAnimator 平滑过渡）
+  → setPlayerTextColor / setPlayerButtonStyle / setProgressBarStyle
+```
+
+换歌 → 换封面 → 色板变；换壁纸 / 改主题 → 同样会重算。
+颜色变化自带 333ms 过渡，本来就是「会自己变色」的。
+
+### 为什么要撤
+
+- **取色源是错的**：系统用封面色，我们去读下拉栏时钟色，两者毫无关系；
+- **覆盖会打架**：系统每次 bind 都重设颜色，我们得拦截 `setTextColor` /
+  `setColorFilter` / `clearColorFilter`，再在 `View.draw` 前校正一次 ——
+  这些补丁全部是为了对抗系统，成本 100% 来自覆盖本身；
+- **覆盖后反而不可读**：系统按「背景 = 封面色渐变」设计前景色，
+  我们把背景换成壁纸玻璃，前提就被打破了。
+
+### 删除清单
+
+- `ArkShadeTint.kt` 整个文件（时钟取色 / 511px 阈值 / 防抖 / onDarkChanged 兜底）；
+- `owned` 颜色归属表与全部设色拦截（`setTextColor` / `setImageTintList` /
+  `setColorFilter` ×3 重载 / `clearColorFilter`）；
+- `SilhouetteDrawable` + `extractAlpha` 位图剪影（连同 density 尺寸修正）；
+- `View.draw` 前的颜色校正、`ImageView.setImageDrawable` 拦截、
+  `ProgressBar.setProgressDrawable` 重新 tint；
+- `refreshCards` / 重试链 / 各类诊断日志。
+
+### 保留
+
+- `ArkGlassDrawable`：接在系统 `WallpaperBlurDrawable` 之上，只做透明度 + 轮廓高光，
+  **不采样下层纹理**（v3.4 已验证采样会卡顿且与实时模糊不同步）；
+- 播放键玻璃圆盘：明暗改为直接读 `imageTintList`（那正是系统算出的前景色），
+  不再自己判断壁纸明暗；前景深时改用淡黑圆盘，浅色背景下也有对比；
+- `View.setBackground` 保活钩子，防止系统把玻璃背景换回去。
+
+### 状态
+
+`versionCode 8 / 3.7.0`，编译通过。设备电量不足，**未做真机验证**，待用户自测。
