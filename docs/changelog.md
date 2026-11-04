@@ -2,6 +2,36 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-04 · v3.15.16｜收藏「有时点不上」修复 + 胶囊重绘缓解
+
+### 一、收藏「有时成功有时失败」——拿不到按钮就放弃
+
+真机日志（19:01，pid 8313 = 3.15.15）铁证：QQ音乐连续点「取消收藏」10+ 次，
+**每次都 `favorite skipped (no like action)`**：
+
+```
+favorite request target=false gen=2 busy=false
+favorite skipped (no like action)     ← 每次都是这里
+```
+
+根因：`favoriteActionFor` 先查 `activeNotifications`（本机 SystemUI 拿不到，size=0），
+回落到 hook 缓存的 `favIntent`；但切歌/通知重建瞬间 `favIntent` 被清空、或缓存的按钮
+标题还是上一首，标题匹配失败 → 返回 null → 旧代码直接 `skipped` 放弃，用户感觉失灵。
+
+修复：`sendFavAction` 拿不到按钮时**不再立即放弃**，改为 250ms 步进、最多等 2.5s
+重取（歌词每一行刷新都会重填 favIntent，几乎总能等到），等不到才认命交真值兜底。
+
+### 二、切歌/收藏导致胶囊重绘——raw 抖动误释放
+
+日志：19:01:07 `raw=false` → 19:01:10 `switch OFF 胶囊释放` → 19:01:22 `raw=true 胶囊恢复`，
+这段 15 秒的 false 既非收藏也非切歌，是 Flyme `getNotificationLiveAllowForPackage` 在
+播放通知重建时的长时间抖动。
+
+缓解：`ArkLiveLyricHook` 门控在「刚点收藏（5s）/ 刚换曲（8s）」的沉降窗口内，
+把 raw=false 当抖动忽略、不触发延迟复核，避免「收藏/切歌导致胶囊重绘」。
+播放中周期性通知重建的抖动，仍需 system_server 广播方案（v3.15.15 已实现）彻底解决，
+依赖勾选「系统框架」作用域。
+
 ## 2026-11-04 · v3.15.15｜收藏 toggle 校验延窗 + 关闭开关实时生效
 
 ### 一、网易云收藏「点了没反应」——toggle 校验窗口太短

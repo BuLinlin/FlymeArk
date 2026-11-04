@@ -171,6 +171,15 @@ internal object ArkLiveLyricHook {
                                 }
                             }
                             if (!allowed) {
+                                // v3.15.16：刚点过收藏 / 刚换过曲时，raw=false 是
+                                // 通知重建的瞬时抖动，不是用户关开关 —— 直接放行，不触发
+                                // 延迟复核，避免「切歌/收藏导致胶囊重绘」。
+                                if (ArkLiveExpandHook.isInFavSettle() ||
+                                    ArkLiveExpandHook.isInTrackChangeSettle()
+                                ) {
+                                    XposedBridge.log("$TAG: raw=false ignored (fav/track settle)")
+                                    return
+                                }
                                 // v3.15.14：不立即释放，改为延迟复核（防瞬时抖动误关）。
                                 // 已经调度过同一个 App 的复核就跳过，避免重复 post。
                                 if (pendingOffPkg == null) {

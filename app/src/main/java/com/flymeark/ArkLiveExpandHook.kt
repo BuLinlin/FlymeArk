@@ -207,8 +207,26 @@ internal object ArkLiveExpandHook {
     private fun inFavSettle(): Boolean =
         SystemClock.uptimeMillis() - lastFavSendAt < FAV_SETTLE_MS
 
+    /**
+     * v3.15.16：是否刚点过收藏（供 [ArkLiveLyricHook] 判断「通知重建抖动」）。
+     *
+     * 真机取证：点收藏/取消会触发播放通知重建，`getNotificationLiveAllowForPackage`
+     * 会瞬时返回 raw=false（实测最长 ~15s），旧逻辑据此误判「用户关开关」→ 释放胶囊，
+     * 随后 raw 恢复 true 胶囊又出现 —— 就是用户看到的「切歌/收藏导致胶囊重绘」。
+     *
+     * 收藏点击的沉降窗口（5s）内不采信 raw=false，把这条抖动挡在门控之外。
+     */
+    fun isInFavSettle(): Boolean = inFavSettle()
+
     /** 上次 send 收藏 action 的时间（SystemUI 侧防抖） */
     private var lastFavSendAt = 0L
+
+    /** v3.15.16：最近一次换曲的时间（供 [ArkLiveLyricHook] 挡切歌触发的 raw 抖动） */
+    @Volatile private var lastTrackChangeAt = 0L
+
+    /** v3.15.16：是否刚换过曲（切歌后 raw 会长时间抖动，见 isInFavSettle 说明） */
+    fun isInTrackChangeSettle(): Boolean =
+        SystemClock.uptimeMillis() - lastTrackChangeAt < 8_000L
 
     /** 上次点击的目标状态（日志用） */
     @Volatile private var lastFavTarget: Boolean? = null
@@ -566,6 +584,7 @@ internal object ArkLiveExpandHook {
             val session = readMediaSession(c)
             // v3.15.1：换曲后旧曲的收藏状态不能继承；随后用 metadata / 通知真值覆盖
             if (trackChanged) {
+                lastTrackChangeAt = now
                 favHash = null
                 // v3.15.4：换曲作废「点击后沉降窗口」与点击闭环 —— 那是上一首的语境，
                 // 不清掉会让新歌的标题真值被静默 5 秒、❤ 白等
@@ -642,6 +661,7 @@ internal object ArkLiveExpandHook {
         // v3.15.1：同步收藏真值（换曲时旧值作废）
         val trackChanged = s.title != null && s.title != trackTitle
         if (trackChanged) {
+            lastTrackChangeAt = SystemClock.uptimeMillis()
             favHash = null
             // v3.15.4：换曲作废点击沉降窗口/闭环（上一首的语境）
             lastFavSendAt = 0L
@@ -1277,7 +1297,8 @@ internal object ArkLiveExpandHook {
         target: Boolean,
         gen: Int,
         attempt: Int,
-        waited: Long = 0L
+        waited: Long = 0L,
+        noBtnWait: Long = 0L
     ) {
         // 目标已被新点击覆盖 → 立刻让位，别把过期目标打出去
         if (gen != favGen) {
@@ -1290,6 +1311,18 @@ internal object ArkLiveExpandHook {
         // 拿旧 PI 去点「取消」实际会再收藏一次。
         val live = favoriteActionFor(ctx, trackTitle.orEmpty())
         if (live == null) {
+            // v3.15.16：拿不到按钮 ≠ 用户没点。真机实测「有时收藏不上」的根因正是这里：
+            // 切歌/通知重建瞬间 favIntent 被清空、或缓存的按钮标题还是上一首，
+            // favoriteActionFor 返回 null，旧代码直接「skipped」放弃 —— 用户就感觉失灵。
+            // 歌词每一行刷新都会重填 favIntent（见 inspectFavoriteActions），所以这里
+            // 短暂等待（最多 ~2.5s）重取，几乎总能等到；等不到才认命。
+            if (noBtnWait < 2_500L) {
+                XposedBridge.log("$TAG: fav no button yet, wait ${noBtnWait}ms")
+                mainHandler.postDelayed({
+                    sendFavAction(ctx, target, gen, attempt, waited, noBtnWait + FAV_SEMANTIC_STEP_MS)
+                }, FAV_SEMANTIC_STEP_MS)
+                return
+            }
             XposedBridge.log("$TAG: favorite skipped (no like action)")
             // 没有可点的按钮：不能硬拗，交给真值/记忆表兜底
             finishFav(ctx, gen, readFavFromSession(ctx))
