@@ -47,13 +47,12 @@ private const val OPEN_APP_DEBOUNCE_MS = 800L
 /**
  * 收藏按钮的点击锁。
  *
- * 播放器的收藏是 toggle，而且对连续调用有限流：短时间连点，音乐端只会吃下第一次，
- * 我们这边却已经跟着点了好几次，两边状态必然错位（用户实测「连点只生效一次」）。
- *
- * 所以不在"发送"上做文章，直接在点击层锁住：一次点击后 900ms 内不再接受输入，
- * UI 也不切换。这个窗口覆盖「发请求 + 首次真值校验」，等结果出来再允许下一次。
+ * v3.15.8 取证：SystemUI 的实况通知点击就是直接 send 通知 action，**没有节流**
+ * （`LiveNotificationClickHelper` 只判 down/up）。所以这里不该照抄任何"系统限制时间"，
+ * 只挡误触双击即可；连点的正确性由 SystemUI 侧的「按钮语义匹配 + 串行泵」保证
+ * （语义不对时会等通知重建，最多 3 秒，不会发出反方向的点击）。
  */
-private const val FAV_CLICK_LOCK_MS = 900L
+private const val FAV_CLICK_LOCK_MS = 450L
 
 /**
  * 点击后多久内不采信推送来的收藏状态。

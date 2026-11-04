@@ -241,6 +241,23 @@ internal object ArkLiveExpandHook {
     private const val FAV_CONFIRM_WAIT_MS = 1_200L
 
     /**
+     * v3.15.8：等「通知按钮语义」刷新成可点状态的最长时间。
+     *
+     * 取证结论：SystemUI 侧点击就是直接 send 通知里的 action，**没有任何节流**
+     * （LiveNotificationController$LiveNotificationClickHelper 只做 down/up 判定）。
+     * 真正的限制来自按钮语义：QQ 音乐的通知 action 是「状态绑定」的 ——
+     * 标题「收藏」= 当前未收藏（点了变已收藏），「已收藏」= 当前已收藏（点了取消）。
+     *
+     * 所以连点的第二次点击如果用的还是旧 PI，语义就是反的：想取消却再收藏一次。
+     * 这正是「连点只生效一次」的真因。正确做法不是加时间锁，而是**等通知重建**。
+     * QQ 音乐重建通知最慢约 1~5 秒，这里给 3 秒上限。
+     */
+    private const val FAV_SEMANTIC_WAIT_MS = 3_000L
+
+    /** 语义等待期间的轮询间隔 */
+    private const val FAV_SEMANTIC_STEP_MS = 250L
+
+    /**
      * 换曲时作废在途的收藏泵：旧目标的校验回调读到的是**新歌**的真值，
      * 不清掉会把新歌 ❤ 按上一首的目标写错，并且把新目标挤掉。
      */
@@ -1097,23 +1114,99 @@ internal object ArkLiveExpandHook {
      * 现在：发完 1.2s 读一次真值，没变再等 0.8s 读一次，仍然没变才重发（最多重试 1 次）。
      * 真值读不到（null）就放弃，交给通知/记忆表兜底 —— 绝不盲目反复发送导致来回翻转。
      */
-    private fun sendFavAction(ctx: Context, target: Boolean, gen: Int, attempt: Int) {
+    /**
+     * 从**当前**在播通知里取收藏按钮，并解析出它的语义。
+     *
+     * QQ 音乐的通知 action 是状态绑定的：
+     *  - 标题「收藏 / 喜欢」    → 当前未收藏（点它 = 收藏）
+     *  - 标题「已收藏 / 取消收藏」→ 当前已收藏（点它 = 取消）
+     *
+     * @return first = PendingIntent，second = 按钮当前状态（true = 已收藏）
+     */
+    private fun favoriteActionFor(ctx: Context, title: String): Pair<PendingIntent, Boolean>? {
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return null
+        val list = try {
+            nm.activeNotifications
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        val candidates = list.filter { sbn ->
+            ArkConstants.isMediaApp(sbn.packageName) &&
+                (currentPkg == null || sbn.packageName == currentPkg)
+        }
+        // 优先标题严格匹配当前曲（防串台）；匹配不到再退化为当前 App 的媒体通知
+        val strict = if (title.isBlank()) candidates else candidates.filter { sbn ->
+            sbn.notification?.extras?.getCharSequence(Notification.EXTRA_TITLE)
+                ?.toString() == title
+        }
+        for (group in listOf(strict, candidates)) {
+            for (sbn in group) {
+                val acts = sbn.notification?.actions ?: continue
+                for (a in acts) {
+                    val t = a.title?.toString()?.trim() ?: continue
+                    val pi = a.actionIntent ?: continue
+                    val faved = t.contains("已喜欢") || t.contains("已收藏") ||
+                        t.contains("取消喜欢") || t.contains("取消收藏")
+                    val plain = !faved && (t.contains("喜欢") || t.contains("收藏"))
+                    if (faved || plain) return pi to faved
+                }
+            }
+        }
+        return null
+    }
+
+    private fun sendFavAction(
+        ctx: Context,
+        target: Boolean,
+        gen: Int,
+        attempt: Int,
+        waited: Long = 0L
+    ) {
         // 目标已被新点击覆盖 → 立刻让位，别把过期目标打出去
         if (gen != favGen) {
             favBusy = false
             pumpFav(ctx)
             return
         }
-        // 重试前先重新取一次按钮：通知可能已经刷新成「另一个语义」的动作
-        if (attempt > 1) refreshFavAction(ctx)
-
-        val pi = favIntent
-        if (pi == null) {
+        // v3.15.8：**实时**取按钮，并用它的语义判断能不能点。
+        // 缓存 favIntent 是错的：它的标题语义会随通知重建而翻转，
+        // 拿旧 PI 去点「取消」实际会再收藏一次。
+        val live = favoriteActionFor(ctx, trackTitle.orEmpty())
+        if (live == null) {
             XposedBridge.log("$TAG: favorite skipped (no like action)")
             // 没有可点的按钮：不能硬拗，交给真值/记忆表兜底
             finishFav(ctx, gen, readFavFromSession(ctx))
             return
         }
+        val pi = live.first
+        val btnState = live.second
+        // 按钮已经处于目标状态 → 真实状态若还不是目标，说明通知还没重建。
+        // 此刻点下去得到的是反方向（想取消却再收藏），必须等它刷新。
+        if (btnState == target) {
+            // 等待期间真值可能已经到位（上一次操作生效了），别再无谓地等
+            if (waited >= FAV_SEMANTIC_STEP_MS) {
+                val now = readFavFromSession(ctx)
+                if (now == target) {
+                    XposedBridge.log("$TAG: fav already=$target while waiting, done")
+                    finishFav(ctx, gen, now)
+                    return
+                }
+            }
+            if (waited < FAV_SEMANTIC_WAIT_MS) {
+                XposedBridge.log(
+                    "$TAG: fav action stale (btn=$btnState target=$target), wait ${waited}ms"
+                )
+                mainHandler.postDelayed({
+                    sendFavAction(ctx, target, gen, attempt, waited + FAV_SEMANTIC_STEP_MS)
+                }, FAV_SEMANTIC_STEP_MS)
+                return
+            }
+            XposedBridge.log("$TAG: fav action never refreshed, give up")
+            finishFav(ctx, gen, readFavFromSession(ctx))
+            return
+        }
+        favIntent = pi
         lastFavSendAt = SystemClock.uptimeMillis()
         lastFavTarget = target
         if (attempt == 1) {

@@ -1193,6 +1193,53 @@ send → 1.2s 用 COLLECT_STATE 校验 → 没变 → 再等 0.8s 再校验 → 
 `resetFavPump()` 接进 `pushToPanel` / `syncNow` 的换曲分支：旧目标的校验回调读到的是
 **新歌**真值，不作废会按上一首的目标把新歌 ❤ 写错。
 
+## 2026-11-04 · v3.15.8｜查清「系统组件限制时间」：系统没有节流，错在按钮语义
+
+**取证方法**：pull `/system_ext/priv-app/SystemUI/SystemUI.apk`（71MB，5 个 dex），
+`dexdump -d` 反汇编后定位 `com.flyme.statusbar.livenotification.LiveNotificationController$LiveNotificationClickHelper`。
+
+**结论：系统侧没有任何点击节流**。`handleTouchEvent` 只做三件事：判断触点是否落在
+实况区域（`SystemUICommonUtils.calcViewScreenLocation`）、记录 `mHasDown`、判断
+`ACTION_UP`/`ACTION_CANCEL`。没有任何 `uptimeMillis` 比较或延迟常量 —— 点一下就直接
+`send` 通知里的 action。
+
+### 真正的限制来自「按钮语义」
+
+`dumpsys notification --noredact` 拿到的 QQ 音乐通知：
+
+```
+actions={
+  [0] "已收藏" -> PendingIntent{... broadcastIntent}
+  [1] "上一首" -> ...
+  [2] "播放"   -> ...
+  [3] "下一首" -> ...
+  [4] "显示桌面歌词" -> ...
+}
+```
+
+收藏按钮的标题是**状态绑定**的：
+
+| 标题 | 表示当前状态 | 点下去的实际效果 |
+|---|---|---|
+| `收藏` / `喜欢` | 未收藏 | 收藏 |
+| `已收藏` / `取消收藏` | 已收藏 | 取消收藏 |
+
+而这条通知要 1~5 秒才重建。连点的第二次点击如果还用旧的 `favIntent`，
+语义就是反的 —— **想取消收藏，实际又发了一次「收藏」**。这才是「连点只生效一次」。
+
+### 改法：按语义实时取按钮，语义不符就等通知重建
+
+- 新增 `favoriteActionFor()`：每次发送前**实时**扫 activeNotifications，返回
+  `(PendingIntent, 按钮当前状态)`；标题先严格匹配当前曲（防串台），匹配不到退化为
+  当前 App 的媒体通知。
+- `sendFavAction()` 只在 `btnState != target` 时发送（语义正确才点）。
+  `btnState == target` 说明通知还没刷新，每 250ms 重试，最多 3 秒
+  （`FAV_SEMANTIC_WAIT_MS`）；过程中真值一旦到位立即结束。
+- 等不到就放弃并回推真实状态，**绝不发反方向的点击**。
+- 面板点击锁 900ms → 450ms：只挡误触双击，正确性已由语义匹配保证。
+
+
+
 
 
 
