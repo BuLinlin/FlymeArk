@@ -237,6 +237,15 @@ internal object ArkLiveExpandHook {
      */
     private var lastToggleSentAt = 0L
 
+    /**
+     * v3.15.9：本次发送的按钮是否**带明确语义**。
+     *
+     * QQ 音乐按钮标题会翻转（收藏/已收藏），语义已知，校验失败可以安全重发一次。
+     * 网易云的 `like` 是纯 toggle、标题恒定 —— 这种情况重发等于把刚做的操作撤销，
+     * 所以只允许发一次，失败就认命（以真值为准）。
+     */
+    private var lastSentSemanticKnown = true
+
     /** 上一次 toggle 发出后，等它落地的最短时间（给播放器写 metadata 的时间） */
     private const val FAV_CONFIRM_WAIT_MS = 1_200L
 
@@ -785,18 +794,23 @@ internal object ArkLiveExpandHook {
         var hit: Notification.Action? = null
         for (a in acts) {
             val t = a.title?.toString()?.trim() ?: continue
-            if (t.contains("已喜欢") || t.contains("已收藏") ||
-                t.contains("取消喜欢") || t.contains("取消收藏")
-            ) {
-                found = a.actionIntent
-                titleState = true
-                hit = a
-                break
-            }
-            if (t.contains("喜欢") || t.contains("收藏")) {
-                found = a.actionIntent
-                titleState = false
-                hit = a
+            // 中文（QQ 音乐：收藏/已收藏）与英文（网易云：like）都要认
+            when (favTitleState(t)) {
+                true -> {
+                    found = a.actionIntent
+                    titleState = true
+                    hit = a
+                    break
+                }
+                false -> {
+                    found = a.actionIntent
+                    titleState = false
+                    hit = a
+                }
+                null -> if (found == null && isFavTitleLike(t)) {
+                    found = a.actionIntent
+                    hit = a
+                }
             }
         }
         if (found == null) return
@@ -830,7 +844,8 @@ internal object ArkLiveExpandHook {
 
         val learned = hash?.let { favMap[it] }
         val state = titleState ?: learned
-        if (state != favState) {
+        // 网易云的 `like` 不带状态词，state 可能仍是 null —— 不能把已知状态清掉
+        if (state != null && state != favState) {
             favState = state
             XposedBridge.log("$TAG: favorite state=$state (title=$titleState learned=$learned)")
         }
@@ -1114,16 +1129,27 @@ internal object ArkLiveExpandHook {
      * 现在：发完 1.2s 读一次真值，没变再等 0.8s 读一次，仍然没变才重发（最多重试 1 次）。
      * 真值读不到（null）就放弃，交给通知/记忆表兜底 —— 绝不盲目反复发送导致来回翻转。
      */
+    /** 收藏按钮：PendingIntent + 按钮当前状态（null = 标题不带状态词，方向不可知） + 来源包名 */
+    private class FavButton(
+        val pi: PendingIntent,
+        val state: Boolean?,
+        val pkg: String
+    )
+
     /**
-     * 从**当前**在播通知里取收藏按钮，并解析出它的语义。
+     * 从在播通知里取收藏按钮。
      *
-     * QQ 音乐的通知 action 是状态绑定的：
-     *  - 标题「收藏 / 喜欢」    → 当前未收藏（点它 = 收藏）
-     *  - 标题「已收藏 / 取消收藏」→ 当前已收藏（点它 = 取消）
+     * 真机取证（2026-11-04 18:04）两家按钮标题完全不同：
+     *  - QQ 音乐：中文、**状态绑定** ——「收藏」（=未收藏）/「已收藏」（=取消收藏）
+     *  - 网易云：  英文、**恒定** —— `like` 一直是 `like`，标题不随状态变
      *
-     * @return first = PendingIntent，second = 按钮当前状态（true = 已收藏）
+     * v3.15.8 只认中文，网易云必然匹配不到（日志 `favorite skipped (no like action)`），
+     * 且候选被 `currentPkg` 死绑 —— 歌词通知归属与正在播的 App 不一致时，QQ 音乐也会全被过滤掉。
+     *
+     * 现在：候选放开到所有受支持 App 的通知，按「标题匹配当前曲 > currentPkg > 其余」排序；
+     * 标题语义也支持英文；语义不可知时返回 state = null，由调用方直接发送 + 真值校验。
      */
-    private fun favoriteActionFor(ctx: Context, title: String): Pair<PendingIntent, Boolean>? {
+    private fun favoriteActionFor(ctx: Context, title: String): FavButton? {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return null
         val list = try {
@@ -1131,29 +1157,79 @@ internal object ArkLiveExpandHook {
         } catch (_: Throwable) {
             null
         } ?: return null
-        val candidates = list.filter { sbn ->
-            ArkConstants.isMediaApp(sbn.packageName) &&
-                (currentPkg == null || sbn.packageName == currentPkg)
+        val media = list.filter { ArkConstants.isMediaApp(it.packageName) }
+        if (media.isEmpty()) return null
+
+        val cur = title.trim()
+        val strict = if (cur.isEmpty()) emptyList() else media.filter { sbn ->
+            val nt = sbn.notification?.extras?.getCharSequence(Notification.EXTRA_TITLE)
+                ?.toString()?.trim().orEmpty()
+            nt.isNotEmpty() && (nt.contains(cur) || cur.contains(nt))
         }
-        // 优先标题严格匹配当前曲（防串台）；匹配不到再退化为当前 App 的媒体通知
-        val strict = if (title.isBlank()) candidates else candidates.filter { sbn ->
-            sbn.notification?.extras?.getCharSequence(Notification.EXTRA_TITLE)
-                ?.toString() == title
-        }
-        for (group in listOf(strict, candidates)) {
+        val preferred = currentPkg?.let { p ->
+            media.filter { it.packageName == p }
+        } ?: emptyList()
+
+        for (group in listOf(strict, preferred, media)) {
             for (sbn in group) {
-                val acts = sbn.notification?.actions ?: continue
-                for (a in acts) {
-                    val t = a.title?.toString()?.trim() ?: continue
-                    val pi = a.actionIntent ?: continue
-                    val faved = t.contains("已喜欢") || t.contains("已收藏") ||
-                        t.contains("取消喜欢") || t.contains("取消收藏")
-                    val plain = !faved && (t.contains("喜欢") || t.contains("收藏"))
-                    if (faved || plain) return pi to faved
+                val btn = favButtonIn(sbn) ?: continue
+                if (btn.pkg != currentPkg) {
+                    XposedBridge.log("$TAG: fav button from ${btn.pkg} (currentPkg=$currentPkg)")
                 }
+                return btn
             }
         }
         return null
+    }
+
+    /** 在单条通知里找收藏按钮；优先带状态词的，再退化为泛指（网易云 `like`） */
+    private fun favButtonIn(sbn: android.service.notification.StatusBarNotification): FavButton? {
+        val acts = sbn.notification?.actions ?: return null
+        var generic: FavButton? = null
+        for (a in acts) {
+            val t = a.title?.toString()?.trim().orEmpty()
+            val pi = a.actionIntent ?: continue
+            if (t.isEmpty()) continue
+            val state = favTitleState(t)
+            when (state) {
+                true -> return FavButton(pi, true, sbn.packageName)
+                false -> if (generic == null) generic = FavButton(pi, false, sbn.packageName)
+                // 可能是英文泛指 like：只当候选，继续找带明确状态的
+                null -> {
+                    if (!isFavTitleLike(t)) continue
+                    if (generic == null) generic = FavButton(pi, null, sbn.packageName)
+                }
+            }
+        }
+        return generic
+    }
+
+    /** 标题 → 收藏状态：true = 已收藏（点它=取消），false = 未收藏（点它=收藏），null = 不确定 */
+    private fun favTitleState(t: String): Boolean? {
+        val s = t.lowercase()
+        // 「已…」「取消…」都表示当前已收藏
+        if (t.contains("已喜欢") || t.contains("已收藏") ||
+            t.contains("取消喜欢") || t.contains("取消收藏")
+        ) return true
+        if (s.contains("liked") || s.contains("favorited") || s.contains("favourited") ||
+            s.contains("unlike") || s.contains("unfavorite") || s.contains("uncollect") ||
+            s.contains("remove from") || s.contains("added")
+        ) return true
+        // 泛指「收藏/喜欢」= 当前未收藏
+        if (t.contains("喜欢") || t.contains("收藏")) return false
+        if (s == "like" || s == "favorite" || s == "favourite" || s == "collect" ||
+            s.contains("add to") || s.contains("like song") || s.contains("favorite song")
+        ) return false
+        return null
+    }
+
+    /** 是否像一个「收藏」类按钮（用于状态未知的候选识别） */
+    private fun isFavTitleLike(t: String): Boolean {
+        val s = t.lowercase()
+        if (s.contains("dislike")) return false
+        return s == "like" || s == "liked" ||
+            s.contains("favorite") || s.contains("favourite") ||
+            s.contains("collect") || s.contains("like song")
     }
 
     private fun sendFavAction(
@@ -1179,11 +1255,13 @@ internal object ArkLiveExpandHook {
             finishFav(ctx, gen, readFavFromSession(ctx))
             return
         }
-        val pi = live.first
-        val btnState = live.second
+        val pi = live.pi
+        val btnState = live.state
         // 按钮已经处于目标状态 → 真实状态若还不是目标，说明通知还没重建。
         // 此刻点下去得到的是反方向（想取消却再收藏），必须等它刷新。
-        if (btnState == target) {
+        // btnState == null（网易云恒为 `like`，标题不带状态）时无法判断方向，
+        // 只能按 toggle 语义直接发送，正确性交给下面的 metadata 真值校验兜底。
+        if (btnState != null && btnState == target) {
             // 等待期间真值可能已经到位（上一次操作生效了），别再无谓地等
             if (waited >= FAV_SEMANTIC_STEP_MS) {
                 val now = readFavFromSession(ctx)
@@ -1209,6 +1287,7 @@ internal object ArkLiveExpandHook {
         favIntent = pi
         lastFavSendAt = SystemClock.uptimeMillis()
         lastFavTarget = target
+        lastSentSemanticKnown = btnState != null
         if (attempt == 1) {
             // 点击闭环：记下点击前的指纹与目标。只有点击前状态已知时，翻转结果才可断言
             pendingFavHash = favHash
@@ -1255,6 +1334,18 @@ internal object ArkLiveExpandHook {
                 verifyFavLater(ctx, target, gen, attempt, round = 1)
                 return@postDelayed
             }
+            // 语义未知（网易云 `like`）时绝不能重发：那是 toggle，重发等于撤销刚才的操作。
+            // 只再多等一轮，还不对就以真值收尾。
+            if (!lastSentSemanticKnown) {
+                if (round == 1) {
+                    XposedBridge.log("$TAG: fav toggle not applied yet, last wait")
+                    verifyFavLater(ctx, target, gen, attempt, round = 2)
+                } else {
+                    XposedBridge.log("$TAG: fav toggle gave up, accept actual=$actual")
+                    finishFav(ctx, gen, actual)
+                }
+                return@postDelayed
+            }
             if (attempt < 2) {
                 XposedBridge.log("$TAG: fav verify failed (actual=$actual), retry")
                 sendFavAction(ctx, target, gen, attempt + 1)
@@ -1263,7 +1354,11 @@ internal object ArkLiveExpandHook {
                 XposedBridge.log("$TAG: fav failed twice, accept actual=$actual")
                 finishFav(ctx, gen, actual)
             }
-        }, if (round == 0) 900L else 700L)
+        }, when (round) {
+            0 -> 900L
+            1 -> 700L
+            else -> 1_200L
+        })
     }
 
     /**
@@ -1309,7 +1404,7 @@ internal object ArkLiveExpandHook {
                 ) continue
                 val a = n.actions?.firstOrNull { act ->
                     val t = act.title?.toString()?.trim().orEmpty()
-                    t.contains("喜欢") || t.contains("收藏")
+                    favTitleState(t) != null || isFavTitleLike(t)
                 } ?: continue
                 favIntent = a.actionIntent
                 XposedBridge.log("$TAG: fav action refreshed ('${a.title}')")

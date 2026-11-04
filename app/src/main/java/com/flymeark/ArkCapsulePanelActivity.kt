@@ -307,8 +307,11 @@ class ArkCapsulePanelActivity : Activity() {
         try {
             appIconView.setImageDrawable(packageManager.getApplicationIcon(pkg))
             appIconView.visibility = View.VISIBLE
-        } catch (_: Throwable) {
+            android.util.Log.i("FlymeArkPanel", "app icon shown pkg=$pkg")
+        } catch (t: Throwable) {
+            // v3.15.9：包可见性未声明时这里会抛 NameNotFoundException，图标整块消失
             appIconView.visibility = View.GONE
+            android.util.Log.w("FlymeArkPanel", "app icon failed pkg=$pkg: ${t.message}")
         }
     }
 

@@ -1245,3 +1245,66 @@ actions={
 
 
 
+
+## 2026-11-04 · v3.15.9｜修收藏彻底失效（英文按钮）+ 右上角 App 图标不显示
+
+**起因**：用户反馈「现在不能取消收藏也不能添加收藏了，网易云和 QQ 音乐都不行，右上角图标一直没出现」。
+
+### 一、收藏彻底失效：只认中文按钮，网易云按钮是英文
+
+真机日志（18:03~18:05）直接抓到了原因：
+
+```
+liveExpand: favorite request target=true gen=33 busy=false
+liveExpand: favorite skipped (no like action)      ← 每一次都是这句
+```
+
+再看通知按钮的取证输出，两家标题完全不同：
+
+```
+(网易云) notif action[0] title='like'  [1] 'pre' [2] 'toggle' [3] 'next' [4] 'lyric'
+(QQ音乐) notif action[0] title='收藏'  [1] '上一首' [2] '暂停' [3] '下一首' [4] '显示桌面歌词'
+```
+
+v3.15.8 的 `favoriteActionFor()` 只匹配 `喜欢/收藏` 中文词，网易云按钮标题固定是
+`like`（不是 `已喜欢`），必然全部落空；同时候选通知被 `currentPkg` 死绑，
+歌词通知归属与正在播放的 App 不一致时，连 QQ 音乐也会被整组过滤掉 → 两家都点不动。
+
+修复：
+
+- 新增 `favTitleState()`：中文（收藏/已收藏/取消收藏）+ 英文
+  （`like`/`liked`/`favorite`/`favourited`/`unlike`/`collect`…）统一解析，
+  返回三态：`true` 已收藏 / `false` 未收藏 / `null` 语义不可知。
+- 候选范围放开：所有受支持 App 的通知，按「标题匹配当前曲 → currentPkg → 其余」排序，
+  不再一刀切过滤；命中其它包时打日志便于取证。
+- `inspectFavoriteActions()` 同步改用同一套解析，且 `state == null` 时**不再清掉已知状态**
+  （否则网易云一开面板 ❤ 就变「未定」）。
+
+### 二、网易云 `like` 是纯 toggle —— 禁止「校验失败就重发」
+
+`like` 标题恒定，无法从按钮判断方向，只能按 toggle 直接发送。这种情况若沿用
+「900ms 未生效 → 重发一次」的逻辑，第二次点击等于把刚做的收藏撤销，比失效更糟。
+
+- 新增 `lastSentSemanticKnown`：发送时记录按钮是否带明确语义。
+- 语义不可知（网易云）时**只发一次**：900ms → 700ms → 再宽限 1200ms，
+  仍未生效就以 metadata 真值收尾，绝不重发。
+- QQ 音乐（标题会翻转，语义明确）保留原有「最多重发 1 次」。
+
+### 三、右上角 App 图标一直不显示：包可见性
+
+`applyAppIcon()` 用 `PackageManager.getApplicationIcon(pkg)` 取图标，失败就 `GONE`。
+模块 targetSdk 36，但 AndroidManifest 里没有 `<queries>` 声明 —— 面板跑在模块自身进程
+（不是 SystemUI），受包可见性限制，`getApplicationIcon("com.tencent.qqmusic")`
+直接抛 `NameNotFoundException`，图标被 catch 成隐藏，所以「从来没出现过」。
+
+- Manifest 增加 `<queries>`：`com.tencent.qqmusic` + `com.netease.cloudmusic`
+  （已用 aapt2 dump 确认进 APK）。
+- `applyAppIcon()` 捕获异常时改为打日志（`FlymeArkPanel: app icon shown/failed pkg=...`），
+  下次可以直接从 logcat 判断是可见性问题还是资源问题。
+
+### 验证要点
+
+- 网易云播歌 → 点 ❤ → 日志应出现 `fav button from com.netease.cloudmusic (currentPkg=...)`
+  → `favorite action sent target=...`（不再有 `no like action`）
+- QQ 音乐同样操作，`fav verified -> true/false` 出现即为闭环成功
+- 打开面板右上角应显示当前播放 App 图标（QQ 音乐红色 / 网易云红色音符）
