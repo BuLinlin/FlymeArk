@@ -174,7 +174,8 @@ internal object ArkLiveExpandHook {
     private var favLogKey: String? = null
 
     /** metadata extras 的 key 只打一次（用于真机确认播放器有没有暴露收藏字段） */
-    private var metaKeysLogged = false
+    /** metadata 的键只按「播放器」打印一次（QQ音乐 / 网易云 的字段集不同） */
+    private val metaLoggedPkgs = HashSet<String>()
 
     /** USER_RATING 的取值签名，变化时才打日志（取证收藏/取消收藏时它怎么变） */
     private var lastRatingSig: String? = null
@@ -512,9 +513,19 @@ internal object ArkLiveExpandHook {
             val playing = session?.playing ?: trackPlaying
             session?.clickIntent?.let { lastClickIntent = it }
 
+            // v3.15.6：封面优先取 MediaSession 的 ALBUM_ART。
+            // trackCover 是歌词通知里缓存的 largeIcon，播放器重发通知才更新
+            // （网易云尤其慢），切歌时面板会先显示上一首的封面。
+            val cover = if (changed) {
+                session?.art?.let { scaleArt(it) } ?: trackCover
+            } else {
+                null
+            }
+            if (cover != null) trackCover = cover
+
             sendTrack(
                 c, title, artist, progress, duration, playing,
-                if (changed) trackCover else null, lastClickIntent
+                cover, lastClickIntent
             )
             if (changed) {
                 XposedBridge.log("$TAG: push track '$title' pos=$progress/$duration playing=$playing")
@@ -927,12 +938,11 @@ internal object ArkLiveExpandHook {
 
     private fun favFromMetadata(md: MediaMetadata?): Boolean? {
         val ex = metaBundle(md) ?: return null
-        if (!metaKeysLogged) {
-            metaKeysLogged = true
+        if (metaLoggedPkgs.add(currentPkg ?: "?")) {
             val dump = ex.keySet().joinToString("; ") { k ->
                 "$k:${ex.get(k)?.javaClass?.simpleName}"
             }
-            XposedBridge.log("$TAG: metadata bundle (${ex.size()}): $dump")
+            XposedBridge.log("$TAG: metadata bundle [${currentPkg}] (${ex.size()}): $dump")
         }
         // ① QQ 音乐（UCAR 内核）明确暴露的收藏位：ucar.media.metadata.COLLECT_STATE = "1"/"0"
         //    真机取证 2026-11-04 17:35：这条与 QQ 音乐界面的 ❤ 完全一致，且随切歌即时更新
@@ -975,33 +985,124 @@ internal object ArkLiveExpandHook {
 
     /** 面板点 ❤ → 触发通知上的收藏按钮（PendingIntent 是播放器自己的，send 无需权限） */
     fun toggleFavorite(ctx: Context?, target: Boolean) {
-        // v3.14.1：收藏按钮是 toggle 语义，连点会在"收藏/取消"之间抖动；
-        // SystemUI 侧再兜一道 800ms 防抖（面板 600ms 之后的窗口期）
+        val c = ctx ?: return
+        // v3.15.6：防抖从 800ms 降到 200ms。面板侧已有 350ms 节流，这里只需挡真正的连点抖动；
+        // 原来 800ms 会把「收藏后立刻取消」的第二次点击直接吞掉 —— 用户看到的「有概率取消失败」。
         val now = SystemClock.uptimeMillis()
-        if (now - lastFavSendAt < 800L) {
+        if (now - lastFavSendAt < 200L) {
             XposedBridge.log("$TAG: favorite throttled")
             return
         }
+        sendFavAction(c, target, attempt = 1)
+    }
+
+    /**
+     * v3.15.6：发送收藏动作，并用 metadata 的 COLLECT_STATE 做**闭环校验**。
+     *
+     * 为什么需要：播放器的收藏按钮挂在通知上，PendingIntent 可能因爲通知未重建而指向
+     * 上一个动作，send 出去等于「什么也没发生」。以前只能盲信，用户看到的就是
+     * 「点了没反应 / 有概率失败」。
+     *
+     * 现在：发完 1.2s 读一次真值，没变再等 0.8s 读一次，仍然没变才重发（最多重试 1 次）。
+     * 真值读不到（null）就放弃，交给通知/记忆表兜底 —— 绝不盲目反复发送导致来回翻转。
+     */
+    private fun sendFavAction(ctx: Context, target: Boolean, attempt: Int) {
+        // 重试前先重新取一次按钮：通知可能已经刷新成「另一个语义」的动作
+        if (attempt > 1) refreshFavAction(ctx)
+
         val pi = favIntent
         if (pi == null) {
             XposedBridge.log("$TAG: favorite skipped (no like action)")
             return
         }
-        lastFavSendAt = now
+        lastFavSendAt = SystemClock.uptimeMillis()
         lastFavTarget = target
-        // 点击闭环：记下点击前的指纹与目标。只有点击前状态已知时，翻转结果才可断言
-        pendingFavHash = favHash
-        pendingFavTarget = target
-        pendingFavLearnable = favState != null
+        if (attempt == 1) {
+            // 点击闭环：记下点击前的指纹与目标。只有点击前状态已知时，翻转结果才可断言
+            pendingFavHash = favHash
+            pendingFavTarget = target
+            pendingFavLearnable = favState != null
+        }
         // 乐观置为目标状态：通知刷新若拿到真值会覆盖它，不会长期错下去
         favState = target
         // v3.15.4：用户意图立刻按曲目记账 —— 之后再切回这首，❤ 直接就是目标状态
-        if (ctx != null) rememberTrackFav(ctx, trackFavKey(currentPkg, trackTitle), target)
+        rememberTrackFav(ctx, trackFavKey(currentPkg, trackTitle), target)
         try {
             pi.send(ctx, 0, null)
-            XposedBridge.log("$TAG: favorite action sent (target=$target from=${favHash})")
+            XposedBridge.log("$TAG: favorite action sent (target=$target attempt=$attempt)")
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: favorite send failed: ${t.message}")
+        }
+
+        verifyFavLater(ctx, target, attempt, round = 0)
+    }
+
+    /** 校验调度：1.2s → 再 0.8s；仍未生效才重试（最多 2 次发送） */
+    private fun verifyFavLater(ctx: Context, target: Boolean, attempt: Int, round: Int) {
+        mainHandler.postDelayed({
+            val actual = readFavFromSession(ctx)
+            if (actual == null) {
+                XposedBridge.log("$TAG: fav verify skipped (no metadata)")
+                return@postDelayed
+            }
+            if (actual == target) {
+                // 成功：撤掉沉降窗口，让真值重新可采信
+                favState = actual
+                lastFavSendAt = 0L
+                pendingFavTarget = null
+                pendingFavHash = null
+                rememberTrackFav(ctx, trackFavKey(currentPkg, trackTitle), actual)
+                XposedBridge.log("$TAG: fav verified -> $actual (attempt=$attempt)")
+                if (panelVisible) pushToPanel(ctx, force = true)
+                return@postDelayed
+            }
+            if (round == 0) {
+                XposedBridge.log("$TAG: fav not applied yet (actual=$actual), recheck")
+                verifyFavLater(ctx, target, attempt, round = 1)
+                return@postDelayed
+            }
+            if (attempt < 2) {
+                XposedBridge.log("$TAG: fav verify failed (actual=$actual), retry")
+                sendFavAction(ctx, target, attempt + 1)
+            } else {
+                // 两次都失败：以播放器真值为准，不再硬拗
+                favState = actual
+                lastFavSendAt = 0L
+                pendingFavTarget = null
+                pendingFavHash = null
+                XposedBridge.log("$TAG: fav failed twice, accept actual=$actual")
+                if (panelVisible) pushToPanel(ctx, force = true)
+            }
+        }, if (round == 0) 1_200L else 800L)
+    }
+
+    /**
+     * 重新从当前在播通知里取收藏按钮（只更新 favIntent / 指纹，不改 favState）。
+     * 重试时用：通知若已重建，按钮语义可能从「收藏」变成「已收藏」，必须取新的。
+     */
+    private fun refreshFavAction(ctx: Context) {
+        try {
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            val list = nm?.activeNotifications ?: return
+            for (sbn in list) {
+                val pkg = sbn?.packageName ?: continue
+                if (!ArkConstants.isMediaApp(pkg)) continue
+                val n = sbn.notification ?: continue
+                val nt = n.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+                val cur = trackTitle?.trim()
+                if (!nt.isNullOrEmpty() && !cur.isNullOrEmpty() &&
+                    !nt.contains(cur) && !cur.contains(nt)
+                ) continue
+                val a = n.actions?.firstOrNull { act ->
+                    val t = act.title?.toString()?.trim().orEmpty()
+                    t.contains("喜欢") || t.contains("收藏")
+                } ?: continue
+                favIntent = a.actionIntent
+                XposedBridge.log("$TAG: fav action refreshed ('${a.title}')")
+                return
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: fav action refresh failed: ${t.message}")
         }
     }
 
