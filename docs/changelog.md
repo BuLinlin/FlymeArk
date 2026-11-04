@@ -1346,3 +1346,63 @@ target=false), wait 1250ms`），刷新后（title=true）立即发送并校验�
 右上角图标：`FlymeArkPanel: app icon shown pkg=com.tencent.qqmusic`（queries 声明生效）。
 
 - versionCode 31 / 3.15.10
+
+## 2026-11-04 · v3.15.11｜实况开关按「当前播放 App」判断（修网易云关不掉）
+
+**起因**：用户反馈「设置里关掉网易云的实况通知，网易云依旧出现实况；QQ 音乐可以控制」。
+
+### 根因一：`any {}` 把两个开关混在一起
+
+`ArkLiveLyricHook` 的门控是这么写的：
+
+```kotlin
+val allowed = ArkConstants.MEDIA_APP_PKGS.any { LiveAllowGate.isAllowed(ctx, it) }
+```
+
+语义变成「**只要有一个 App 开着就放行**」。用户关掉网易云时 QQ 音乐的开关仍然是开的，
+`any` 依旧是 true，所以网易云的胶囊照样出现 —— 开关看起来完全没生效。
+
+现在改成按**当前正在出歌词的 App** 判断：
+
+```kotlin
+val cur = ArkLiveExpandHook.currentPkg          // 由歌词通知归属实时更新
+val allowed = if (cur != null && isMediaApp(cur)) LiveAllowGate.isAllowed(ctx, cur)
+              else MEDIA_APP_PKGS.any { ... }   // 未知归属时才退回任一放行
+```
+
+### 根因二：system_server 的「强制放行」把开关架空了
+
+`ArkLiveAllowHook` 会 hook `PreferencesHelper.getNotificationLiveAllowForPackage`，
+对两个播放器**一律返回 true**。只要用户在 LSPosed 里勾了「系统框架」，
+设置里的开关就彻底失效（写进去的 false 被 hook 覆盖）。
+
+胶囊出现在渲染侧已由 `LiveAllowGate` 按真值决定，这个强制放行不再需要，
+v3.15.11 起**停用**（`install()` 只留一行日志），`allowLive` 恢复为用户真实选择。
+
+### 真机验证
+
+```
+liveLyric: lyrics from com.tencent.qqmusic -> '今夜茉莉要开'
+[FlymeArk/liveAllow] allowLive(com.tencent.qqmusic) = true
+liveLyric: mIsMediaShow forced true
+```
+
+日志里现在**只查当前播放 App 一个包**（旧版会连网易云一起查），开关语义正确。
+
+### 顺带：连点收藏实测通过（v3.15.10 的串行泵）
+
+连续 5 次交替 `false→true→false→true→false`：
+
+```
+favorite action sent (target=false gen=26 attempt=1)
+favorite request target=true  gen=27 busy=true     ← 在途，只记目标
+favorite request target=false gen=28 busy=true
+favorite request target=true  gen=29 busy=true
+fav verify stale (gen=26 now=29)                   ← 旧校验作废
+favorite request target=false gen=30 busy=true
+fav already=false, skip send                       ← 幂等短路
+```
+
+最终状态 = 最后一次点击的目标，没有多翻一次。
+
+- versionCode 32 / 3.15.11

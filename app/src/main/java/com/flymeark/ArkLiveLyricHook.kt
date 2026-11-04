@@ -67,10 +67,17 @@ internal object ArkLiveLyricHook {
                             // 否则用户在设置里关掉后，mIsMediaShow 仍是 true，胶囊会一直留着。
                             val ctx = XposedHelpers.getObjectField(ctrl, "mContext")
                                 as? android.content.Context
-                            // v3.15：受支持的媒体 App（QQ音乐/网易云）任一放行即可。
-                            // 不同时听两个 App 时实际只有一个在出歌词，这里 OR 判断足够。
-                            val allowed = ArkConstants.MEDIA_APP_PKGS.any {
-                                LiveAllowGate.isAllowed(ctx, it)
+                            // v3.15.11：必须按**当前正在出歌词的那个 App** 判断开关。
+                            // 原来用 MEDIA_APP_PKGS.any{...}，只要有一个 App 开着就放行 ——
+                            // 用户在设置里关掉网易云，QQ 音乐还开着，any 仍为 true，
+                            // 网易云的实况照旧出现（用户实测「网易云开关不生效」）。
+                            val cur = ArkLiveExpandHook.currentPkg
+                            val allowed = if (cur != null && ArkConstants.isMediaApp(cur)) {
+                                LiveAllowGate.isAllowed(ctx, cur)
+                            } else {
+                                ArkConstants.MEDIA_APP_PKGS.any {
+                                    LiveAllowGate.isAllowed(ctx, it)
+                                }
                             }
                             if (!allowed) {
                                 if (XposedHelpers.getBooleanField(ctrl, "mIsMediaShow")) {
