@@ -30,6 +30,8 @@ class ArkEntry : IXposedHookLoadPackage {
 
             ArkConstants.SYSTEMUI_PKG -> {
                 log("SystemUI: installing lyric + cover + expand + media-key")
+                // 全局玻璃：统一染色透明度（所有玻璃面一处生效）
+                ArkGlobalGlassHook.install(lpp)
                 // 媒体键代派（system uid）
                 SystemUILiveHost.install(lpp)
                 // 放开歌词胶囊门控（mIsMediaShow 恒 false）

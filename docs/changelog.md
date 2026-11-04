@@ -567,3 +567,83 @@ v3.4 起把这张卡的背景包进 `ArkGlassDrawable`，并且设了 `alpha = 0
 
 `versionCode 11 / 3.10.0`，编译通过。**装机时设备断开（adb devices 为空），未安装、未验证。**
 重连后 `adb install -r` + 重启 SystemUI 即可，日志里不应再出现任何 `[FlymeArk/mediaCard]`。
+
+## 2026-11-04 · v3.11｜全局玻璃入口：统一染色透明度
+
+### 为什么改这里
+
+Flyme 所有玻璃面最终都汇到一个方法：
+
+```java
+MzBlurUtils.setBackgroundBlurDrawable(
+    view, blurRadius = 180, cornerRadius = -1f, clipCornerRadius,
+    color,          // ← args[4]，染色 = ARGB
+    debug, blurAlpha, zAdjustment, Function0, Consumer
+)
+```
+
+6 个调用方：`MediaCarouseTransitionLayout`（媒体卡）、`NotificationBackgroundView`（通知行）、
+`LandscapeHeadsUpNotificationView`、`BatteryWarningView`、`PluginBlurView`（锁屏插件）、
+`StatusBarHotZoneWindowController`。4 个重载全汇到 10 参版（经 `setBackgroundBlurDrawable$default`），
+所以**一次 `hookAllMethods` 覆盖全部玻璃面**，不再单独碰任何一个组件。
+
+### 两个透明度各管一层（关键结论）
+
+读 AOSP `BackgroundBlurDrawable` 源码：
+
+```java
+public void setColor(int color) { mPaint.setColor(color); }   // 染色，含 alpha，原样进 Paint
+public void setAlpha(int alpha) { mAlpha = alpha / 255f; }    // 只控制 SurfaceFlinger 模糊强度
+public void draw(Canvas c) {
+    c.drawPath(mRectPath, mPaint);        // ① 先画染色
+    c.drawRenderNode(mRenderNode);        // ② 模糊层后盖上去
+}
+```
+
+两个要点：
+
+1. **染色透明度在 `setColor` 的 alpha 里**，`setAlpha` 管的是模糊强度 —— 之前一直调错了参数；
+2. 绘制顺序是「先画染色、再盖模糊」，染色被混进模糊源，等于**先掺白再模糊**，
+   这才是玻璃「白得发死、颜色被洗掉」的真正机制。
+
+### 只动 0xB2 这一档
+
+实测系统有三档染色 alpha，只有第一档是主玻璃：
+
+| alpha | 用途 | 处理 |
+|---|---|---|
+| `0xB2`（70%） | 主玻璃（白 / 深灰） | **改动目标** |
+| `0x66`（40%） | 次级遮罩 | 原样保留 |
+| `0x1A`（10%） | 弱遮罩 | 原样保留 |
+
+第一版把三档一律压成 58%，会把 10% 的弱遮罩抬到 58%，层次全毁。已改成只认 `0xB2`。
+
+改写只换 alpha，**RGB 原样保留** —— 是「把玻璃调透」，不是换一套配色，因此不与系统主题色逻辑冲突。
+
+### 效果与上限（实测）
+
+同一场景三档对照，卡片背景平均饱和度：
+
+| 染色不透明度 | 平均饱和度 |
+|---|---|
+| 70%（原值） | 0.0557 |
+| 58%（0x94） | 0.0714 |
+| 43%（0x6E） | 0.0886 |
+
+饱和度涨了 59%，但**肉眼差异很小**，卡片仍是一片近白。原因有三：
+
+1. 染色画在模糊层**下面**，再高的模糊（180）也会把掺进去的颜色一起抹平；
+2. 下拉栏本身已有一层浅色底，卡片背后的「模糊源」早被洗过一遍；
+3. `BackgroundBlurDrawable` 只支持 blurRadius / cornerRadius / color / alpha，
+   **没有折射、没有边缘高光**，而液态玻璃的辨识度恰恰来自这两样。
+
+结论：这个入口能调的是「透多少」，调不出「液态」。要真正的液态玻璃必须自己渲染
+（离屏抓背景 → 模糊 → 提饱和 → 边缘菲涅尔高光），代价是实时性，
+v3.8 前后已经因为「截取下层纹理导致卡顿」否决过一次。
+
+### 状态
+
+`versionCode 14 / 3.11.0`，浅色玻璃临时设为 43%（0x6E）作通透上限对照，已装机。
+定稿值待用户目视确认后回填（58% 为保守档，43% 为极限档）。
+
+注意：43% 在**深色壁纸 + 浅色模式**下会让黑字对比度不足，这是压透明度的固有代价。
