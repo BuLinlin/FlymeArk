@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.flymeark'
+    compileSdk rootProject.ext.compile_sdk
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'com.flymeark'
+        minSdk rootProject.ext.min_sdk
+        targetSdk rootProject.ext.target_sdk
+        versionCode 1
+        versionName '3.0.0'
+    }
+
+    buildTypes {
+        debug {
+            // 便于对比体积：不做无意义的多 dex
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // 本地自用：直接用 debug 签名，装上即可
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+        // 模块本身没有协程/反射需求，关掉不必要的元数据
+        freeCompilerArgs += ['-Xno-source-debug-extension']
+    }
+}
+
+dependencies {
+    // LSPosed 经典 API（compileOnly：运行时由 LSPosed 框架提供，不进 APK）
+    compileOnly 'de.robv.android.xposed:api:82'
+}

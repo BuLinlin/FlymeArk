@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FlymeArk</string>
+
+    <string name="ark_panel_cover">专辑封面</string>
+    <string name="ark_panel_prev">上一首</string>
+    <string name="ark_panel_next">下一首</string>
+    <string name="ark_panel_play">播放</string>
+    <string name="ark_panel_pause">暂停</string>
+    <string name="ark_panel_unknown">正在播放</string>
+</resources>

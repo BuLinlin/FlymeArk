@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 仅保留一条：从 SystemUI 后台拉起面板 Activity 的启动豁免兜底。
+         本模块不发通知、不驻留 Service、不渲染悬浮窗。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_flymeark"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Ark.CapsulePanel">
+
+        <!-- 点击实况胶囊展开的原生播放面板。
+             exported=true：由 SystemUI 进程（不同 uid）按类名显式拉起；
+             singleTask + 独立任务栈：不把任何界面带进最近任务。 -->
+        <activity
+            android:name=".ArkCapsulePanelActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Ark.CapsulePanel"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.flymeark.panel"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|fontScale"
+            android:windowSoftInputMode="stateAlwaysHidden"
+            android:showWhenLocked="true" />
+
+        <!-- LSPosed 模块元数据 -->
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="FlymeArk：把播放器自己的实况通知变成带封面的灵动胶囊（只 hook，不自己发通知）" />
+        <meta-data android:name="xposedminversion" android:value="82" />
+        <!-- 推荐作用域；system_server 需在管理器里手动勾选「系统框架」 -->
+        <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+    </application>
+</manifest>

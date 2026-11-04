@@ -1,0 +1,34 @@
+// FlymeArk 根构建脚本
+// 纯 Kotlin LSPosed 模块：不集成 UniApp 离线 SDK，无 native 库，APK 目标 < 1MB
+buildscript {
+    ext {
+        kotlin_version = '2.2.0'
+        agp_version = '8.7.3'
+        compile_sdk = 36
+        min_sdk = 26
+        target_sdk = 36
+    }
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.android.tools.build:gradle:$agp_version"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+allprojects {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        google()
+        mavenCentral()
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}
