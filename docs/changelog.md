@@ -2,6 +2,63 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-04 · v3.15.18｜新增微信/QQ 消息实况通知（参考「魅况」，本版收尾）
+
+### 一、微信/QQ 消息实况胶囊
+
+参考第三方「魅况」的做法，给微信（`com.tencent.mm`）与 QQ（`com.tencent.mobileqq`）
+加实况通知支持。它们不是媒体 App（无歌词、无 MediaSession），走的是独立的**消息实况胶囊**
+通道，与 QQ音乐/网易云 的歌词胶囊互不冲突。
+
+逆向确认（SystemUI `LiveNotificationController.shouldShowLiveNotification`）：
+一条通知要变成实况胶囊需同时满足 `sbn.isLive()`（`extras["notification.live.type"]` 非 0）
+与 `sbn.getCapsuleStatus()==1`（`extras["notification.live.capsule"].capsuleStatus`）。
+
+新增 `ArkMessageLiveInjector`：在微信/QQ 进程 hook `NotificationManager.notify`，
+对「有标题+正文」的消息通知注入上述 live 字段（`capsuleTitle`=发送者、`capsuleContent`=正文），
+跳过常驻前台通知，并带已注入标记防重复。
+
+### 二、推荐应用与设置登记同步
+
+- `xposed_scope` / `scope.list` 加入微信、QQ（`com.tencent.mm`、`com.tencent.mobileqq`）。
+- `ArkLiveSettingsHook.TARGETS` 登记微信、QQ，让它们在「设置 → 实况通知」开关列表出现，
+  描述按类型区分（音乐播放实况 / 消息实况）。
+- manifest `<queries>` 补微信、QQ 包可见性。
+
+### 三、本版收尾
+
+放弃 system_server 侧 `setNotificationLiveAllowForPackage` hook（SELinux Enforcing 下
+无法可靠写入 LSPosed 配置库，且该方法在 `NotificationManagerService$12` 内部类、随 ROM 变化），
+关闭开关的实时生效改由现有 SystemUI 侧门控 + 延迟复核承担。至此微信/QQ 消息实况、QQ音乐/网易云
+歌词实况均已覆盖，本版收尾。
+
+---
+
+## 2026-11-04 · v3.15.17｜修正系统框架作用域 key + 开关 hook 目标类
+
+### 一、系统框架作用域 key 是 `system` 不是 `android`
+
+上一版在 `xposedscope` 数组里加的 `<item>android</item>` 是错的。LSPosed v2.x 里
+system_server（系统框架）的 scope key 是 **`system`**（真机 `scope` 表里其他模块
+如 `flymemod`/`flyme10` 都用 `system` 条目，无任何模块用 `android`）。
+
+已改为 `<item>system</item>`，并直接改写设备 `modules_config.db` 给本模块插入了
+`system` 作用域条目。
+
+### 二、开关 hook 目标类错误 → NoSuchMethodError
+
+真机日志（18:58，pid 3850）：`hook setNotificationLiveAllowForPackage` 报
+`NoSuchMethodError: NotificationManagerService#setNotificationLiveAllowForPackage`。
+
+反编译 services.jar 确认：该方法签名 `(String, int, boolean)` 是对的，但**实现不在
+`NotificationManagerService` 本身，而在它的内部类 `NotificationManagerService$12`**
+（父类 `INotificationManager$Stub`，即 Binder 服务端实现）。
+
+修复：遍历 `NotificationManagerService` 的所有内部类，找到声明该签名的那个再 hook，
+避免 `$12` 编号随 ROM 版本变化失效。
+
+---
+
 ## 2026-11-04 · v3.15.16｜收藏「有时点不上」修复 + 胶囊重绘缓解
 
 ### 一、收藏「有时成功有时失败」——拿不到按钮就放弃

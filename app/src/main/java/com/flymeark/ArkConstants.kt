@@ -30,6 +30,24 @@ object ArkConstants {
     /** 是否为本模块支持的媒体 App 包名（网易云/QQ音乐） */
     fun isMediaApp(pkg: String?): Boolean = pkg != null && pkg in MEDIA_APP_PKGS
 
+    // ------------------------------------------------------------------
+    // 微信 / QQ 消息实况通知（v3.15.18，参考「魅况」）
+    // ------------------------------------------------------------------
+
+    /**
+     * 微信 / QQ 的包名。它们不是媒体 App（无歌词、无 MediaSession），不走
+     * [MEDIA_APP_PKGS] 的歌词胶囊链路，而是**消息实况胶囊**：在 SystemUI 侧把
+     * 它们发出的普通消息通知渲染成魅族实况胶囊（标题=发送者，正文=消息内容）。
+     */
+    const val WECHAT_PKG = "com.tencent.mm"
+    const val QQ_PKG = "com.tencent.mobileqq"
+
+    /** 消息实况 App 集合（微信 / QQ） */
+    val MESSAGE_LIVE_PKGS: Set<String> = setOf(WECHAT_PKG, QQ_PKG)
+
+    /** 是否为本模块支持的消息实况 App 包名（微信/QQ） */
+    fun isMessageLiveApp(pkg: String?): Boolean = pkg != null && pkg in MESSAGE_LIVE_PKGS
+
     /** 设置进程包名（把 QQ音乐登记进「实况通知」设置页） */
     const val SETTINGS_PKG = "com.android.settings"
 

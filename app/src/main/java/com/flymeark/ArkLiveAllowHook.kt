@@ -35,31 +35,48 @@ internal object ArkLiveAllowHook {
 
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: hook setNotificationLiveAllowForPackage")
 
-        // 定位 INotificationManager.setNotificationLiveAllowForPackage(String, int, boolean)
-        ArkHooks.quiet("$TAG setNotificationLiveAllowForPackage") {
-            XposedHelpers.findAndHookMethod(
-                "com.android.server.notification.NotificationManagerService",
-                lpp.classLoader,
-                "setNotificationLiveAllowForPackage",
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                Boolean::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
-                            val pkg = param.args[0] as? String ?: return
-                            if (!ArkConstants.isMediaApp(pkg)) return
-                            val allow = param.args[2] as? Boolean ?: return
-                            XposedBridge.log(
-                                "[${ArkConstants.LOG_TAG}] $TAG: user toggled live for $pkg -> $allow"
-                            )
-                            notifySystemUI(pkg, allow)
-                        } catch (t: Throwable) {
-                            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")
-                        }
+        // v3.15.17：`setNotificationLiveAllowForPackage(String,int,boolean)` 的实现不在
+        // `NotificationManagerService` 本身，而在它的内部类 `NotificationManagerService$12`
+        // （父类是 `INotificationManager$Stub`，即 Binder 服务端实现）。直接 hook 外层类会
+        // 报 NoSuchMethodError。这里遍历所有 `NotificationManagerService$N` 内部类，找到
+        // 真正声明该方法签名的那个再 hook，避免 `$12` 编号随 ROM 版本变化而失效。
+        val nmCls = XposedHelpers.findClass(
+            "com.android.server.notification.NotificationManagerService", lpp.classLoader
+        )
+        var hooked = false
+        for (inner in nmCls.declaredClasses) {
+            if (!inner.name.startsWith("com.android.server.notification.NotificationManagerService$")) continue
+            val m = try {
+                inner.getDeclaredMethod(
+                    "setNotificationLiveAllowForPackage",
+                    String::class.java,
+                    Int::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType
+                )
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: hooking ${inner.name}")
+            XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    try {
+                        val pkg = param.args[0] as? String ?: return
+                        if (!ArkConstants.isMediaApp(pkg)) return
+                        val allow = param.args[2] as? Boolean ?: return
+                        XposedBridge.log(
+                            "[${ArkConstants.LOG_TAG}] $TAG: user toggled live for $pkg -> $allow"
+                        )
+                        notifySystemUI(pkg, allow)
+                    } catch (t: Throwable) {
+                        XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")
                     }
                 }
-            )
+            })
+            hooked = true
+            break
+        }
+        if (!hooked) {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: no inner class declares setNotificationLiveAllowForPackage")
         }
     }
 

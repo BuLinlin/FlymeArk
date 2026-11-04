@@ -1,18 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- LSPosed 推荐作用域：安装后管理器据此提示勾选。
-         「android」= 系统框架（system_server），用于感知用户切换「实况通知」开关的动作，
-         让关闭开关实时生效（hook setNotificationLiveAllowForPackage）。 -->
+         「system」= 系统框架（system_server），用于感知用户切换「实况通知」开关的动作，
+         让关闭开关实时生效（hook setNotificationLiveAllowForPackage）。
+         注意：LSPosed 里 system_server 的 scope key 是「system」，不是「android」。 -->
     <string-array name="xposed_scope">
         <!-- 系统框架（system_server）：感知实况通知开关的「用户动作」，关闭实时生效 -->
-        <item>android</item>
+        <item>system</item>
         <!-- 目标播放器：QQ音乐（打开魅族状态栏歌词通道） -->
         <item>com.tencent.qqmusic</item>
         <!-- 目标播放器：网易云音乐（同为魅族状态栏歌词协议，v3.15 起支持） -->
         <item>com.netease.cloudmusic</item>
+        <!-- 消息实况：微信（把消息通知渲染成实况胶囊，v3.15.18） -->
+        <item>com.tencent.mm</item>
+        <!-- 消息实况：QQ（把消息通知渲染成实况胶囊，v3.15.18） -->
+        <item>com.tencent.mobileqq</item>
         <!-- SystemUI：歌词胶囊放行 + 封面 + 点击展开 + 媒体键代派 -->
         <item>com.android.systemui</item>
-        <!-- 设置：把 QQ音乐 / 网易云 登记进「实况通知」开关列表 -->
+        <!-- 设置：把 QQ音乐 / 网易云 / 微信 / QQ 登记进「实况通知」开关列表 -->
         <item>com.android.settings</item>
     </string-array>
 </resources>

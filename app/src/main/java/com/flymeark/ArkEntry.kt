@@ -53,6 +53,8 @@ class ArkEntry : IXposedHookLoadPackage {
 
         // 播放器进程（作用域内其余应用）：只做「打开魅族歌词通道」这一件事
         ArkLiveInjector.install(lpp)
+        // 微信 / QQ：注入消息实况字段，把消息通知渲染成实况胶囊（v3.15.18）
+        ArkMessageLiveInjector.install(lpp)
     }
 
     private fun log(msg: String) {
