@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -14,8 +15,6 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
-import android.view.animation.DecelerateInterpolator
-import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
 import com.flymeark.R
@@ -38,6 +37,7 @@ class ArkCapsulePanelActivity : Activity() {
 
     private lateinit var root: View
     private lateinit var card: View
+    private lateinit var content: View
     private lateinit var coverView: ImageView
     private lateinit var titleView: TextView
     private lateinit var artistView: TextView
@@ -45,6 +45,8 @@ class ArkCapsulePanelActivity : Activity() {
     private lateinit var timeCurrent: TextView
     private lateinit var timeTotal: TextView
     private lateinit var playBtn: ImageView
+
+    private lateinit var morph: ArkMorphAnim
 
     private var durationMs = 0
     private var positionMs = 0
@@ -100,8 +102,30 @@ class ArkCapsulePanelActivity : Activity() {
         bindViews()
         bindData()
         bindActions()
-        placeBelowStatusBar()
-        animateIn()
+
+        morph = ArkMorphAnim(root, card, content)
+        // 第一帧先按胶囊尺寸摆好（此时不可见，避免「完整卡片闪一下再缩回去」），
+        // 第二帧再显示并开始长大。
+        card.alpha = 0f
+        root.post {
+            morph.prepare(capsuleRect())
+            root.post {
+                card.alpha = 1f
+                morph.expand()
+                restartTicker()
+            }
+        }
+    }
+
+    /** SystemUI 传来的胶囊屏幕矩形；缺失时交给 [ArkMorphAnim] 用兜底尺寸 */
+    private fun capsuleRect(): Rect? {
+        val i = intent ?: return null
+        val w = i.getIntExtra(ArkConstants.EXTRA_CAPSULE_WIDTH, 0)
+        val h = i.getIntExtra(ArkConstants.EXTRA_CAPSULE_HEIGHT, 0)
+        if (w <= 0 || h <= 0) return null
+        val l = i.getIntExtra(ArkConstants.EXTRA_CAPSULE_LEFT, 0)
+        val t = i.getIntExtra(ArkConstants.EXTRA_CAPSULE_TOP, 0)
+        return Rect(l, t, l + w, t + h)
     }
 
     private fun registerTrackReceiver() {
@@ -120,6 +144,7 @@ class ArkCapsulePanelActivity : Activity() {
     private fun bindViews() {
         root = findViewById(R.id.panel_root)
         card = findViewById(R.id.panel_card)
+        content = findViewById(R.id.panel_content)
         coverView = findViewById(R.id.panel_cover)
         titleView = findViewById(R.id.panel_title)
         artistView = findViewById(R.id.panel_artist)
@@ -210,7 +235,13 @@ class ArkCapsulePanelActivity : Activity() {
         closing = false
         handler.removeCallbacksAndMessages(null)
         bindData()
-        animateIn()
+        // 面板已经开着了，换一批数据即可；重新播一遍展开会让画面闪，
+        // 只有在还没走完入场动画时才补一次。
+        if (card.alpha < 1f) {
+            card.alpha = 1f
+            morph.expand()
+        }
+        restartTicker()
     }
 
     @Suppress("DEPRECATION")
@@ -304,49 +335,19 @@ class ArkCapsulePanelActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // 窗口位置与动画
+    // 动画（几何计算全部在 ArkMorphAnim 里）
     // ------------------------------------------------------------------
-
-    /** 卡片贴状态栏下沿出现，像从胶囊垂下来，同时不遮挡时间/信号 */
-    private fun placeBelowStatusBar() {
-        val lp = card.layoutParams as FrameLayout.LayoutParams
-        lp.topMargin = statusBarHeight() + dp(4)
-        card.layoutParams = lp
-    }
-
-    private fun statusBarHeight(): Int {
-        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
-        return if (id > 0) resources.getDimensionPixelSize(id) else dp(30)
-    }
-
-    private fun dp(v: Int): Int =
-        (v * resources.displayMetrics.density).toInt()
-
-    private fun animateIn() {
-        card.post {
-            card.translationY = -card.height * 0.55f
-            card.alpha = 0f
-            card.animate()
-                .translationY(0f)
-                .alpha(1f)
-                .setDuration(280L)
-                .setInterpolator(DecelerateInterpolator(1.8f))
-                .start()
-            restartTicker()
-        }
-    }
 
     private fun dismiss() {
         if (closing) return
         closing = true
         handler.removeCallbacks(ticker)
         handler.removeCallbacks(switchWatchdog)
-        card.animate()
-            .translationY(-card.height * 0.45f)
-            .alpha(0f)
-            .setDuration(170L)
-            .withEndAction { finish() }
-            .start()
+        handler.removeCallbacks(syncRequest)
+        // 卡片缩回胶囊的中途让状态栏胶囊淡入，两个动作重叠，
+        // 视觉上是「卡片收回胶囊里」，而不是「卡片消失后胶囊凭空出现」。
+        handler.postDelayed({ publishVisibility(false) }, 90L)
+        morph.collapse { finish() }
     }
 
     // ------------------------------------------------------------------
@@ -374,6 +375,7 @@ class ArkCapsulePanelActivity : Activity() {
 
     override fun onDestroy() {
         publishVisibility(false)
+        if (this::morph.isInitialized) morph.stop()
         try {
             unregisterReceiver(trackReceiver)
         } catch (_: Throwable) {

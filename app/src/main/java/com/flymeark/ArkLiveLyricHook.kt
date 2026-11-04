@@ -52,7 +52,7 @@ internal object ArkLiveLyricHook {
 
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG installing")
 
-        // 门控放行：有歌词 → 视作媒体实况在显示
+        // 门控放行：有歌词 + 用户没关开关 → 视作媒体实况在显示
         ArkHooks.quiet("$TAG getTopLyricsDisplayText") {
             XposedHelpers.findAndHookMethod(
                 CTRL_CLS, lpp.classLoader, "getTopLyricsDisplayText",
@@ -63,6 +63,20 @@ internal object ArkLiveLyricHook {
                             val ctrl = param.thisObject
                             val lyrics = XposedHelpers.getObjectField(ctrl, "mLyricsInofo")
                             if (lyrics == null) return
+
+                            // v3.2：每次都要问一次开关，不能只在首次放行时判断 ——
+                            // 否则用户在设置里关掉后，mIsMediaShow 仍是 true，胶囊会一直留着。
+                            val ctx = XposedHelpers.getObjectField(ctrl, "mContext")
+                                as? android.content.Context
+                            if (!LiveAllowGate.isAllowed(ctx, QQ_MUSIC)) {
+                                if (XposedHelpers.getBooleanField(ctrl, "mIsMediaShow")) {
+                                    XposedHelpers.setBooleanField(ctrl, "mIsMediaShow", false)
+                                    lastLoggedText = null
+                                    XposedBridge.log("$TAG: switch OFF -> capsule released")
+                                }
+                                return
+                            }
+
                             if (XposedHelpers.getBooleanField(ctrl, "mIsMediaShow")) return
 
                             XposedHelpers.setBooleanField(ctrl, "mIsMediaShow", true)

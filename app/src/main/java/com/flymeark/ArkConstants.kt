@@ -33,6 +33,15 @@ object ArkConstants {
     const val EXTRA_PANEL_PLAYING = "panel_playing"
 
     /**
+     * 胶囊在屏幕上的矩形（px，左上角 + 宽高）。
+     * 面板用它做「从胶囊长大成卡片」的展开动画起点，收起时再缩回同一位置。
+     */
+    const val EXTRA_CAPSULE_LEFT = "capsule_left"
+    const val EXTRA_CAPSULE_TOP = "capsule_top"
+    const val EXTRA_CAPSULE_WIDTH = "capsule_width"
+    const val EXTRA_CAPSULE_HEIGHT = "capsule_height"
+
+    /**
      * 播放面板 → SystemUI：媒体键请求。
      * 面板运行在普通 App uid，`AudioManager.dispatchMediaKeyEvent` 可能被隐藏 API 限制；
      * 统一交给 SystemUI（system uid）派发，命中率 100%。

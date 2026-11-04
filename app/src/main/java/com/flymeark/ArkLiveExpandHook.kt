@@ -69,6 +69,12 @@ internal object ArkLiveExpandHook {
     /** 两次展开之间的最小间隔，防止焦点抖动导致连续拉起 */
     private const val PANEL_COOLDOWN_MS = 1_200L
 
+    /** 展开时胶囊淡出时长（与面板「长大」前段重叠，形成连续动作） */
+    private const val CAPSULE_FADE_MS = 110L
+
+    /** 收起时胶囊淡回时长 */
+    private const val CAPSULE_RESTORE_MS = 170L
+
     /**
      * 胶囊视图可能挂在这几个字段上（按可靠性排序，命中第一个就停）。
      * 只淡出胶囊本身，不动整个状态栏左侧区域。
@@ -251,12 +257,22 @@ internal object ArkLiveExpandHook {
         if (!panelVisible) return
         val v = capsuleRef?.get() ?: return
         try {
-            v.animate().cancel()
-            v.alpha = 0f
+            // 淡出动画还在跑（animation != null）时不要硬压成 0，否则会「闪一下再消失」；
+            // 只有原生刷新把 alpha 直接拉回来（没有动画在跑）时才需要再压一次。
+            if (v.animation == null && v.alpha > 0.05f) {
+                v.alpha = 0f
+            }
         } catch (_: Throwable) {
         }
     }
 
+    /**
+     * 面板展开/收起时同步胶囊的透明度。
+     *
+     * v3.2：不再「瞬间消失」。胶囊用 110ms 淡出，和面板从胶囊矩形长大的前段重叠，
+     * 视觉上是一个连续动作（胶囊一边长成卡片、一边退场），而不是先闪一下再冒出个卡片。
+     * 收起时 170ms 淡回，等面板缩回胶囊位置后再出现。
+     */
     private fun applyCapsuleAlpha(ctrl: Any, alpha: Float) {
         for (name in CAPSULE_FIELDS) {
             val v = try {
@@ -267,10 +283,9 @@ internal object ArkLiveExpandHook {
             capsuleRef = WeakReference(v)
             v.animate().cancel()
             if (alpha >= 1f) {
-                // 收起面板时淡回来，避免突兀地「啪」一下出现
-                v.animate().alpha(1f).setDuration(160L).start()
+                v.animate().alpha(1f).setDuration(CAPSULE_RESTORE_MS).start()
             } else {
-                v.alpha = 0f
+                v.animate().alpha(0f).setDuration(CAPSULE_FADE_MS).start()
             }
             XposedBridge.log("$TAG: capsule[$name] alpha=$alpha")
             return
@@ -399,26 +414,41 @@ internal object ArkLiveExpandHook {
     // ------------------------------------------------------------------
 
     /**
+     * 胶囊视图在**屏幕坐标系**下的矩形：`[left, top, width, height]`。
+     * 面板拿它当展开动画的起点，所以必须是屏幕绝对坐标（`getLocationOnScreen`），
+     * 不能用相对父容器的位置。
+     */
+    private fun capsuleRectOnScreen(ctrl: Any): IntArray? = try {
+        val view = XposedHelpers.getObjectField(ctrl, "mLiveNotificationDisplay") as? View
+        if (view == null || view.width <= 0 || view.height <= 0) {
+            null
+        } else {
+            val loc = IntArray(2)
+            view.getLocationOnScreen(loc)
+            intArrayOf(loc[0], loc[1], view.width, view.height)
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
      * 精确命中判定：落点必须真的在胶囊视图内。
      * `LiveNotificationClickHelper` 只判断 mHasDown 与整个 mLiveNotificationArea 范围，
      * 粒度过粗，状态栏的其它手势也常常被判成 consumed —— 这里再用视图矩形收一次。
      */
     private fun hitCapsule(ctrl: Any, x: Float, y: Float): Boolean = try {
-        val view = XposedHelpers.getObjectField(ctrl, "mLiveNotificationDisplay") as? View
-        if (view == null || view.visibility != View.VISIBLE) {
+        val r = capsuleRectOnScreen(ctrl)
+        if (r == null) {
             false
         } else {
-            val loc = IntArray(2)
-            view.getLocationOnScreen(loc)
-            val w = view.width
-            val h = view.height
-            if (w <= 0 || h <= 0) {
-                false
-            } else {
-                val pad = view.resources.displayMetrics.density * 8f
-                x >= loc[0] - pad && x <= loc[0] + w + pad &&
-                    y >= loc[1] - pad && y <= loc[1] + h + pad
-            }
+            val pad = (ctrl as? Any)?.let {
+                val ctx = XposedHelpers.getObjectField(ctrl, "mContext") as? Context
+                (ctx?.resources?.displayMetrics?.density ?: 3f) * 8f
+            } ?: 24f
+            val left = r[0].toFloat()
+            val top = r[1].toFloat()
+            x >= left - pad && x <= left + r[2] + pad &&
+                y >= top - pad && y <= top + r[3] + pad
         }
     } catch (_: Throwable) {
         false
@@ -477,6 +507,13 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_PANEL_DURATION, durationMs)
             putExtra(ArkConstants.EXTRA_PANEL_PLAYING, isPlaying)
             trackCover?.let { putExtra(ArkConstants.EXTRA_PANEL_COVER, it) }
+            // 胶囊矩形：面板以它为展开动画起点（长大）与收起终点（缩回）
+            capsuleRectOnScreen(ctrl)?.let { r ->
+                putExtra(ArkConstants.EXTRA_CAPSULE_LEFT, r[0])
+                putExtra(ArkConstants.EXTRA_CAPSULE_TOP, r[1])
+                putExtra(ArkConstants.EXTRA_CAPSULE_WIDTH, r[2])
+                putExtra(ArkConstants.EXTRA_CAPSULE_HEIGHT, r[3])
+            }
         }
 
         try {

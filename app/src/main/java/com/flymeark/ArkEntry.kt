@@ -36,6 +36,8 @@ class ArkEntry : IXposedHookLoadPackage {
                 ArkLiveLyricHook.install(lpp)
                 // 专辑封面写入 smallIcon + 清 showType=5 单色滤镜
                 ArkLiveCoverHook.install(lpp)
+                // 胶囊宽度收窄 + 歌词横向滑入
+                ArkLiveCapsuleStyleHook.install(lpp)
                 // 点击胶囊 → 原生播放面板
                 ArkLiveExpandHook.install(lpp)
                 return
