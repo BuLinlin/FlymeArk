@@ -82,6 +82,17 @@ object ArkConstants {
     const val EXTRA_SEEK_POSITION = "seek_position"
 
     /**
+     * 播放面板 → SystemUI：显式播放/暂停请求（v3.13.2）。
+     *
+     * **不要用 KEYCODE_MEDIA_PLAY_PAUSE 做 toggle。** 连续两次 PLAY_PAUSE 会被
+     * 播放器/系统判成「双击线控」→ 下一首（用户实测：快速连点暂停就切歌）。
+     * 这里改发明确目标状态，SystemUI 侧走 MediaController.transportControls
+     * 的 play() / pause()，幂等、无双击语义，也不会互相抵消。
+     */
+    const val ACTION_PANEL_PLAYBACK = "com.flymeark.PANEL_PLAYBACK"
+    const val EXTRA_PLAY_TARGET = "play_target"
+
+    /**
      * SystemUI → 播放面板：媒体 App 的点击跳转 PendingIntent（v3.13）。
      * 来源 MediaController.sessionActivity，点卡片空白处时 send() 拉起对应 App，
      * 与下拉栏媒体卡「点卡片进 App」行为对齐。

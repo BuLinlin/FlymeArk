@@ -748,3 +748,37 @@ v3.8 前后已经因为「截取下层纹理导致卡顿」否决过一次。
 - 收藏 ❤ / 歌词「词」按钮、输出切换：需 hook MediaSession 的 custom actions 与 MediaRouter2，
   与系统媒体卡对齐的最后一部分
 - 移除面板侧临时诊断日志（`FlymeArk` tag 的 Log.d）
+
+## 2026-11-04 · v3.13.2｜暂停不再用媒体键 toggle（连点导致切歌）
+
+**起因**：用户反馈「频繁点击暂停播放按钮就会切歌」。
+
+### 根因
+
+播放/暂停按钮发的是 `KEYCODE_MEDIA_PLAY_PAUSE`（toggle 语义）。这条链路
+`面板 → 广播 → SystemUI → AudioManager.dispatchMediaKeyEvent` 走的就是**线控耳机键**
+通道：QQ 音乐有「线控双击切换歌曲」、Flyme 媒体键分发层也可能把两次 PLAY_PAUSE
+识别成双击。250ms 的节流窗口挡不住人手连点（间隔常在 300~500ms），
+于是「点两下暂停」变成「下一首」。
+
+### 改法：发目标状态，不发 toggle
+
+- 新增 `ACTION_PANEL_PLAYBACK` + `EXTRA_PLAY_TARGET`（Boolean）。
+  面板点击后发的是「我要播放」或「我要暂停」，不是「翻转一下」。
+- `ArkLiveExpandHook.setPlayback(ctx, playing)`：取 QQ 音乐的 `MediaController`，
+  直接 `transportControls.play()` / `transportControls.pause()`。
+  **play/pause 是幂等的** —— 连点十次暂停也只是暂停十次，不会切歌；
+  也不会像 toggle 那样两次互相抵消。
+- 兜底：拿不到 MediaController 时仍回落 `dispatchMediaKeyEvent(PLAY_PAUSE)`，
+  保证按钮不至于完全失效（日志会打 `playback fallback to media key`）。
+- 面板侧防抖从「按键 250ms」改为「按目标状态 180ms」：`play` 与 `pause`
+  各自计时，互不阻塞，所以「暂停→立刻播放」不会被上一次 pause 吃掉；
+  同一目标窗口内重复点击直接丢弃（结果本来就相同）。
+- 上一首/下一首仍走媒体键（`KEYCODE_MEDIA_NEXT/PREVIOUS` 不是 toggle，
+  没有双击歧义），节流窗口保持 400ms。
+
+### 待真机验证
+
+- 连点暂停 5~10 次：应停在暂停态，不切歌、不跳曲
+- 暂停 → 立刻播放 → 再暂停：图标与真实状态一致，无延迟
+- 关掉 QQ 音乐进程后再点：日志出现 `playback fallback to media key`

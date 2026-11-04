@@ -36,8 +36,8 @@ private const val COVER_SLIDE_MS = 340L
 /** 上一首 / 下一首节流窗口：切歌链路本身有延迟，连点只会一次跳好几首 */
 private const val KEY_THROTTLE_MS = 400L
 
-/** 播放 / 暂停节流窗口：只挡抖动，不能挡「暂停→立刻播放」这种正常操作 */
-private const val PLAY_THROTTLE_MS = 250L
+/** 播放 / 暂停防连发窗口：显式 play()/pause() 幂等，这里只挡同一帧内的连发 IPC */
+private const val PLAY_THROTTLE_MS = 180L
 
 /** 点卡片跳转的防抖窗口：避免连点拉起多个实例 */
 private const val OPEN_APP_DEBOUNCE_MS = 800L
@@ -94,6 +94,9 @@ class ArkCapsulePanelActivity : Activity() {
 
     /** 媒体键节流时间戳（按按键分开记，暂停和切歌互不干扰） */
     private val lastKeyAt = HashMap<Int, Long>(4)
+
+    /** 播放/暂停防抖时间戳（按目标状态分开记：true=play，false=pause） */
+    private val lastPlaybackAt = HashMap<Boolean, Long>(2)
 
     /** 跳转防抖时间戳 */
     private var lastOpenAppAt = 0L
@@ -575,9 +578,11 @@ class ArkCapsulePanelActivity : Activity() {
             onTrackSwitched(1)
         }
         playBtn.setOnClickListener {
-            // 播放/暂停间隔更短：用户可能快速暂停再播放，只挡抖动不挡操作
-            if (!sendKeyThrottled(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, PLAY_THROTTLE_MS)) return@setOnClickListener
-            playing = !playing
+            // v3.13.2：发给 SystemUI 的是「目标状态」(play/pause)，不是 PLAY_PAUSE。
+            // toggle 媒体键连点两次会被播放器判成线控双击 → 下一首。
+            val target = !playing
+            if (!sendPlaybackThrottled(target)) return@setOnClickListener
+            playing = target
             updatePlayIcon()
             restartTicker()
         }
@@ -599,6 +604,29 @@ class ArkCapsulePanelActivity : Activity() {
         if (now - last < windowMs) return false
         lastKeyAt[keyCode] = now
         sendMediaKey(keyCode)
+        return true
+    }
+
+    /**
+     * v3.13.2：显式播放/暂停请求（幂等）。
+     *
+     * 按目标状态各自防抖：`pause` 与 `play` 互不阻塞，所以「暂停→马上播放」
+     * 不会被上一次 pause 的窗口吃掉；同一目标在窗口内重复点击直接忽略
+     * （连续 pause 本来就是同一结果，没有必要再发一次）。
+     */
+    private fun sendPlaybackThrottled(target: Boolean): Boolean {
+        val now = SystemClock.uptimeMillis()
+        val last = lastPlaybackAt[target] ?: 0L
+        if (now - last < PLAY_THROTTLE_MS) return false
+        lastPlaybackAt[target] = now
+        try {
+            sendBroadcast(
+                Intent(ArkConstants.ACTION_PANEL_PLAYBACK)
+                    .setPackage(ArkConstants.SYSTEMUI_PKG)
+                    .putExtra(ArkConstants.EXTRA_PLAY_TARGET, target)
+            )
+        } catch (_: Throwable) {
+        }
         return true
     }
 

@@ -72,6 +72,13 @@ internal object SystemUILiveHost {
                 when (intent.action) {
                     ArkConstants.ACTION_PANEL_MEDIA_KEY -> dispatchPanelKey(context, intent)
 
+                    // v3.13.2：播放/暂停改为显式目标状态，不再发 toggle 媒体键
+                    // （连点 PLAY_PAUSE 会被判成双击切歌）
+                    ArkConstants.ACTION_PANEL_PLAYBACK -> ArkLiveExpandHook.setPlayback(
+                        context,
+                        intent.getBooleanExtra(ArkConstants.EXTRA_PLAY_TARGET, true)
+                    )
+
                     // v3.1：面板展开/收起 → 淡出/恢复状态栏胶囊
                     ArkConstants.ACTION_PANEL_STATE -> {
                         val visible =
@@ -92,6 +99,7 @@ internal object SystemUILiveHost {
             addAction(ArkConstants.ACTION_PANEL_STATE)
             addAction(ArkConstants.ACTION_PANEL_SYNC)
             addAction(ArkConstants.ACTION_PANEL_SEEK)
+            addAction(ArkConstants.ACTION_PANEL_PLAYBACK)
         }
         try {
             if (Build.VERSION.SDK_INT >= 33) {

@@ -410,6 +410,40 @@ internal object ArkLiveExpandHook {
         }
     }
 
+    /**
+     * v3.13.2：面板播放/暂停 → 显式 play()/pause()。
+     *
+     * 为什么不用媒体键：KEYCODE_MEDIA_PLAY_PAUSE 是 toggle 语义，快速连点两次会被
+     * 播放器（QQ 音乐线控双击下一首）/系统媒体键分发层判成「双击 → 下一首」，
+     * 用户实测「频繁点暂停就切歌」正是这个原因。改成明确目标状态后：
+     *  · 连点暂停 = 多次 pause()，幂等，不会切歌
+     *  · 连点切换 = play()/pause() 交替，各按各的生效，不会互相抵消
+     * 失败（session 未就绪 / 不支持）时回落到媒体键，保证按钮不会完全失效。
+     */
+    fun setPlayback(ctx: Context?, playing: Boolean) {
+        val c = ctx ?: return
+        try {
+            val msm = c.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
+            val ctrl: MediaController? =
+                msm?.getActiveSessions(null)?.firstOrNull { it.packageName == QQ_MUSIC }
+            if (ctrl != null) {
+                if (playing) ctrl.transportControls.play() else ctrl.transportControls.pause()
+                XposedBridge.log("$TAG: playback -> $playing (transportControls)")
+                return
+            }
+            XposedBridge.log("$TAG: playback fallback to media key (no session)")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: setPlayback failed: ${t.message}")
+        }
+        try {
+            val am = c.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            val code = android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, code))
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, code))
+        } catch (_: Throwable) {
+        }
+    }
+
     /** MediaSession 里的专辑图 → 面板用的方形圆角缩略图（绑 Binder 事务 1MB 上限） */
     private fun scaleArt(src: Bitmap): Bitmap? = try {
         val size = minOf(src.width, src.height)
