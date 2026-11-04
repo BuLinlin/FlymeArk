@@ -15,10 +15,14 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.widget.ImageView
 import android.widget.TextView
 import com.flymeark.R
 import java.util.Locale
+
+/** 封面轮播单程时长 */
+private const val COVER_SLIDE_MS = 340L
 
 /**
  * v2.6：点击实况胶囊后从状态栏下方展开的播放控制面板。
@@ -38,7 +42,9 @@ class ArkCapsulePanelActivity : Activity() {
     private lateinit var root: View
     private lateinit var card: View
     private lateinit var content: View
-    private lateinit var coverView: ImageView
+    private lateinit var coverSlot: View
+    private lateinit var coverA: ImageView
+    private lateinit var coverB: ImageView
     private lateinit var titleView: TextView
     private lateinit var artistView: TextView
     private lateinit var progressBar: ArkProgressBar
@@ -52,6 +58,12 @@ class ArkCapsulePanelActivity : Activity() {
     private var positionMs = 0
     private var playing = false
     private var closing = false
+
+    /** 封面轮播：当前露在前面的是 A 还是 B */
+    private var frontIsA = true
+
+    /** 下次换曲的滑动方向（+1 下一首向右进，-1 上一首向左进） */
+    private var pendingDir = 1
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -145,7 +157,9 @@ class ArkCapsulePanelActivity : Activity() {
         root = findViewById(R.id.panel_root)
         card = findViewById(R.id.panel_card)
         content = findViewById(R.id.panel_content)
-        coverView = findViewById(R.id.panel_cover)
+        coverSlot = findViewById(R.id.panel_cover_slot)
+        coverA = findViewById(R.id.panel_cover)
+        coverB = findViewById(R.id.panel_cover_b)
         titleView = findViewById(R.id.panel_title)
         artistView = findViewById(R.id.panel_artist)
         progressBar = findViewById(R.id.panel_progress)
@@ -169,7 +183,7 @@ class ArkCapsulePanelActivity : Activity() {
         artistView.text = artist
         artistView.visibility = if (artist.isBlank()) View.GONE else View.VISIBLE
 
-        coverOf(i)?.let { coverView.setImageBitmap(it) }
+        coverOf(i)?.let { resetCover(it) }
 
         durationMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_DURATION, -1)
         positionMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_PROGRESS, -1).coerceAtLeast(0)
@@ -193,13 +207,17 @@ class ArkCapsulePanelActivity : Activity() {
      */
     private fun applyTrack(i: Intent) {
         val title = i.getStringExtra(ArkConstants.EXTRA_PANEL_TITLE)?.takeIf { it.isNotBlank() }
-        if (title != null) {
-            if (title != titleView.text.toString()) {
-                pendingTitle = null
-                handler.removeCallbacks(switchWatchdog)
-                handler.removeCallbacks(syncRequest)
-                titleView.text = title
-            }
+        var titleChanged = false
+        var dir = 1
+        if (title != null && title != titleView.text.toString()) {
+            titleChanged = true
+            // 换曲方向：按用户按的是上一首还是下一首决定封面滑入方向
+            dir = pendingDir
+            pendingDir = 1
+            pendingTitle = null
+            handler.removeCallbacks(switchWatchdog)
+            handler.removeCallbacks(syncRequest)
+            titleView.text = title
         }
 
         val artist = i.getStringExtra(ArkConstants.EXTRA_PANEL_ARTIST).orEmpty()
@@ -208,7 +226,8 @@ class ArkCapsulePanelActivity : Activity() {
             artistView.visibility = View.VISIBLE
         }
 
-        coverOf(i)?.let { coverView.setImageBitmap(it) }
+        // 换曲 → 轮播滑动；同曲补封面 → 直接替换
+        coverOf(i)?.let { bmp -> applyCover(bmp, if (titleChanged) dir else 0) }
 
         durationMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_DURATION, -1)
         positionMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_PROGRESS, -1).coerceAtLeast(0)
@@ -252,14 +271,88 @@ class ArkCapsulePanelActivity : Activity() {
             null
         }
 
+    // ------------------------------------------------------------------
+    // 封面轮播 + 专辑取色（v3.12）
+    // ------------------------------------------------------------------
+
+    private fun frontView(): ImageView = if (frontIsA) coverA else coverB
+
+    private fun backView(): ImageView = if (frontIsA) coverB else coverA
+
+    /** 首次显示 / onNewIntent 整批重绑：不做动画，直接落在 A 位 */
+    private fun resetCover(bmp: Bitmap) {
+        coverA.animate().cancel()
+        coverB.animate().cancel()
+        frontIsA = true
+        coverA.setImageBitmap(bmp)
+        coverA.visibility = View.VISIBLE
+        coverA.translationX = 0f
+        coverB.visibility = View.GONE
+        coverB.translationX = 0f
+        applyAlbumColor(bmp)
+    }
+
+    /**
+     * 换封面。
+     *
+     * @param dir +1 下一首：新封面从右边滑入、旧的向左滑出；
+     *            -1 上一首：方向相反；
+     *             0 同曲补封面：直接替换，不滑动
+     */
+    private fun applyCover(bmp: Bitmap, dir: Int) {
+        if (dir == 0 || coverSlot.width <= 0) {
+            resetCover(bmp)
+            return
+        }
+        applyAlbumColor(bmp)
+
+        val w = coverSlot.width.toFloat()
+        val outgoing = frontView()
+        val incoming = backView()
+
+        incoming.animate().cancel()
+        outgoing.animate().cancel()
+
+        incoming.setImageBitmap(bmp)
+        incoming.visibility = View.VISIBLE
+        incoming.translationX = dir * w
+
+        outgoing.animate()
+            .translationX(-dir * w)
+            .setDuration(COVER_SLIDE_MS)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+        incoming.animate()
+            .translationX(0f)
+            .setDuration(COVER_SLIDE_MS)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+
+        frontIsA = !frontIsA
+
+        // 归还旧封面：若这期间又换过曲，它可能已经重新上场，不能再藏
+        handler.postDelayed({
+            if (outgoing !== frontView()) {
+                outgoing.animate().cancel()
+                outgoing.translationX = 0f
+                outgoing.visibility = View.GONE
+            }
+        }, COVER_SLIDE_MS + 60)
+    }
+
+    /** 专辑取色 → 进度条主题色（取不出时保持原色） */
+    private fun applyAlbumColor(bmp: Bitmap) {
+        ArkAlbumColor.vibrantOf(bmp)?.let { progressBar.barColor = it }
+    }
+
     private fun bindActions() {
         findViewById<View>(R.id.panel_prev).setOnClickListener {
             sendMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-            onTrackSwitched()
+            onTrackSwitched(-1)
         }
         findViewById<View>(R.id.panel_next).setOnClickListener {
             sendMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
-            onTrackSwitched()
+            onTrackSwitched(1)
         }
         playBtn.setOnClickListener {
             sendMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
@@ -281,10 +374,11 @@ class ArkCapsulePanelActivity : Activity() {
         }
     }
 
-    private fun onTrackSwitched() {
+    private fun onTrackSwitched(dir: Int) {
         // v3.1：不再收起面板。切歌后先请 SystemUI 直接读 MediaSession 同步一次
         // （毫秒级），同步不到再等歌词通知推送；6 秒仍没换曲才判定失败并收起。
         pendingTitle = titleView.text.toString()
+        pendingDir = dir
         positionMs = 0
         timeCurrent.text = formatTime(0)
         progressBar.ratio = 0f

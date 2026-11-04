@@ -43,7 +43,7 @@ internal object ArkGlobalGlassHook {
     private const val SOURCE_ALPHA = 0xB2     // 70%
 
     /** 浅色玻璃目标不透明度 */
-    private const val LIGHT_ALPHA = 0x6E      // 43%（对照档，验证通透上限）
+    private const val LIGHT_ALPHA = 0x94      // 58%（保守档；43% 为极限档，待定稿）
 
     /** 深色玻璃目标不透明度 */
     private const val DARK_ALPHA = 0xA3       // 64%

@@ -44,13 +44,34 @@
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
 
-                <ImageView
-                    android:id="@+id/panel_cover"
+                <!--
+                  v3.12：封面位改成「双图插槽」做左右轮播。
+                  clipChildren=true 让滑出/滑入的图被裁在 62dp 方框内，
+                  切换时看起来是轮播而不是整块飘出去。
+                -->
+                <FrameLayout
+                    android:id="@+id/panel_cover_slot"
                     android:layout_width="62dp"
                     android:layout_height="62dp"
-                    android:contentDescription="@string/ark_panel_cover"
-                    android:scaleType="centerCrop"
-                    android:src="@drawable/ic_flymeark" />
+                    android:clipChildren="true"
+                    android:clipToPadding="true">
+
+                    <ImageView
+                        android:id="@+id/panel_cover"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:contentDescription="@string/ark_panel_cover"
+                        android:scaleType="centerCrop"
+                        android:src="@drawable/ic_flymeark" />
+
+                    <ImageView
+                        android:id="@+id/panel_cover_b"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:contentDescription="@string/ark_panel_cover"
+                        android:scaleType="centerCrop"
+                        android:visibility="gone" />
+                </FrameLayout>
 
                 <LinearLayout
                     android:layout_width="0dp"
