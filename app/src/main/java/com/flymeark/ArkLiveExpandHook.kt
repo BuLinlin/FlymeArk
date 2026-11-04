@@ -161,6 +161,20 @@ internal object ArkLiveExpandHook {
     private var favHash: String? = null
 
     /**
+     * v3.15.10：hook 侧缓存的收藏按钮语义（真机证明 `NotificationManager.activeNotifications`
+     * 在本机 SystemUI 里拿不到列表，v3.15.8 的「实时扫描」因此永远返回 null，
+     * 收藏彻底失效）。改为缓存播放通知里解析到的按钮 —— 通知本身每次进度刷新都会进来。
+     */
+    @Volatile private var favCachedState: Boolean? = null
+
+    /** 缓存按钮所属通知的标题（用于判断它是不是上一首的按钮） */
+    @Volatile private var favCachedSong: String? = null
+
+    /** activeNotifications 取证日志：只在数量变化时打一次 */
+    private var activeListLoggedOnce = false
+    private var lastActiveListSize = -2
+
+    /**
      * 指纹 → 状态 的自学习表（持久化在 SystemUI 数据目录）。
      *
      * QQ 音乐不给收藏接口、按钮标题固定「收藏」，唯一能区分两态的只有按钮图标。
@@ -259,9 +273,9 @@ internal object ArkLiveExpandHook {
      *
      * 所以连点的第二次点击如果用的还是旧 PI，语义就是反的：想取消却再收藏一次。
      * 这正是「连点只生效一次」的真因。正确做法不是加时间锁，而是**等通知重建**。
-     * QQ 音乐重建通知最慢约 1~5 秒，这里给 3 秒上限。
+     * 真机实测 QQ 音乐重建通知约 2.7 秒，这里给 5 秒上限。
      */
-    private const val FAV_SEMANTIC_WAIT_MS = 3_000L
+    private const val FAV_SEMANTIC_WAIT_MS = 5_000L
 
     /** 语义等待期间的轮询间隔 */
     private const val FAV_SEMANTIC_STEP_MS = 250L
@@ -815,6 +829,10 @@ internal object ArkLiveExpandHook {
         }
         if (found == null) return
         favIntent = found
+        // v3.15.10：缓存按钮语义与所属曲目 —— 本机拿不到 activeNotifications，
+        // 点击时只能靠这份缓存；通知每次进度刷新都会重走这里，所以它会跟着更新。
+        favCachedState = titleState
+        favCachedSong = key
 
         // 图标指纹：同一 App 的「已收藏/未收藏」通常是两个资源 id
         val hash = hit?.let { "${currentPkg ?: "?"}#${it.icon}" }
@@ -1150,36 +1168,47 @@ internal object ArkLiveExpandHook {
      * 标题语义也支持英文；语义不可知时返回 state = null，由调用方直接发送 + 真值校验。
      */
     private fun favoriteActionFor(ctx: Context, title: String): FavButton? {
+        val cur = title.trim()
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return null
         val list = try {
-            nm.activeNotifications
+            nm?.activeNotifications
         } catch (_: Throwable) {
             null
-        } ?: return null
-        val media = list.filter { ArkConstants.isMediaApp(it.packageName) }
-        if (media.isEmpty()) return null
-
-        val cur = title.trim()
-        val strict = if (cur.isEmpty()) emptyList() else media.filter { sbn ->
-            val nt = sbn.notification?.extras?.getCharSequence(Notification.EXTRA_TITLE)
-                ?.toString()?.trim().orEmpty()
-            nt.isNotEmpty() && (nt.contains(cur) || cur.contains(nt))
         }
-        val preferred = currentPkg?.let { p ->
-            media.filter { it.packageName == p }
-        } ?: emptyList()
-
-        for (group in listOf(strict, preferred, media)) {
-            for (sbn in group) {
-                val btn = favButtonIn(sbn) ?: continue
-                if (btn.pkg != currentPkg) {
-                    XposedBridge.log("$TAG: fav button from ${btn.pkg} (currentPkg=$currentPkg)")
+        if (activeListLoggedOnce.not() || (list?.size ?: -1) != lastActiveListSize) {
+            activeListLoggedOnce = true
+            lastActiveListSize = list?.size ?: -1
+            XposedBridge.log("$TAG: activeNotifications size=${list?.size ?: "null"}")
+        }
+        val media = list?.filter { ArkConstants.isMediaApp(it.packageName) }.orEmpty()
+        if (media.isNotEmpty()) {
+            val strict = if (cur.isEmpty()) emptyList() else media.filter { sbn ->
+                val nt = sbn.notification?.extras?.getCharSequence(Notification.EXTRA_TITLE)
+                    ?.toString()?.trim().orEmpty()
+                nt.isNotEmpty() && (nt.contains(cur) || cur.contains(nt))
+            }
+            val preferred = currentPkg?.let { p -> media.filter { it.packageName == p } }
+                ?: emptyList()
+            for (group in listOf(strict, preferred, media)) {
+                for (sbn in group) {
+                    val btn = favButtonIn(sbn) ?: continue
+                    XposedBridge.log("$TAG: fav button from active notif ${btn.pkg}")
+                    return btn
                 }
-                return btn
             }
         }
-        return null
+
+        // ② 回落到 hook 缓存（本机唯一可用的路径）
+        val pi = favIntent ?: return null
+        val cachedSong = favCachedSong
+        if (!cachedSong.isNullOrEmpty() && cur.isNotEmpty() &&
+            !cachedSong.contains(cur) && !cur.contains(cachedSong)
+        ) {
+            // 缓存按钮还是上一首的，点下去会改错歌 —— 宁可这次无响应
+            XposedBridge.log("$TAG: cached fav button is for '$cachedSong' (cur='$cur')")
+            return null
+        }
+        return FavButton(pi, favCachedState, currentPkg ?: "?")
     }
 
     /** 在单条通知里找收藏按钮；优先带状态词的，再退化为泛指（网易云 `like`） */

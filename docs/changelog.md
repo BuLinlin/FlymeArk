@@ -1308,3 +1308,41 @@ v3.15.8 的 `favoriteActionFor()` 只匹配 `喜欢/收藏` 中文词，网易�
   → `favorite action sent target=...`（不再有 `no like action`）
 - QQ 音乐同样操作，`fav verified -> true/false` 出现即为闭环成功
 - 打开面板右上角应显示当前播放 App 图标（QQ 音乐红色 / 网易云红色音符）
+
+## 2026-11-04 · v3.15.10｜真凶是 activeNotifications 拿不到：收藏改用 hook 缓存兜底
+
+**起因**：装机实测 v3.15.9 后，收藏仍然每次都是 `favorite skipped (no like action)`。
+
+### 取证
+
+- v3.15.9 的中英文解析与候选放宽都没问题，但 `NotificationManager.activeNotifications`
+  在本机 SystemUI 进程里**拿不到通知列表**（v3.15.8 起按钮来源从 hook 缓存换成实时扫描，
+  这条路径在本机根本走不通，所以两家一起失效）。加了 `activeNotifications size=` 日志取证。
+- 之前能用的版本靠的是 `inspectFavoriteActions()` 从 hook 拦截到的播放通知里缓存的按钮
+  —— 通知每次进度刷新都会重走这里，缓存是新鲜的。
+
+### 修复
+
+- `favoriteActionFor()` 改两级：先试 `activeNotifications`（有的系统可用），
+  拿不到就回落 hook 缓存的 `(favIntent, favCachedState, favCachedSong)`；
+  缓存按钮若属于**上一首**（标题对不上当前曲）则拒绝使用，防止改错歌。
+- `inspectFavoriteActions()` 顺手缓存按钮语义与所属曲目。
+- 语义等待上限 3s → 5s（真机实测 QQ 音乐通知重建约 2.7s）。
+
+### 装机实测（真机广播直发，双向闭环均通过）
+
+```
+18:13:52 favorite action sent (target=false gen=7 attempt=1)
+18:13:52 fav from COLLECT_STATE=0 -> false
+18:13:52 fav verified -> false          ← 取消收藏成功
+18:14:07 favorite action sent (target=true gen=8 attempt=1)
+18:14:08 fav from COLLECT_STATE=1 -> true
+18:14:08 fav verified -> true           ← 再收藏成功（已恢复原状态）
+```
+
+滞后场景也按设计工作：缓存按钮语义过期时先等通知重建（`fav action stale (btn=false
+target=false), wait 1250ms`），刷新后（title=true）立即发送并校验通过。
+
+右上角图标：`FlymeArkPanel: app icon shown pkg=com.tencent.qqmusic`（queries 声明生效）。
+
+- versionCode 31 / 3.15.10
