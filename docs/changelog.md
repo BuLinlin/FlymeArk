@@ -212,3 +212,11 @@ liveLyric: mIsMediaShow forced true
 `hideClock()`（`mClockView` 的 `leftMargin` 先置 `-width`，胶囊结束后再
 `animatTranslationXAndShow` 滑回来），所以胶囊期间左上角没有时间显示是系统设计行为，
 不是被我们的胶囊盖住。缩窄之后多出来的空间目前是空的。
+
+> **试过把时钟挪到胶囊右侧，已放弃（未合入）。**
+> 实测 `mClockView.visibility == GONE(8)`，所以必须 hook `hideClock(boolean)` 才能让它可见；
+> 而它一变 VISIBLE 就会在同级 `LinearLayout` 里占掉一格，把胶囊整体往右推。
+> 用 `translationX` 平移又踩到「平移 → 胶囊跟着动 → 再平移」的正反馈
+> （日志 `70 -> 2604 -> 3094 -> 3584` 一路跑飞），改 `leftMargin` 同样成环。
+> 结论：Flyme 原生状态栏歌词本身也是「胶囊占位、时钟让开」这套逻辑，保持一致即可。
+> 当前代码里没有这条链路（`ArkStatusBarClockHook` 已删除）。
