@@ -164,4 +164,25 @@ object ArkConstants {
 
     /** Xposed 日志 TAG（logcat / LSPosed 日志里搜这个） */
     const val LOG_TAG = "FlymeArk"
+
+    // ------------------------------------------------------------------
+    // 实况通知开关「用户动作」跨进程通知（v3.15.15）
+    // ------------------------------------------------------------------
+
+    /**
+     * system_server → SystemUI：用户在「设置 → 实况通知」里主动切换了某个媒体 App 的开关。
+     *
+     * 背景：`getNotificationLiveAllowForPackage` 返回的 raw 值会在播放通知重建时
+     * 瞬时抖动（1.6~4.2s 后自恢复），无法用它区分「用户真关开关」和「通知重建抖动」。
+     * 前者走 `setNotificationLiveAllowForPackage`（用户动作，唯一可靠信号），
+     * 后者只在 get 侧抖动。所以 system_server hook set 方法，把「用户动作」广播给
+     * SystemUI，让关闭**实时生效**，同时保留 get 侧延迟复核来防抖动。
+     */
+    const val ACTION_LIVE_ALLOW_CHANGED = "com.flymeark.LIVE_ALLOW_CHANGED"
+
+    /** extra：被切换开关的 App 包名（String） */
+    const val EXTRA_LIVE_PKG = "live_pkg"
+
+    /** extra：用户设定的新开关值（Boolean） */
+    const val EXTRA_LIVE_ALLOW = "live_allow"
 }

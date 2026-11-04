@@ -2,6 +2,60 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-04 · v3.15.15｜收藏 toggle 校验延窗 + 关闭开关实时生效
+
+### 一、网易云收藏「点了没反应」——toggle 校验窗口太短
+
+真机日志（18:37，pid 12895 = 3.15.14）铁证：
+
+```
+favorite action sent (target=true)              ← like 按钮 toggle 已发出
+fav not applied yet (actual=false), recheck      ← 900ms 后 COLLECT_STATE 还是旧值
+fav toggle not applied yet, last wait            ← 再等 700ms
+fav toggle gave up, accept actual=false          ← 放弃，用户看到「无效」
+```
+
+网易云 `like` 是纯 toggle（`btnState=null` → `lastSentSemanticKnown=false`），
+**绝不能重发**（重发 = 撤销刚做的操作），只能被动等它写回 COLLECT_STATE。
+但网易云 COLLECT_STATE 写回要 1~2s（有时更久），原校验窗口 900+700+1200=2.8s 太短，
+toggle 永远等不到落地就 gave up。
+
+修复：
+1. toggle 路径校验窗口从 2.8s 延到 5.2s（round 0→1→2→3→4，间隔 900/700/1200/1200/1200ms），
+   最后一轮仍不落地才以真值收尾。
+2. `inspectFavoriteActions` 里，当 `titleState == null`（网易云 like）但指纹表已学到
+   icon→状态 映射时，把 learned 回填到 `favCachedState`。这样网易云一旦学到
+   icon 4047↔8763 的语义，后续点击就走「状态绑定」路径（可安全重发、可等通知重建），
+   不再每次都退回「toggle 只发一次」。
+
+### 二、关闭开关「不实时」——raw 抖动无法区分用户动作
+
+真机日志（18:37:59，pid 12895）：
+
+```
+18:37:59  raw=false → 用户关 QQ音乐
+18:38:02  switch OFF → capsule released    ← 3s 延迟复核才释放（用户嫌慢）
+```
+
+之前为了防「通知重建」引起的 raw 抖动（1.6~4.2s），给关闭加了 3s 延迟复核，
+结果用户真关开关也要等 3 秒才消失——不实时。
+
+根因：`getNotificationLiveAllowForPackage` 的 raw 值在播放通知重建时会瞬时抖动，
+单靠它无法区分「用户真关」和「通知重建抖动」。
+
+修复（彻底解耦）：
+- system_server 进程（`ArkLiveAllowHook`）hook `NotificationManagerService#setNotificationLiveAllowForPackage`，
+  用户点开关必走这里，是**唯一无抖动的「用户动作」信号**；媒体 App 开关变化时发
+  `ACTION_LIVE_ALLOW_CHANGED` 广播给 SystemUI。
+- SystemUI（`ArkLiveLyricHook.onUserToggleLive`）收到广播：
+  · 关闭 → 立即释放胶囊 + 记入 `userOffPkgs`（实时）；
+  · 开启 → 移出 `userOffPkgs`，胶囊恢复。
+- 门控 `getTopLyricsDisplayText` 里，`userOffPkgs` 中的 App 强制不放行——即使 raw
+  随后短暂跳回 true（通知重建抖动）也不会让胶囊「自己回来」。
+- get 侧的 3s 延迟复核继续保留，专防「通知重建」抖动（那条路径用户没动开关）。
+
+- versionCode 36 / 3.15.15
+
 ## 2026-11-04 · v3.1｜展开时胶囊淡出 + 面板实时跟随换曲
 
 **起因**：v3.0 遗留两条体验问题——点开面板时状态栏里原来的胶囊还挂着；切歌后面板不刷新、

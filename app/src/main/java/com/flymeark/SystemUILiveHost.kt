@@ -115,6 +115,13 @@ internal object SystemUILiveHost {
                                 context,
                                 intent.getLongExtra(ArkConstants.EXTRA_SEEK_POSITION, -1L)
                             )
+
+                        // v3.15.15：用户在设置里切换了实况通知开关（system_server 广播）
+                        ArkConstants.ACTION_LIVE_ALLOW_CHANGED ->
+                            ArkLiveLyricHook.onUserToggleLive(
+                                intent.getStringExtra(ArkConstants.EXTRA_LIVE_PKG),
+                                intent.getBooleanExtra(ArkConstants.EXTRA_LIVE_ALLOW, true)
+                            )
                     }
                 } catch (t: Throwable) {
                     XposedBridge.log(
@@ -132,6 +139,7 @@ internal object SystemUILiveHost {
             addAction(ArkConstants.ACTION_PANEL_FAVORITE)
             addAction(ArkConstants.ACTION_PANEL_OUTPUT_LIST)
             addAction(ArkConstants.ACTION_PANEL_OUTPUT_TRANSFER)
+            addAction(ArkConstants.ACTION_LIVE_ALLOW_CHANGED)
         }
         try {
             if (Build.VERSION.SDK_INT >= 33) {

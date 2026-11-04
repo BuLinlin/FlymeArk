@@ -66,7 +66,37 @@ internal object ArkLiveLyricHook {
     @Volatile
     private var pendingOffPkg: String? = null
 
+    /**
+     * v3.15.15：用户**明确关闭**的 App 集合（由 system_server 的
+     * setNotificationLiveAllowForPackage 广播驱动，是唯一无抖动的「用户关开关」信号）。
+     *
+     * 一旦进入此集合，门控强制不放行 —— 即使 raw 值随后短暂跳回 true（通知重建抖动）
+     * 也不会让胶囊复活；直到收到「开」的广播才移除。
+     */
+    private val userOffPkgs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     private val offRunnable = Runnable { confirmOff() }
+
+    /**
+     * 用户在「设置 → 实况通知」里切换了开关（system_server 广播，实时、无抖动）。
+     * 关闭 → 立即释放胶囊 + 记录 userOff；开启 → 移除 userOff，让胶囊恢复。
+     */
+    fun onUserToggleLive(pkg: String?, allow: Boolean) {
+        val p = pkg ?: return
+        if (!ArkConstants.isMediaApp(p)) return
+        if (allow) {
+            if (userOffPkgs.remove(p)) {
+                XposedBridge.log("$TAG: user re-enabled live for $p, capsule can show again")
+            }
+            return
+        }
+        // 关闭：立即释放，不再走 3s 延迟复核（延迟是防抖动的，用户动作不需要）
+        userOffPkgs.add(p)
+        mainHandler.removeCallbacks(offRunnable)
+        pendingOffPkg = null
+        releaseCapsule(p)
+        XposedBridge.log("$TAG: user disabled live for $p, capsule released immediately")
+    }
 
     private fun confirmOff() {
         val pkg = pendingOffPkg ?: return
@@ -128,6 +158,11 @@ internal object ArkLiveLyricHook {
 
                             // v3.15.11：必须按**当前正在出歌词的那个 App** 判断开关。
                             val cur = ArkLiveExpandHook.currentPkg
+                            // v3.15.15：用户已明确关闭的 App，无论 raw 怎么抖都强制不放行，
+                            // 避免「关闭后胶囊又自己回来」。
+                            val userOff = cur?.let { it in userOffPkgs }
+                                ?: ArkConstants.MEDIA_APP_PKGS.any { it in userOffPkgs }
+                            if (userOff) return
                             val allowed = if (cur != null && ArkConstants.isMediaApp(cur)) {
                                 LiveAllowGate.isAllowed(ctx, cur)
                             } else {

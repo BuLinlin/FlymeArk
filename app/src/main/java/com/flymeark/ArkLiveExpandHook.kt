@@ -862,6 +862,12 @@ internal object ArkLiveExpandHook {
 
         val learned = hash?.let { favMap[it] }
         val state = titleState ?: learned
+        // v3.15.15：网易云 `like` 标题不带状态词（titleState=null），但它的图标会
+        // 4047↔8763 翻转，指纹表一旦学到 icon→状态 映射，就把 learned 回填到
+        // favCachedState。这样下次点击时 favoriteActionFor 返回的按钮 state 不再是 null，
+        // 走「状态绑定」路径（可安全重发、可等通知重建），而不是每次都退回
+        // 「toggle 只发一次」—— 后者在校验窗口内等不到网易云写回 COLLECT_STATE。
+        if (favCachedState == null) favCachedState = learned
         // 网易云的 `like` 不带状态词，state 可能仍是 null —— 不能把已知状态清掉
         if (state != null && state != favState) {
             favState = state
@@ -1369,11 +1375,13 @@ internal object ArkLiveExpandHook {
                 return@postDelayed
             }
             // 语义未知（网易云 `like`）时绝不能重发：那是 toggle，重发等于撤销刚才的操作。
-            // 只再多等一轮，还不对就以真值收尾。
+            // 只能被动等它落地。网易云实测 COLLECT_STATE 写回要 1~2s（有时更久），
+            // 原来只等 2.8s（round 0→1→2）太短，toggle 永远等不到就「gave up」，
+            // 表现为「收藏点了没反应」。延长到 round 4（约 5.2s），仍不落地才以真值收尾。
             if (!lastSentSemanticKnown) {
-                if (round == 1) {
-                    XposedBridge.log("$TAG: fav toggle not applied yet, last wait")
-                    verifyFavLater(ctx, target, gen, attempt, round = 2)
+                if (round < 4) {
+                    XposedBridge.log("$TAG: fav toggle pending (actual=$actual), wait round=$round")
+                    verifyFavLater(ctx, target, gen, attempt, round = round + 1)
                 } else {
                     XposedBridge.log("$TAG: fav toggle gave up, accept actual=$actual")
                     finishFav(ctx, gen, actual)
