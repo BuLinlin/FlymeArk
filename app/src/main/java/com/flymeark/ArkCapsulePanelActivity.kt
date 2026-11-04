@@ -1,16 +1,25 @@
 package com.flymeark
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.app.Activity
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -23,6 +32,15 @@ import java.util.Locale
 
 /** 封面轮播单程时长 */
 private const val COVER_SLIDE_MS = 340L
+
+/** 上一首 / 下一首节流窗口：切歌链路本身有延迟，连点只会一次跳好几首 */
+private const val KEY_THROTTLE_MS = 400L
+
+/** 播放 / 暂停节流窗口：只挡抖动，不能挡「暂停→立刻播放」这种正常操作 */
+private const val PLAY_THROTTLE_MS = 250L
+
+/** 点卡片跳转的防抖窗口：避免连点拉起多个实例 */
+private const val OPEN_APP_DEBOUNCE_MS = 800L
 
 /**
  * v2.6：点击实况胶囊后从状态栏下方展开的播放控制面板。
@@ -40,6 +58,7 @@ private const val COVER_SLIDE_MS = 340L
 class ArkCapsulePanelActivity : Activity() {
 
     private lateinit var root: View
+    private lateinit var backdrop: ImageView
     private lateinit var card: View
     private lateinit var content: View
     private lateinit var coverSlot: View
@@ -51,6 +70,8 @@ class ArkCapsulePanelActivity : Activity() {
     private lateinit var timeCurrent: TextView
     private lateinit var timeTotal: TextView
     private lateinit var playBtn: ImageView
+    private lateinit var prevBtn: ImageView
+    private lateinit var nextBtn: ImageView
 
     private lateinit var morph: ArkMorphAnim
 
@@ -58,6 +79,31 @@ class ArkCapsulePanelActivity : Activity() {
     private var positionMs = 0
     private var playing = false
     private var closing = false
+
+    /** v3.13：系统深色模式（配色与背景定标都跟它走） */
+    private var nightMode = false
+
+    /** v3.13：当前专辑主题色（进度条 + 背景兜底色） */
+    private var albumColor: Int? = null
+
+    /** v3.13：媒体 App 跳转 PendingIntent（SystemUI 从 sessionActivity 带来） */
+    private var lastClickIntent: PendingIntent? = null
+
+    /** 最近一次封面（深浅模式切换时重新生成背景用） */
+    private var lastCover: Bitmap? = null
+
+    /** 媒体键节流时间戳（按按键分开记，暂停和切歌互不干扰） */
+    private val lastKeyAt = HashMap<Int, Long>(4)
+
+    /** 跳转防抖时间戳 */
+    private var lastOpenAppAt = 0L
+
+    /** 当前配色（morph 动画层创建时要用，早于 applyPalette 生效时序） */
+    private var paletteCard = 0xFF18181C.toInt()
+    private var paletteStroke = 0x24FFFFFF.toInt()
+
+    /** v3.13：背景生成任务计数，防止换曲过快时旧任务覆盖新背景 */
+    private var backdropJob = 0
 
     /** 封面轮播：当前露在前面的是 A 还是 B */
     private var frontIsA = true
@@ -115,7 +161,7 @@ class ArkCapsulePanelActivity : Activity() {
         bindData()
         bindActions()
 
-        morph = ArkMorphAnim(root, card, content)
+        morph = ArkMorphAnim(root, card, content, paletteCard, paletteStroke)
         // 第一帧先按胶囊尺寸摆好（此时不可见，避免「完整卡片闪一下再缩回去」），
         // 第二帧再显示并开始长大。
         card.alpha = 0f
@@ -155,6 +201,7 @@ class ArkCapsulePanelActivity : Activity() {
 
     private fun bindViews() {
         root = findViewById(R.id.panel_root)
+        backdrop = findViewById(R.id.panel_backdrop)
         card = findViewById(R.id.panel_card)
         content = findViewById(R.id.panel_content)
         coverSlot = findViewById(R.id.panel_cover_slot)
@@ -166,10 +213,29 @@ class ArkCapsulePanelActivity : Activity() {
         timeCurrent = findViewById(R.id.panel_time_current)
         timeTotal = findViewById(R.id.panel_time_total)
         playBtn = findViewById(R.id.panel_play)
+        prevBtn = findViewById(R.id.panel_prev)
+        nextBtn = findViewById(R.id.panel_next)
 
-        // 点空白收起；卡片本身消费点击
+        // v3.13：样式对齐系统媒体卡 —— 配色按深浅模式一套走
+        nightMode =
+            (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+        android.util.Log.d("FlymeArk", "panel init nightMode=$nightMode uiMode=0x${Integer.toHexString(resources.configuration.uiMode)}")
+        applyPalette()
+
+        // 点空白收起；点卡片跳转音乐 App（对齐系统媒体卡行为）
         root.setOnClickListener { dismiss() }
-        card.setOnClickListener { }
+        card.setOnClickListener { openMusicApp() }
+
+        // v3.13：拖动进度条 → seek
+        progressBar.onScrub = { ms -> timeCurrent.text = formatTime(ms) }
+        progressBar.onSeek = { ms ->
+            positionMs = ms
+            timeCurrent.text = formatTime(ms)
+            sendSeek(ms)
+            // seek 后立刻向 SystemUI 要一次真实进度，修正播放器实际落点
+            handler.postDelayed(syncRequest, 400)
+        }
     }
 
     private fun bindData() {
@@ -188,6 +254,8 @@ class ArkCapsulePanelActivity : Activity() {
         durationMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_DURATION, -1)
         positionMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_PROGRESS, -1).coerceAtLeast(0)
         playing = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_PLAYING, true)
+        clickIntentOf(i)?.let { lastClickIntent = it }
+        setNight(i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode))
 
         if (durationMs <= 0) {
             // 时长未知时不画进度条，避免展示假进度
@@ -232,6 +300,8 @@ class ArkCapsulePanelActivity : Activity() {
         durationMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_DURATION, -1)
         positionMs = i.getIntExtra(ArkConstants.EXTRA_PANEL_PROGRESS, -1).coerceAtLeast(0)
         playing = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_PLAYING, playing)
+        clickIntentOf(i)?.let { lastClickIntent = it }
+        setNight(i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode))
 
         if (durationMs <= 0) {
             progressBar.visibility = View.GONE
@@ -267,6 +337,14 @@ class ArkCapsulePanelActivity : Activity() {
     private fun coverOf(i: Intent): Bitmap? =
         try {
             i.getParcelableExtra(ArkConstants.EXTRA_PANEL_COVER) as? Bitmap
+        } catch (_: Throwable) {
+            null
+        }
+
+    @Suppress("DEPRECATION")
+    private fun clickIntentOf(i: Intent): PendingIntent? =
+        try {
+            i.getParcelableExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT) as? PendingIntent
         } catch (_: Throwable) {
             null
         }
@@ -340,26 +418,188 @@ class ArkCapsulePanelActivity : Activity() {
         }, COVER_SLIDE_MS + 60)
     }
 
-    /** 专辑取色 → 进度条主题色（取不出时保持原色） */
+    /** 专辑取色 → 进度条主题色 + 音乐壁纸背景（取不出时背景用纯色渐变兜底） */
     private fun applyAlbumColor(bmp: Bitmap) {
-        ArkAlbumColor.vibrantOf(bmp)?.let { progressBar.barColor = it }
+        lastCover = bmp
+        val color = ArkAlbumColor.vibrantOf(bmp)
+        albumColor = color
+        color?.let { progressBar.barColor = it }
+        applyBackdrop(bmp)
+    }
+
+    /**
+     * SystemUI 推来的深浅模式（与媒体卡玻璃同源：SystemUICommonUtils.sIsNightMode）。
+     * 变化时整套配色 + 背景定标一起重刷。
+     */
+    private fun setNight(night: Boolean) {
+        android.util.Log.d("FlymeArk", "panel setNight($night) was=$nightMode")
+        if (night == nightMode) return
+        nightMode = night
+        applyPalette()
+        applyBackdrop(lastCover)
+    }
+
+    // ------------------------------------------------------------------
+    // 音乐壁纸背景（v3.13）
+    // ------------------------------------------------------------------
+
+    /** 生成专辑模糊背景并 crossfade 替换；一次性计算放后台线程 */
+    private fun applyBackdrop(cover: Bitmap?) {
+        val dm = resources.displayMetrics
+        val w = root.width.takeIf { it > 0 } ?: dm.widthPixels
+        val h = root.height.takeIf { it > 0 } ?: dm.heightPixels
+        val night = nightMode
+        val job = ++backdropJob
+        val fallback = albumColor
+        Thread {
+            val bmp = try {
+                ArkBackdrop.build(cover, fallback, w, h, night)
+            } catch (t: Throwable) {
+                android.util.Log.w("FlymeArk", "panel backdrop build failed", t)
+                null
+            }
+            android.util.Log.d("FlymeArk", "panel backdrop job=$job w=$w h=$h cover=${cover != null} -> ${bmp?.width}x${bmp?.height}")
+            handler.post {
+                if (job != backdropJob || closing) return@post
+                if (bmp != null) swapBackdrop(bmp)
+            }
+        }.start()
+    }
+
+    /** 已有背景时做一次淡出→替换→淡入，没有则直接铺 */
+    private fun swapBackdrop(bmp: Bitmap) {
+        if (backdrop.drawable == null) {
+            backdrop.setImageBitmap(bmp)
+            return
+        }
+        backdrop.animate().cancel()
+        backdrop.animate()
+            .alpha(0f)
+            .setDuration(170L)
+            .withEndAction {
+                backdrop.setImageBitmap(bmp)
+                backdrop.animate()
+                    .alpha(1f)
+                    .setDuration(220L)
+                    .setInterpolator(DecelerateInterpolator())
+                    .start()
+            }
+            .start()
+    }
+
+    // ------------------------------------------------------------------
+    // 深浅模式配色（v3.13，对齐系统媒体卡：浅色 70% 白玻璃 / 深色 70% 深灰玻璃）
+    // ------------------------------------------------------------------
+
+    private fun applyPalette() {
+        val cardBg = if (nightMode) 0xC216161A.toInt() else 0xC9FAFAFA.toInt()
+        val stroke = if (nightMode) 0x24FFFFFF.toInt() else 0x1F000000.toInt()
+        paletteCard = cardBg
+        paletteStroke = stroke
+        if (this::morph.isInitialized) {
+            // morph.prepare 会把卡片背景换成它自己的 drawable，颜色必须经它下发
+            morph.setColors(cardBg, stroke)
+        }
+        (card.background as? GradientDrawable)?.apply {
+            setColor(cardBg)
+            setStroke((resources.displayMetrics.density * 1).toInt(), stroke)
+        } ?: android.util.Log.w("FlymeArk", "panel card bg is ${card.background?.javaClass?.name}")
+
+        val title = if (nightMode) Color.WHITE else 0xE6000000.toInt()
+        val sub = if (nightMode) 0xB3FFFFFF.toInt() else 0x99000000.toInt()
+        val time = if (nightMode) 0x8AFFFFFF.toInt() else 0x80000000.toInt()
+        val icon = if (nightMode) Color.WHITE else 0xE6000000.toInt()
+        val playBg = if (nightMode) 0x2EFFFFFF.toInt() else 0x26000000.toInt()
+
+        titleView.setTextColor(title)
+        artistView.setTextColor(sub)
+        timeCurrent.setTextColor(time)
+        timeTotal.setTextColor(time)
+        prevBtn.imageTintList = ColorStateList.valueOf(icon)
+        nextBtn.imageTintList = ColorStateList.valueOf(icon)
+        playBtn.imageTintList = ColorStateList.valueOf(icon)
+        (playBtn.background as? GradientDrawable)?.setColor(playBg)
+        progressBar.trackColor = if (nightMode) 0x33FFFFFF.toInt() else 0x26000000
+    }
+
+    // ------------------------------------------------------------------
+    // seek / 跳转（v3.13）
+    // ------------------------------------------------------------------
+
+    /** 拖动进度条 → SystemUI（system uid）调 MediaController.seekTo */
+    private fun sendSeek(ms: Int) {
+        try {
+            sendBroadcast(
+                Intent(ArkConstants.ACTION_PANEL_SEEK)
+                    .setPackage(ArkConstants.SYSTEMUI_PKG)
+                    .putExtra(ArkConstants.EXTRA_SEEK_POSITION, ms.toLong())
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 点卡片空白处 → 拉起媒体 App。
+     * 优先 sessionActivity（系统媒体卡同款行为）；QQ 音乐实测不设置它
+     * （dumpsys media_session: launchIntent=null），兜底按包名拉主界面。
+     */
+    private fun openMusicApp() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastOpenAppAt < OPEN_APP_DEBOUNCE_MS) return
+        lastOpenAppAt = now
+
+        val pi = lastClickIntent
+        if (pi != null) {
+            try {
+                pi.send(applicationContext, 0, null)
+                return
+            } catch (_: Throwable) {
+            }
+        }
+        try {
+            packageManager.getLaunchIntentForPackage(ArkConstants.MEDIA_APP_PKG)?.let {
+                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(it)
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     private fun bindActions() {
-        findViewById<View>(R.id.panel_prev).setOnClickListener {
-            sendMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+        prevBtn.setOnClickListener {
+            if (!sendKeyThrottled(KeyEvent.KEYCODE_MEDIA_PREVIOUS, KEY_THROTTLE_MS)) return@setOnClickListener
             onTrackSwitched(-1)
         }
-        findViewById<View>(R.id.panel_next).setOnClickListener {
-            sendMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+        nextBtn.setOnClickListener {
+            if (!sendKeyThrottled(KeyEvent.KEYCODE_MEDIA_NEXT, KEY_THROTTLE_MS)) return@setOnClickListener
             onTrackSwitched(1)
         }
         playBtn.setOnClickListener {
-            sendMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+            // 播放/暂停间隔更短：用户可能快速暂停再播放，只挡抖动不挡操作
+            if (!sendKeyThrottled(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, PLAY_THROTTLE_MS)) return@setOnClickListener
             playing = !playing
             updatePlayIcon()
             restartTicker()
         }
+    }
+
+    /**
+     * 带节流的媒体键派发（v3.13.1）。
+     *
+     * 面板按钮是「发一次广播、SystemUI 转发 IPC」的链路，连点会连发按键：
+     * 上一首/下一首连点会一次跳好几首。节流窗口按按键各自记录——
+     * 上一首的节流窗口不能挡住紧接着的暂停（这正是「按钮失效」的成因）。
+     * 窗口内直接丢弃，不做排队补发。
+     *
+     * @return true = 本次按键已派发；false = 处于节流窗口内，已忽略
+     */
+    private fun sendKeyThrottled(keyCode: Int, windowMs: Long): Boolean {
+        val now = SystemClock.uptimeMillis()
+        val last = lastKeyAt[keyCode] ?: 0L
+        if (now - last < windowMs) return false
+        lastKeyAt[keyCode] = now
+        sendMediaKey(keyCode)
+        return true
     }
 
     /** 交给 SystemUI（system uid）派发，命中率远高于普通 App 直接调用 */
@@ -381,12 +621,36 @@ class ArkCapsulePanelActivity : Activity() {
         pendingDir = dir
         positionMs = 0
         timeCurrent.text = formatTime(0)
-        progressBar.ratio = 0f
+        collapseProgress()
         handler.removeCallbacks(switchWatchdog)
         handler.postDelayed(switchWatchdog, 6_000)
         // 两次请求：第一次可能赶在媒体键生效之前，补一次兜底
         handler.postDelayed(syncRequest, 250)
         handler.postDelayed(syncRequest, 900)
+    }
+
+    /**
+     * 切歌时进度条滑回起点（v3.13.1）。
+     * 硬归零观感是「卡一下突然清零」；220ms 滑动回零顺滑自然，
+     * 新曲目推送到达时 renderProgress 会从真实位置接管（两者都从小值开始，无跳变）。
+     */
+    private fun collapseProgress() {
+        val from = progressBar.ratio
+        if (from <= 0f) return
+        progressBar.isCollapsing = true
+        ValueAnimator.ofFloat(from, 0f).apply {
+            duration = 220
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { a ->
+                progressBar.ratio = a.animatedValue as Float
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    progressBar.isCollapsing = false
+                }
+            })
+            start()
+        }
     }
 
     /** 让 SystemUI 立即从 MediaSession 读一次曲目（标题/歌手/专辑图/进度） */
@@ -406,8 +670,12 @@ class ArkCapsulePanelActivity : Activity() {
 
     private fun renderProgress() {
         if (durationMs <= 0) return
-        progressBar.ratio = positionMs.toFloat() / durationMs.toFloat()
-        timeCurrent.text = formatTime(positionMs)
+        progressBar.durationMs = durationMs
+        if (!progressBar.isScrubbing && !progressBar.isCollapsing) {
+            // 拖动中/归零动画中：显示由各自驱动，秒表不要覆盖
+            progressBar.ratio = positionMs.toFloat() / durationMs.toFloat()
+            timeCurrent.text = formatTime(positionMs)
+        }
         timeTotal.text = formatTime(durationMs)
     }
 

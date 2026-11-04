@@ -699,3 +699,52 @@ v3.8 前后已经因为「截取下层纹理导致卡顿」否决过一次。
 
 全局玻璃的浅色透明度从实验值 43%（0x6E）回退到保守档 58%（0x94），
 43% 未定稿，且深色壁纸 + 浅色模式下有黑字对比度风险。
+
+## 2026-11-04 · v3.13.1｜样式对齐系统媒体卡 + 按钮节流 + 三个真机反馈修复
+
+### 样式对齐（用户反馈「明显样式不对，是黑的」）
+
+**根因链有两层：**
+
+1. **Flyme 的深色判断不走 configuration**。反编译确认：
+   `MediaCarouseTransitionLayout.isInNightMode()` → `SystemUICommonUtils.isNightModel(ctx)`
+   → 静态字段 `sIsNightMode`。面板 App 进程读 `configuration.uiMode` 判断，与它不一致。
+   修法：SystemUI 侧反射读同一个字段（`XposedHelpers.getStaticBooleanField`），随曲目推送
+   （`EXTRA_PANEL_NIGHT`）传给面板，模式变化时整套配色 + 背景定标重刷。
+2. **`ArkMorphAnim.prepare()` 硬编码深黑背景**：展开动画会把卡片背景换成自己构造的
+   `GradientDrawable`（`0xFF18181C`），把 applyPalette 设置的浅色盖掉。
+   修法：morph 颜色改为构造传入 + `setColors()` 动态下发。
+
+浅色模式最终效果：`#C9FAFAFA` 玻璃卡 + 黑字 + 深色描边 `#1F000000`，进度条滑块圆点
+（thumbRadius 5.5dp，颜色随专辑取色），对齐系统媒体卡观感。
+
+### 「暂停按钮失效」的真正根因：媒体键被派发两次
+
+`SystemUILiveHost` 的 exported 广播接收器在 `com.android.systemui` 主进程和
+`:screenshot` 子进程**各注册了一份**，媒体键连发两次：播放/暂停互相抵消（看起来就是没反应），
+切歌一次跳两首。之前一直存在，本轮 LSPosed 日志暴露（每次点击两条 `media key dispatched`）。
+
+修法：`onReceive` 开头过滤进程名，只有主进程处理（media key / state / sync / seek 全部受益）。
+注意 **`:screenshot` 子进程是常驻的**，改完只 kill 主进程不够，子进程也要 kill
+（或等系统自然回收）才会用新代码——本次实测踩过。
+
+### 用户反馈的其他修复
+
+- **按钮节流**：新增 `sendKeyThrottled`，窗口按按键各自记录（上一首 400ms / 播放暂停 250ms /
+  卡片跳转 800ms）。切歌的节流窗口不挡暂停。
+- **切歌进度条滑回起点**：新增 `collapseProgress()`，220ms Decelerate 动画从当前位置滑到 0，
+  替代硬归零；动画期间（`isCollapsing`）宿主推送不覆盖进度。
+
+### 真机验证（3.13.1 / versionCode 17）
+
+- 浅色玻璃卡 + 黑字 + 专辑取色滑块：截图确认（陈红鲤/庄心妍曲目，进度条分别取到黄/暗红）
+- 播放/暂停点击：图标正确切换，媒体键单次派发
+- seek 广播链路：`seekTo 60000` → QQ 音乐真实跳到 62.9s
+- 音乐壁纸背景：封面模糊 + 提饱和铺满全屏，换曲 crossfade
+- 卡片跳转：QQ 音乐 `launchIntent=null`（不设置 sessionActivity），兜底按包名拉主界面
+
+### 遗留（下阶段）
+
+- 收藏 ❤ / 歌词「词」按钮、输出切换：需 hook MediaSession 的 custom actions 与 MediaRouter2，
+  与系统媒体卡对齐的最后一部分
+- 移除面板侧临时诊断日志（`FlymeArk` tag 的 Log.d）

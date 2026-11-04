@@ -1,11 +1,13 @@
 package com.flymeark
 
 import android.app.Notification
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.media.AudioManager
 import android.media.MediaMetadata
+import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.SystemClock
@@ -119,6 +121,9 @@ internal object ArkLiveExpandHook {
     @Volatile private var trackTitle: String? = null
     @Volatile private var trackArtist: String? = null
     @Volatile private var trackCover: Bitmap? = null
+
+    /** v3.13：媒体 App 跳转 PendingIntent（session 读不到时沿用旧值） */
+    @Volatile private var lastClickIntent: PendingIntent? = null
     @Volatile private var trackProgress: Int = -1
     @Volatile private var trackDuration: Int = -1
     @Volatile private var trackPlaying: Boolean = false
@@ -314,8 +319,9 @@ internal object ArkLiveExpandHook {
         val progress = session?.position?.takeIf { it >= 0 }?.toInt() ?: trackProgress
         val duration = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
         val playing = session?.playing ?: trackPlaying
+        session?.clickIntent?.let { lastClickIntent = it }
 
-        sendTrack(c, title, artist, progress, duration, playing, if (changed) trackCover else null)
+        sendTrack(c, title, artist, progress, duration, playing, if (changed) trackCover else null, lastClickIntent)
         if (changed) {
             XposedBridge.log("$TAG: push track '$title' pos=$progress/$duration playing=$playing")
         }
@@ -340,6 +346,7 @@ internal object ArkLiveExpandHook {
         val cover = s.art?.let { scaleArt(it) } ?: trackCover
         val progress = s.position.takeIf { it >= 0 }?.toInt() ?: trackProgress
         val duration = s.duration.takeIf { it > 0 }?.toInt() ?: trackDuration
+        s.clickIntent?.let { lastClickIntent = it }
 
         trackTitle = title
         trackArtist = artist
@@ -347,7 +354,7 @@ internal object ArkLiveExpandHook {
         lastPushKey = "$title|$artist"
         lastPushAt = SystemClock.uptimeMillis()
 
-        sendTrack(c, title, artist, progress, duration, s.playing, cover)
+        sendTrack(c, title, artist, progress, duration, s.playing, cover, lastClickIntent)
         XposedBridge.log("$TAG: sync '$title' pos=$progress/$duration playing=${s.playing}")
     }
 
@@ -358,7 +365,8 @@ internal object ArkLiveExpandHook {
         progress: Int,
         duration: Int,
         playing: Boolean,
-        cover: Bitmap?
+        cover: Bitmap?,
+        clickIntent: PendingIntent? = null
     ) {
         val intent = Intent(ArkConstants.ACTION_PANEL_TRACK).apply {
             setPackage(ArkConstants.APP_PKG)
@@ -367,12 +375,38 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_PANEL_PROGRESS, progress)
             putExtra(ArkConstants.EXTRA_PANEL_DURATION, duration)
             putExtra(ArkConstants.EXTRA_PANEL_PLAYING, playing)
+            // v3.13.1：媒体卡玻璃的深浅判断源就在 SystemUI，面板配色必须同源
+            putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
             cover?.let { putExtra(ArkConstants.EXTRA_PANEL_COVER, it) }
+            clickIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
         }
         try {
             ctx.sendBroadcast(intent)
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: push track failed: ${t.message}")
+        }
+    }
+
+    /**
+     * v3.13：面板拖动进度条 → seekTo。
+     * MediaController.seekTo 需要 system uid（MEDIA_CONTENT_CONTROL），
+     * 面板是普通 App uid，统一在这里代派。
+     */
+    fun seekTo(ctx: Context?, positionMs: Long) {
+        val c = ctx ?: return
+        if (positionMs < 0) return
+        try {
+            val msm = c.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
+            val ctrl: MediaController? =
+                msm?.getActiveSessions(null)?.firstOrNull { it.packageName == QQ_MUSIC }
+            if (ctrl == null) {
+                XposedBridge.log("$TAG: seek skipped (no media session)")
+                return
+            }
+            ctrl.transportControls.seekTo(positionMs)
+            XposedBridge.log("$TAG: seekTo $positionMs")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: seekTo failed: ${t.message}")
         }
     }
 
@@ -493,6 +527,7 @@ internal object ArkLiveExpandHook {
         val progressMs = session?.position?.takeIf { it >= 0 }?.toInt() ?: trackProgress
         val durationMs = session?.duration?.takeIf { it > 0 }?.toInt() ?: trackDuration
         val isPlaying = session?.playing ?: playing
+        session?.clickIntent?.let { lastClickIntent = it }
 
         val intent = Intent().apply {
             setClassName(ArkConstants.APP_PKG, PANEL_ACTIVITY)
@@ -507,6 +542,10 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_PANEL_DURATION, durationMs)
             putExtra(ArkConstants.EXTRA_PANEL_PLAYING, isPlaying)
             trackCover?.let { putExtra(ArkConstants.EXTRA_PANEL_COVER, it) }
+            // v3.13：媒体 App 跳转（点卡片空白处拉起 App，对齐系统媒体卡）
+            lastClickIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
+            // v3.13.1：SystemUI 同源的深浅模式
+            putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
             // 胶囊矩形：面板以它为展开动画起点（长大）与收起终点（缩回）
             capsuleRectOnScreen(ctrl)?.let { r ->
                 putExtra(ArkConstants.EXTRA_CAPSULE_LEFT, r[0])
@@ -536,7 +575,9 @@ internal object ArkLiveExpandHook {
         val position: Long,
         val duration: Long,
         val playing: Boolean,
-        val art: Bitmap?
+        val art: Bitmap?,
+        /** 媒体 App 的跳转 PendingIntent（v3.13，点面板卡片空白处拉起 App） */
+        val clickIntent: PendingIntent? = null
     )
 
     /**
@@ -559,7 +600,8 @@ internal object ArkLiveExpandHook {
                 duration = md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: -1L,
                 playing = ps?.state == PlaybackState.STATE_PLAYING,
                 art = md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-                    ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                    ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART),
+                clickIntent = ctrl.sessionActivity
             )
         }
     } catch (t: Throwable) {
@@ -571,5 +613,28 @@ internal object ArkLiveExpandHook {
         (ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)?.isMusicActive ?: false
     } catch (_: Throwable) {
         false
+    }
+
+    /**
+     * SystemUI 侧深色模式判断——必须与媒体卡玻璃同源。
+     *
+     * 反编译确认：MediaCarouseTransitionLayout.isInNightMode() →
+     * SystemUICommonUtils.isNightModel(ctx) → 静态字段 `sIsNightMode`
+     * （Flyme 自己维护的深色开关，不读 configuration）。
+     * 面板 App 进程读 configuration 判断不可靠（实测 Flyme 深色开关下两者不一致）。
+     */
+    private fun isNightMode(ctx: Context): Boolean = try {
+        val cls = XposedHelpers.findClass(
+            "com.flyme.systemui.utils.SystemUICommonUtils", ctx.classLoader
+        )
+        XposedHelpers.getStaticBooleanField(cls, "sIsNightMode")
+    } catch (_: Throwable) {
+        try {
+            (ctx.resources.configuration.uiMode and
+                android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+                android.content.res.Configuration.UI_MODE_NIGHT_YES
+        } catch (_: Throwable) {
+            false
+        }
     }
 }

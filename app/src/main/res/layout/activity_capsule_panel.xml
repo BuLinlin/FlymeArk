@@ -17,6 +17,18 @@
     android:clickable="true"
     android:focusable="true">
 
+    <!--
+      v3.13：音乐壁纸背景 —— 专辑封面放大模糊 + 提饱和 + 噪点（ArkBackdrop 生成）。
+      放在卡片之下全屏铺开，点空白收起的透明区域也盖着它。
+    -->
+    <ImageView
+        android:id="@+id/panel_backdrop"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@null"
+        android:importantForAccessibility="no"
+        android:scaleType="centerCrop" />
+
     <FrameLayout
         android:id="@+id/panel_card"
         android:layout_width="match_parent"
@@ -97,18 +109,22 @@
                 </LinearLayout>
             </LinearLayout>
 
-            <!-- 进度条 -->
+            <!--
+              进度条：v3.13 起可拖动 seek。
+              触摸热区需要高度，view 给 25dp，线画在垂直中心（3dp），
+              上下用负 margin 补偿保持原视觉间距（16dp / 7dp）。
+            -->
             <com.flymeark.ArkProgressBar
                 android:id="@+id/panel_progress"
                 android:layout_width="match_parent"
-                android:layout_height="3dp"
-                android:layout_marginTop="16dp" />
+                android:layout_height="25dp"
+                android:layout_marginTop="4dp" />
 
             <!-- 时间 -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="7dp"
+                android:layout_marginTop="-5dp"
                 android:orientation="horizontal">
 
                 <TextView

@@ -18,6 +18,9 @@ object ArkConstants {
     /** SystemUI 进程包名（面板媒体键定向广播目标） */
     const val SYSTEMUI_PKG = "com.android.systemui"
 
+    /** 媒体 App 包名（QQ 音乐）。跳转兜底：session 没给 sessionActivity 时按包名拉主界面 */
+    const val MEDIA_APP_PKG = "com.tencent.qqmusic"
+
     /** 设置进程包名（把 QQ音乐登记进「实况通知」设置页） */
     const val SETTINGS_PKG = "com.android.settings"
 
@@ -70,6 +73,27 @@ object ArkConstants {
      */
     const val ACTION_PANEL_STATE = "com.flymeark.PANEL_STATE"
     const val EXTRA_PANEL_VISIBLE = "panel_visible"
+
+    /**
+     * 播放面板 → SystemUI：拖动进度条后的 seekTo 请求（v3.13）。
+     * MediaController.seekTo(long) 需要 system uid 权限，与媒体键一样统一代派。
+     */
+    const val ACTION_PANEL_SEEK = "com.flymeark.PANEL_SEEK"
+    const val EXTRA_SEEK_POSITION = "seek_position"
+
+    /**
+     * SystemUI → 播放面板：媒体 App 的点击跳转 PendingIntent（v3.13）。
+     * 来源 MediaController.sessionActivity，点卡片空白处时 send() 拉起对应 App，
+     * 与下拉栏媒体卡「点卡片进 App」行为对齐。
+     */
+    const val EXTRA_PANEL_CLICK_INTENT = "panel_click_intent"
+
+    /**
+     * SystemUI → 播放面板：SystemUI 侧判断的深色模式（v3.13.1）。
+     * 媒体卡玻璃色用 isInNightMode() 决定，面板样式必须与它同源，
+     * 不能用面板 App 进程自己的 uiMode（Flyme 对第三方 App 的配置可能不一致）。
+     */
+    const val EXTRA_PANEL_NIGHT = "panel_night"
 
     /** Xposed 日志 TAG（logcat / LSPosed 日志里搜这个） */
     const val LOG_TAG = "FlymeArk"

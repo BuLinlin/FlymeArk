@@ -55,6 +55,17 @@ internal object SystemUILiveHost {
     private fun registerReceiver(ctx: Context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
+                // v3.13.1：只允许 SystemUI 主进程处理。
+                // com.android.systemui:screenshot 等子进程也会收到 exported 广播，
+                // 媒体键被派发两次 → 播放/暂停连发互相抵消（用户看到的「暂停失效」）、
+                // 切歌一次跳两首。非主进程一律忽略。
+                val proc = try {
+                    android.app.Application.getProcessName()
+                } catch (_: Throwable) {
+                    null
+                }
+                if (proc != null && proc != "com.android.systemui") return
+
                 // v2.6：只接播放面板的媒体键请求。
                 // v2.2 的「播放器媒体事件 → SystemUI 代发实况通知」已废弃：
                 // 方舟不再自己发胶囊，避免与 QQ音乐 原生 ticker 胶囊冲突。
@@ -70,12 +81,17 @@ internal object SystemUILiveHost {
 
                     // v3.1：面板要求立即同步曲目（切歌后不用等歌词通知刷新）
                     ArkConstants.ACTION_PANEL_SYNC -> ArkLiveExpandHook.syncNow(context)
+
+                    // v3.13：面板拖动进度条 → seekTo（需 system uid）
+                    ArkConstants.ACTION_PANEL_SEEK ->
+                        ArkLiveExpandHook.seekTo(context, intent.getLongExtra(ArkConstants.EXTRA_SEEK_POSITION, -1L))
                 }
             }
         }
         val filter = IntentFilter(ArkConstants.ACTION_PANEL_MEDIA_KEY).apply {
             addAction(ArkConstants.ACTION_PANEL_STATE)
             addAction(ArkConstants.ACTION_PANEL_SYNC)
+            addAction(ArkConstants.ACTION_PANEL_SEEK)
         }
         try {
             if (Build.VERSION.SDK_INT >= 33) {

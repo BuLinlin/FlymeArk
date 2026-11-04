@@ -40,7 +40,10 @@ import android.widget.FrameLayout
 internal class ArkMorphAnim(
     private val root: View,
     private val card: View,
-    private val content: View
+    private val content: View,
+    /** 卡片底色/描边色：与 applyPalette 同源（v3.13.1 起不能硬编码，否则盖掉深浅配色） */
+    private var cardColor: Int = 0xFF18181C.toInt(),
+    private var strokeColor: Int = 0x24FFFFFF.toInt()
 ) {
 
     private val density = root.resources.displayMetrics.density
@@ -118,16 +121,25 @@ internal class ArkMorphAnim(
         startRadius = minOf(startRect.height() / 2f, dp(18).toFloat())
         finalRadius = dp(30).toFloat()
 
-        // 与 res/drawable/bg_ark_panel.xml 同色同描边，但圆角要能随动画变化，所以用代码构造。
-        // v3.2：底色从不透明化处理改为 #FF18181C —— 原来的 0xF0 会透出桌面时钟/壁纸（实测透射 6%），
-        // 在大面积深色上一个白色大字很扎眼；这里直接做实心，视觉更干净。
+        // 与 res/drawable/bg_ark_panel.xml 同描边、同圆角逻辑，但圆角要能随动画变化，
+        // 所以用代码构造；颜色来自 Activity 的配色系统（深浅模式），不再硬编码。
         bg.shape = GradientDrawable.RECTANGLE
-        bg.setColor(0xFF18181C.toInt())
-        bg.setStroke(dp(1), 0x24FFFFFF.toInt())
+        bg.setColor(cardColor)
+        bg.setStroke(dp(1), strokeColor)
         bg.cornerRadius = finalRadius
         card.background = bg
 
         applyRect(startRect, startRadius, 0f)
+    }
+
+    /** 配色变化（深浅模式切换）时由 Activity 调用，动画中/后都生效 */
+    fun setColors(color: Int, stroke: Int) {
+        cardColor = color
+        strokeColor = stroke
+        if (prepared) {
+            bg.setColor(color)
+            bg.setStroke(dp(1), stroke)
+        }
     }
 
     /** 展开：胶囊矩形 → 卡片矩形，内容在后半段浮现 */
