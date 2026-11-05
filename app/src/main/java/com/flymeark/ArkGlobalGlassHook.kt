@@ -28,16 +28,29 @@ import java.util.Collections
  * 所以改玻璃观感必须改 color 里的 alpha，改 setAlpha 没用。
  *
  * 系统给主玻璃的染色是 `0xB2FFFFFF`（浅）/ `0xB21A1A1A`（深），即 70%。
- * 现在按液态玻璃规范改成**深浅分别配置 + 随背景复杂度自动插值**的区间：
- * 浅色白 6%–22%、深色 rgb(20 20 24) 16%–38%。复杂度来自 [ArkLiquidGlass] 的
- * 多点背景采样；RGB 原样保留，只替换 alpha，因此不会和系统自己的主题色逻辑打架。
+ *
+ * ## v3.15.43：默认停用，理由是真机实测
+ *
+ * CSS 规范里的 `--glass-tint` 是**叠加在 backdrop-filter 模糊结果之上**的一层，
+ * 6%–22% 成立；但这里的 `args[4]` 是这块玻璃**唯一的不透明基底**，独自承担文字
+ * 对比度。v3.15.42 把它降到 17%（`#b2ffffff → #2bffffff`）后，锁屏壁纸的大片
+ * 粉红/红色图案直接透出来 → 用户看到「背景变成红色」，系统文字也发灰不可读。
+ * 两者不是同一层，不能共用一组数字。
+ *
+ * 深浅浓度规范继续作用于模块**自己的** 6 层玻璃（[ArkLiquidGlassDrawable]）；
+ * 系统主玻璃恢复原生观感。区间常量保留，若以后确实要调系统玻璃，必须按「基底」
+ * 重新定标（不低于 50%），而不是套用 CSS 的着色层数值。
  *
  * 注意：SystemUI 里还有 `0x66FFFFFF` / `0x1AFFFFFF` 这类更淡的遮罩，那是系统有意
- * 做出来的层次，必须原样放过，只动 0xB2 这一档。
- *
- * 若实机觉得系统通知卡过透、文字可读性下降，把下面四个区间常量整体上调即可。
+ * 做出来的层次，即便开启改写也必须原样放过，只认 0xB2 这一档。
  */
 internal object ArkGlobalGlassHook {
+
+    /**
+     * 是否改写系统主玻璃染色。默认 **false**。
+     * 见文件头注释：v3.15.42 实测已证明按 CSS 着色层浓度改写会毁掉系统玻璃。
+     */
+    private const val REWRITE_SYSTEM_TINT = false
 
     private const val MZ_BLUR_UTILS = "com.flyme.systemui.utils.MzBlurUtils"
     private const val METHOD = "setBackgroundBlurDrawable"
@@ -60,6 +73,8 @@ internal object ArkGlobalGlassHook {
     private val logged: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
+        // v3.15.43：系统主玻璃是「基底」不是「着色层」，默认完全不改写。
+        if (!REWRITE_SYSTEM_TINT) return
         ArkHooks.quiet("glass") {
             val cls = XposedHelpers.findClass(MZ_BLUR_UTILS, lpp.classLoader)
             // 4 个重载最终都汇到 10 参数那个（经 setBackgroundBlurDrawable$default），

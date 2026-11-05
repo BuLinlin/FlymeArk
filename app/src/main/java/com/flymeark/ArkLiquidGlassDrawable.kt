@@ -28,6 +28,16 @@ import java.util.Locale
  * ⑥ 文字着色  → ArkLiquidGlass.ink()（Activity 侧应用到 TextView）
  * ```
  *
+ * ## v3.15.43 修正（真机「背景变红」）
+ *
+ * 面板 Activity 是**全透明窗口**，玻璃 Drawable 下面直接是壁纸。v3.15.42 的 AGSL
+ * 把 `ambientRgb`（壁纸平均色）当成实体底色并且 `return half4(c, 1.0)` 完全不透明，
+ * 一旦壁纸偏红，整张卡就是一块红色。现在：
+ * - 先画一层 90% 不透明的**中性基底**（浅 `#F7F8FA` / 深 `rgb(18,18,22)`），
+ *   它才承担文字对比度，并挡住壁纸彩色；
+ * - 玻璃层改为半透明 `half4(c, 0.55)`，底纹 `base = mix(中性色, 环境色, 0.10)`；
+ * - 壁纸平均色只用于亮度/复杂度判定与文字 ink 混色，**不再作为玻璃底色**。
+ *
  * AGSL 通过**反射**构造 RuntimeShader：模块 minSdk 26，避免低版本加载本类时
  * 因找不到 `android.graphics.RuntimeShader` 而抛 NoClassDefFoundError。
  * 设备是 API 36，正常运行走 AGSL；失败时降级为纯渐变玻璃，功能不受影响。
@@ -50,6 +60,8 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
 
     private val density = android.content.res.Resources.getSystem().displayMetrics.density
 
+    /** ⓪ 中性基底：挡住透明窗口后面的壁纸彩色，承担文字对比度（v3.15.43） */
+    private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val volumePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -87,12 +99,15 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
         shader = buildAgsl(params)
         agslReady = shader != null
         glassPaint.shader = if (agslReady) shader else fallbackGradient()
+        basePaint.color = (0xE6 shl 24) or (neutralRgb() and 0x00FFFFFF)
         Log.i(
             TAG,
             "glass ${if (agslReady) "AGSL enabled" else "gradient fallback"}: " +
                 "light=${params.light} tint=${(params.tintAlpha * 100).toInt()}% " +
                 "luma=${String.format(Locale.US, "%.2f", params.ambientLuma)} " +
-                "complexity=${String.format(Locale.US, "%.2f", params.complexity)}"
+                "complexity=${String.format(Locale.US, "%.2f", params.complexity)} " +
+                "neutral=#${Integer.toHexString(neutralRgb())} " +
+                "ambient=#${Integer.toHexString(params.ambientRgb)}"
         )
         applyEdgeColors()
         updateVolumeGradient()
@@ -101,10 +116,14 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
     /** AGSL 不可用（低版本 / shader 编译失败 / uniform 写入失败）时的渐变玻璃 */
     private fun fallbackGradient(): LinearGradient = LinearGradient(
         0f, 0f, rect.width().coerceAtLeast(1f), rect.height().coerceAtLeast(1f),
-        blend(params.tintRgb, params.ambientRgb, 0.18f),
-        params.tintArgb,
+        // 起点必须是中性色；v3.15.42 用 ambient 混色做起点会带出壁纸的红色
+        0xFF000000.toInt() or (neutralRgb() and 0x00FFFFFF),
+        (140 shl 24) or (params.tintRgb and 0x00FFFFFF),   // 终点 55% 半透明 tint
         Shader.TileMode.CLAMP,
     )
+
+    /** 玻璃的中性基底：浅色近白、深色近黑。壁纸平均色只在底纹里占 10% 权重 */
+    private fun neutralRgb(): Int = if (params.light) 0xF7F8FA else Color.rgb(18, 18, 22)
 
     private fun updateVolumeGradient() {
         volumePaint.shader = LinearGradient(
@@ -164,6 +183,9 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
     override fun draw(canvas: Canvas) {
         if (rect.isEmpty) return
         val r = cornerRadius.coerceAtMost(minOf(rect.width(), rect.height()) / 2f)
+
+        // ⓪ 中性基底：面板是透明窗口，必须先挡住壁纸彩色，否则整张卡会染成壁纸色
+        canvas.drawRoundRect(rect, r, r, basePaint)
 
         // ②③④：AGSL 一次算完模糊提亮 / 折射色散 / 着色（降级时是渐变 + tint）
         canvas.drawRoundRect(rect, r, r, glassPaint)
@@ -245,7 +267,10 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
                 float a = sin(q.x * 7.0 + sin(q.y * 5.0) * 1.2) * 0.5 + 0.5;
                 float b = sin(q.y * 9.0 - q.x * 3.0) * 0.5 + 0.5;
                 float grain = fract(sin(dot(floor(p * 0.5), float2(12.9898, 78.233))) * 43758.5453);
-                half3 base = half3(${channel(p.ambientRgb, 16)}, ${channel(p.ambientRgb, 8)}, ${channel(p.ambientRgb, 0)});
+                // v3.15.43：中性基底 + 10% 环境色，绝不把壁纸平均色当玻璃底色
+                half3 neutral = half3(${channel(neutralRgb(), 16)}, ${channel(neutralRgb(), 8)}, ${channel(neutralRgb(), 0)});
+                half3 ambient = half3(${channel(p.ambientRgb, 16)}, ${channel(p.ambientRgb, 8)}, ${channel(p.ambientRgb, 0)});
+                half3 base = mix(neutral, ambient, 0.10);
                 half3 wave = half3(
                     (a - 0.5) * 0.075 + (b - 0.5) * 0.030,
                     (b - 0.5) * 0.070 + (a - 0.5) * 0.020,
@@ -278,7 +303,8 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
                 // tint layer
                 half3 tint = half3(${channel(p.tintRgb, 16)}, ${channel(p.tintRgb, 8)}, ${channel(p.tintRgb, 0)});
                 c = mix(c, tint, ${f(p.tintAlpha)});
-                return half4(c, 1.0);
+                // 半透明：底下还有 90% 的中性基底，玻璃只提供质感而不是整块实体色
+                return half4(c, 0.55);
             }
         """.trimIndent()
         return try {
