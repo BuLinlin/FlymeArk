@@ -45,6 +45,8 @@ class ArkEntry : IXposedHookLoadPackage {
                 // 微信/QQ 通知栏样式：已废弃 sbn.isLive 拦截（会连带断掉胶囊点击追踪）
                 // 实况影子通知：从通知栏列表过滤 + 原通知消失时同步销毁胶囊
                 ArkLiveShadowHook.install(lpp)
+                // 胶囊首次展示补内容（系统只淡入不设文字 → 空白窗口）
+                ArkLiveShowFixHook.install(lpp)
                 // 专辑封面写入 smallIcon + 清 showType=5 单色滤镜
                 ArkLiveCoverHook.install(lpp)
                 // 胶囊宽度收窄 + 歌词横向滑入

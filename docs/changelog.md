@@ -2,6 +2,31 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.31 胶囊「先空白、后补字」修复
+
+用户反馈：**每条消息的胶囊都会延迟，延迟期间内容是空白**。
+
+反编译 `LiveNotificationController.updateStatusBarIcons` 得到确定结论：一条实况**从无到有
+（或 key 变化）时，系统只把胶囊 view 淡入，不设内容**：
+
+```java
+if (view.getNotificationKey() == null) goto 淡入;                          // ①
+if (!view.getNotificationKey().equals(info.getNotificationKey())) goto 淡入; // ②
+view.setLiveNotificationInfo(info);   // ③ 只有 key 相同时才写文字
+淡入: startDisplayAlphaAnim();          // ④ 只跑 alpha 动画
+```
+
+内容要等**下一次** `updateStatusBarIcons`（下一条通知 / 面板变化 / tick）才补上，
+中间这段就是用户看到的「空白延迟」。系统音乐实况长期常驻、key 不变，几乎不会走 ①②，
+所以只有我们的消息胶囊每次都撞上。
+
+修复（[ArkLiveShowFixHook]）：hook `startDisplayAlphaAnim()`，淡入前若
+`mDisplayNotificationInfo` 已就绪（正是这次要显示的那条）且 view 的 key 与之不符，
+就直接 `setLiveNotificationInfo(info)`，文字与淡入同帧生效，空白窗口消失。
+只对微信/QQ 生效，音乐实况零影响。
+
+- versionCode 54 / 3.15.31
+
 ## 2026-11-05 · v3.15.30 作用域补全（system + android 双声明）
 
 - 真机取证（`/data/adb/lspd/config/modules_config.db` 的 `scope` 表）确认模块已勾选的
