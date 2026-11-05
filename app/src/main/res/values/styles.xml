@@ -42,4 +42,36 @@
         <item name="android:textColor">@color/ark_text_tertiary</item>
         <item name="android:fontFeatureSettings">tnum</item>
     </style>
+
+    <!--
+        v3.15.46：通知卡专用三档（对齐设计稿 NotificationCapsule + IslandComponents.GlassSurface）
+         - ArkPanelTitleSmall：群名/发送者标题，设计稿 TypeTitle = 16sp SemiBold
+         - ArkPanelBody      ：正文，TypeBody = 14sp，行高 20sp（= 14sp + 6sp extra）
+         - ArkPanelCta       ：底部「应用 · 进入会话」主 CTA，14sp Medium 一级色
+    -->
+    <style name="ArkPanelTitleSmall">
+        <item name="android:textSize">16sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">600</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkPanelBody">
+        <item name="android:textSize">14sp</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
+        <item name="android:lineSpacingExtra">6sp</item>
+        <item name="android:maxLines">6</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkPanelCta">
+        <item name="android:textSize">14sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">500</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
 </resources>

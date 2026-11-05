@@ -11,8 +11,11 @@
 
     <color name="ark_brand">#FF8FB0FF</color>
     <color name="ark_brand_on">#FF0B1730</color>
+    <color name="ark_brand_container">#FF23304C</color>
     <color name="ark_track">#FF454C58</color>
-    <color name="ark_divider">#33FFFFFF</color>
+
+    <!-- v3.15.46：封面描边（设计稿 island_cover_frame.xml 亮暗同值） -->
+    <color name="ark_cover_stroke">#80FFFFFF</color>
 
     <!-- 86% 玻璃 -->
     <color name="ark_glass_top">#DB2A303B</color>

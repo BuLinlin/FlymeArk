@@ -170,7 +170,9 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
     private fun applyEdgeColors() {
         val hi = params.strokeRgb
         val clear = Color.TRANSPARENT
-        val dim = if (params.light) 0x12000000 else 0x0CFFFFFF
+        // v3.15.46（06 规范）：内侧缩进那一道改成 1px **内高光**（原来是一道压暗），
+        // 与外侧 1dp 边缘光一起构成「玻璃厚度」；亮/暗只差一档 alpha。
+        val inner = if (params.light) 0x38FFFFFF else 0x24FFFFFF
         // 同一条对角渐变让左上与右下同时起亮，中段留空 → 「左上、右下各一道光」
         val colors = intArrayOf(hi, clear, clear, hi)
         val positions = floatArrayOf(0f, 0.34f, 0.66f, 1f)
@@ -179,10 +181,11 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
         edgePaint.shader = LinearGradient(0f, 0f, w, h, colors, positions, Shader.TileMode.CLAMP)
         innerEdgePaint.shader = LinearGradient(
             0f, 0f, w, h,
-            intArrayOf(dim, clear, clear, dim), positions, Shader.TileMode.CLAMP,
+            intArrayOf(inner, clear, clear, inner), positions, Shader.TileMode.CLAMP,
         )
-        edgePaint.strokeWidth = density * 1.6f
-        innerEdgePaint.strokeWidth = density * 1f
+        // 边缘光 1dp（设计稿 1px 描边），内侧高光 1dp
+        edgePaint.strokeWidth = density * ArkTokens.STROKE_DP
+        innerEdgePaint.strokeWidth = density * ArkTokens.STROKE_DP
     }
 
     override fun onBoundsChange(bounds: Rect) {

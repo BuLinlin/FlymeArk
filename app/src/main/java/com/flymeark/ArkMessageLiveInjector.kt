@@ -232,7 +232,11 @@ internal object ArkMessageLiveInjector {
      */
     private val COUNT_IN_TEXT = Regex("""(\d+)\s*条""")
 
-    private fun sessionMessageCount(extras: Bundle, text: String?, title: String?): Int {
+    /**
+     * v3.15.47：由 [ArkMiniBarStyleHook]（运行在 SystemUI 进程）复用，用于迷你条右上角
+     * 未读徽标的数字，避免第二套条数算法。可见性从 private 放宽到 internal。
+     */
+    internal fun sessionMessageCount(extras: Bundle, text: String?, title: String?): Int {
         // ① 微信 / TIM 风格：正文前缀 [4条]
         if (!text.isNullOrBlank()) {
             val n = COUNT_IN_TEXT.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0

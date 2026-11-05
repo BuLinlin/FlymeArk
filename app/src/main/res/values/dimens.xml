@@ -10,8 +10,16 @@
     <dimen name="ark_stroke">1dp</dimen>
     <dimen name="ark_elevation">18dp</dimen>
     <dimen name="ark_touch">48dp</dimen>
+    <!-- v3.15.50：时间胶囊的垂直内边距（设计稿 2dp，胶囊总高约 20dp） -->
+    <dimen name="ark_space_2">2dp</dimen>
     <dimen name="ark_space_4">4dp</dimen>
     <dimen name="ark_space_8">8dp</dimen>
     <dimen name="ark_space_12">12dp</dimen>
     <dimen name="ark_space_16">16dp</dimen>
+    <!-- v3.15.46：组件尺寸 token（IslandTokens.Avatar / Cover / PlayButton / ProgressHeight） -->
+    <dimen name="ark_avatar">40dp</dimen>
+    <dimen name="ark_cover">56dp</dimen>
+    <dimen name="ark_play">56dp</dimen>
+    <!-- v3.15.46：48dp 触控区内 22dp 光学图标的四边余量（02/04 规范） -->
+    <dimen name="ark_space_13">13dp</dimen>
 </resources>

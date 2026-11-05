@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.46：专辑封面外框（对齐设计稿 view/res/drawable/island_cover_frame.xml）。
+    14dp 圆角（IslandTokens.RadiusCover）+ 1dp 50% 白描边，避免浅色封面与玻璃底糊在一起。
+    封面图本身由 ArkCapsulePanelActivity 用圆角 outline 裁切（clipToOutline），
+    slot 内再留 1dp padding，让描边整条可见。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@android:color/transparent" />
+    <corners android:radius="@dimen/ark_radius_cover" />
+    <stroke
+        android:width="@dimen/ark_stroke"
+        android:color="@color/ark_cover_stroke" />
+</shape>

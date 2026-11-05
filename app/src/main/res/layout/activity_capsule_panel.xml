@@ -1,13 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   v3.2：点击实况胶囊展开的播放面板。
+  v3.15.46：按设计包 `MusicCapsule.kt` + `IslandComponents.kt` 校准视觉
+  （封面形状 / 间距 / 字号层级 / 主按钮尺寸 / 图标按钮触控区），
+  **不动**任何业务逻辑、动画几何与点击行为。
 
   结构分两层，是为了做「胶囊长大成卡片」的动画：
    - panel_card：只负责背景（圆角矩形）与尺寸。展开时它的 layout 宽高/位置
-     从胶囊矩形连续插值到卡片矩形，背景圆角同步从胶囊半径变到 30dp。
+     从胶囊矩形连续插值到卡片矩形，背景圆角同步从胶囊半径变到 28dp。
    - panel_content：内容层。代码里把它的宽高固定成**最终尺寸**，
      动画过程中不重排（避免文字换行抖动），只做 alpha 淡入淡出，
      超出 panel_card 的部分由 clipChildren 裁掉。
+
+  设计稿映射（4dp 栅格）：
+   - 内容内边距 S4 = 16dp（原 18dp 上边距收敛到栅格）
+   - 封面 Cover = 56dp，RadiusCover = 14dp + 1dp 50% 白描边（bg_ark_cover_frame）
+   - 封面 → 文字 S3 = 12dp；标题 TypeTitleLarge = 18sp SemiBold；歌手 TypeBody = 14sp
+   - 主播放键 PlayButton = 56dp 品牌圆；四个次级图标按钮最小触控 48dp、图标 24dp
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/panel_root"
@@ -40,9 +49,9 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:paddingHorizontal="16dp"
-            android:paddingTop="18dp"
-            android:paddingBottom="16dp">
+            android:paddingHorizontal="@dimen/ark_space_16"
+            android:paddingTop="@dimen/ark_space_16"
+            android:paddingBottom="@dimen/ark_space_16">
 
             <!-- 封面 + 曲目信息（v3.14.1：右上角显示媒体 App 图标，参考用户提供的参考图） -->
             <FrameLayout
@@ -56,59 +65,61 @@
                     android:gravity="center_vertical"
                     android:orientation="horizontal">
 
-                <!--
-                  v3.12：封面位改成「双图插槽」做左右轮播。
-                  clipChildren=true 让滑出/滑入的图被裁在 62dp 方框内，
-                  切换时看起来是轮播而不是整块飘出去。
-                -->
-                <FrameLayout
-                    android:id="@+id/panel_cover_slot"
-                    android:layout_width="62dp"
-                    android:layout_height="62dp"
-                    android:clipChildren="true"
-                    android:clipToPadding="true">
+                    <!--
+                      v3.12：封面位改成「双图插槽」做左右轮播。
+                      clipChildren=true 让滑出/滑入的图被裁在 56dp 方框内，
+                      切换时看起来是轮播而不是整块飘出去。
+                      v3.15.46：加 14dp 圆角外框 + 1dp padding，让描边整条可见；
+                      封面图本身在 ArkCapsulePanelActivity 里用圆角 outline 裁切。
+                    -->
+                    <FrameLayout
+                        android:id="@+id/panel_cover_slot"
+                        android:layout_width="@dimen/ark_cover"
+                        android:layout_height="@dimen/ark_cover"
+                        android:background="@drawable/bg_ark_cover_frame"
+                        android:clipChildren="true"
+                        android:clipToPadding="true"
+                        android:padding="@dimen/ark_stroke">
 
-                    <ImageView
-                        android:id="@+id/panel_cover"
-                        android:layout_width="match_parent"
-                        android:layout_height="match_parent"
-                        android:contentDescription="@string/ark_panel_cover"
-                        android:scaleType="centerCrop"
-                        android:src="@drawable/ic_flymeark" />
+                        <ImageView
+                            android:id="@+id/panel_cover"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent"
+                            android:contentDescription="@string/ark_panel_cover"
+                            android:scaleType="centerCrop"
+                            android:src="@drawable/ic_flymeark" />
 
-                    <ImageView
-                        android:id="@+id/panel_cover_b"
-                        android:layout_width="match_parent"
-                        android:layout_height="match_parent"
-                        android:contentDescription="@string/ark_panel_cover"
-                        android:scaleType="centerCrop"
-                        android:visibility="gone" />
-                </FrameLayout>
+                        <ImageView
+                            android:id="@+id/panel_cover_b"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent"
+                            android:contentDescription="@string/ark_panel_cover"
+                            android:scaleType="centerCrop"
+                            android:visibility="gone" />
+                    </FrameLayout>
 
-                <LinearLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="14dp"
-                    android:layout_weight="1"
-                    android:orientation="vertical">
-
-                    <TextView
-                        android:id="@+id/panel_title"
-                        style="@style/ArkPanelTitle"
-                        android:layout_width="match_parent"
+                    <LinearLayout
+                        android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:text="@string/ark_panel_unknown" />
+                        android:layout_marginStart="@dimen/ark_space_12"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
 
-                    <TextView
-                        android:id="@+id/panel_artist"
-                        style="@style/ArkPanelSubtitle"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="3dp"
-                        android:text="" />
-                </LinearLayout>
+                        <TextView
+                            android:id="@+id/panel_title"
+                            style="@style/ArkPanelTitle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="@string/ark_panel_unknown" />
 
-                <!-- 当前媒体 App 图标（右上角，参考图四排版） -->
+                        <TextView
+                            android:id="@+id/panel_artist"
+                            style="@style/ArkPanelSubtitle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="@dimen/ark_space_4"
+                            android:text="" />
+                    </LinearLayout>
                 </LinearLayout>
 
                 <!-- 当前媒体 App 图标（右上角，参考图四排版） -->
@@ -123,14 +134,15 @@
 
             <!--
               进度条：v3.13 起可拖动 seek。
-              触摸热区需要高度，view 给 25dp，线画在垂直中心（3dp），
-              上下用负 margin 补偿保持原视觉间距（16dp / 7dp）。
+              触摸热区保持 25dp（不动命中区域 = 不改点击行为，见 changelog v3.15.46 取舍），
+              线画在垂直中心（4dp，对齐设计稿 ProgressHeight），
+              上下用负 margin 补偿保持原视觉间距（4dp / 7dp）。
             -->
             <com.flymeark.ArkProgressBar
                 android:id="@+id/panel_progress"
                 android:layout_width="match_parent"
                 android:layout_height="25dp"
-                android:layout_marginTop="4dp" />
+                android:layout_marginTop="@dimen/ark_space_4" />
 
             <!-- 时间 -->
             <LinearLayout
@@ -161,13 +173,15 @@
 
             <!--
               控制按钮（v3.14.1）：播放键绝对居中（用户反馈跑偏）。
-              左区 ❤ + 上一首（靠拢播放键），右区下一首（对称位置），
-              与参考图四一致；右侧留白给后续的输出切换/歌词按钮。
+              左区 ❤ + 上一首（靠拢播放键），右区下一首 + 输出切换（对称位置），
+              与参考图四一致。
+              v3.15.46：主按钮 58dp → 56dp（设计稿 PlayButton），
+              次级按钮 46dp → 48dp（MinTouch）、图标仍 24dp（padding 12dp）。
             -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
+                android:layout_marginTop="@dimen/ark_space_8"
                 android:baselineAligned="false"
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
@@ -181,31 +195,31 @@
 
                     <ImageView
                         android:id="@+id/panel_fav"
-                        android:layout_width="46dp"
-                        android:layout_height="46dp"
+                        android:layout_width="@dimen/ark_touch"
+                        android:layout_height="@dimen/ark_touch"
                         android:background="?android:attr/selectableItemBackgroundBorderless"
                         android:contentDescription="@string/ark_panel_fav"
-                        android:padding="11dp"
+                        android:padding="@dimen/ark_space_13"
                         android:src="@drawable/ic_ark_fav" />
 
                     <ImageView
                         android:id="@+id/panel_prev"
-                        android:layout_width="46dp"
-                        android:layout_height="46dp"
-                        android:layout_marginEnd="18dp"
+                        android:layout_width="@dimen/ark_touch"
+                        android:layout_height="@dimen/ark_touch"
+                        android:layout_marginEnd="@dimen/ark_space_16"
                         android:background="?android:attr/selectableItemBackgroundBorderless"
                         android:contentDescription="@string/ark_panel_prev"
-                        android:padding="11dp"
+                        android:padding="@dimen/ark_space_13"
                         android:src="@drawable/ic_ark_prev" />
                 </LinearLayout>
 
                 <ImageView
                     android:id="@+id/panel_play"
-                    android:layout_width="58dp"
-                    android:layout_height="58dp"
+                    android:layout_width="@dimen/ark_play"
+                    android:layout_height="@dimen/ark_play"
                     android:background="@drawable/bg_ark_play_btn"
                     android:contentDescription="@string/ark_panel_play"
-                    android:padding="16dp"
+                    android:padding="@dimen/ark_space_16"
                     android:src="@drawable/ic_ark_play" />
 
                 <!--
@@ -221,22 +235,22 @@
 
                     <ImageView
                         android:id="@+id/panel_next"
-                        android:layout_width="46dp"
-                        android:layout_height="46dp"
-                        android:layout_marginStart="18dp"
+                        android:layout_width="@dimen/ark_touch"
+                        android:layout_height="@dimen/ark_touch"
+                        android:layout_marginStart="@dimen/ark_space_16"
                         android:background="?android:attr/selectableItemBackgroundBorderless"
                         android:contentDescription="@string/ark_panel_next"
-                        android:padding="11dp"
+                        android:padding="@dimen/ark_space_13"
                         android:src="@drawable/ic_ark_next" />
 
                     <ImageView
                         android:id="@+id/panel_output"
-                        android:layout_width="46dp"
-                        android:layout_height="46dp"
-                        android:layout_marginStart="10dp"
+                        android:layout_width="@dimen/ark_touch"
+                        android:layout_height="@dimen/ark_touch"
+                        android:layout_marginStart="@dimen/ark_space_8"
                         android:background="?android:attr/selectableItemBackgroundBorderless"
                         android:contentDescription="@string/ark_panel_output"
-                        android:padding="11dp"
+                        android:padding="@dimen/ark_space_13"
                         android:src="@drawable/ic_ark_output" />
                 </LinearLayout>
             </LinearLayout>

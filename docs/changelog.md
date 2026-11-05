@@ -2,6 +2,273 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.50 消息卡：删标题/正文分割线 + 时间加胶囊底
+
+> 只改消息大卡 `ArkMessagePanelActivity`（本模块自己的 Activity）。
+> 迷你条（SystemUI 侧 `ArkMiniBarStyleHook`）本轮**冻结未动**。
+
+### ① 删掉标题与正文之间的分割线
+
+用户认为多余。删的是 `activity_message_panel.xml` 里的 `<View android:id="@+id/msg_divider" ...>`。
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 结构 | 头部 → 12dp → 1dp 线 → 12dp → 正文 | 头部 → 12dp → 正文 |
+| 净间距 | 12 + 1 + 12 = 25dp | **12dp**（`ark_space_12` 保留在正文的 marginTop 上）|
+
+连带清理（无死代码）：
+
+- `ArkMessagePanelActivity`：删 `dividerView` 字段、`findViewById(R.id.msg_divider)`、
+  `applyPalette()` 里的 `setBackgroundColor(DIVIDER_*)` 分支；更新相关注释。
+- `res/values/colors.xml` + `res/values-night/colors.xml`：删 `<color name="ark_divider">`
+  （删完全局无引用，已 grep 确认）。
+- `ArkTokens`：删 `DIVIDER_LIGHT` / `DIVIDER_DARK`（同上，无引用）。
+
+### ② 时间「刚刚」加 12% 二级色胶囊底
+
+设计稿 `rgba(78, 87, 102, 0.12)` → ARGB `0x1F4E5766`（0.12 × 255 ≈ 0x1F）。
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 宽度 | `match_parent`（会撑满整行）| `wrap_content` + `layout_gravity="start"` |
+| 背景 | 无 | 自绘 `ArkChipDrawable`，fill = `TIME_CHIP_FILL`(0x1F4E5766)，**全圆角** |
+| 内边距 | 无 | 水平 8dp / 垂直 2dp → 胶囊高约 20dp |
+| 文字 | 12sp / `ARK_TEXT_TERTIARY` | 不变 |
+
+实现说明：
+
+- 没有新增 xml shape，复用 `ArkChipDrawable` 并给它加了 `pill` 模式 ——
+  `onBoundsChange` 里按「短边一半」重算 `radius`，从而得到药丸形而不是固定 10dp chip 圆角。
+  `pill` 默认 false，**CTA 底板那处用法行为完全不变**（仍走构造时的固定半径）。
+- 仍然自绘而不是用 `GradientDrawable`：Flyme 深色模式会把 framework 形状 drawable 的填充
+  反色（v3.15.46 已取证），自绘不受影响。
+- 新增 `@dimen/ark_space_2`（2dp）承载垂直内边距。
+
+### 已知边界
+
+- 深色玻璃上这层 12%（`0x1F`）叠层几乎看不出来。本轮按设计稿单值落地，
+  没有自造深色镜像色；如果深色下也要可见，需要设计侧给一个深色值。
+
+### 需要用户实测确认（本轮未验证）
+
+- 删线后「标题区 → 正文」是否为 12dp 净间距（视觉上不塌也不松）；
+- 时间胶囊是否呈药丸形、宽度贴合文字、不与标题抢行；
+- 深色模式下胶囊底的可见度是否可接受。
+
+版本 `versionCode 73 / 3.15.50`。
+
+## 2026-11-05 · v3.15.49 音乐卡「输出」改为拉起系统 MediaOutputDialog
+
+> 用户反馈：音乐卡右下角「输出」点开的是本模块自己用 `AlertDialog.Builder` 画的
+> DeviceDefault 列表（深/浅系统主题），与 Flyme 通知栏媒体卡点开的输出面板完全不是一个东西。
+>
+> 改动只碰 SystemUI 侧 `ArkLiveExpandHook.outputRoutes()`；
+> App 侧 `ArkCapsulePanelActivity.showRouteDialog()` **一行未动**（保留作兜底）。
+
+### 系统入口（反编译实证）
+
+`com.android.systemui.media.dialog.MediaOutputDialogReceiver.onReceive()`：
+
+```
+"com.android.systemui.action.LAUNCH_MEDIA_OUTPUT_DIALOG"
+  → String pkg = intent.getStringExtra("package_name")
+  → launchMediaOutputDialogIfPossible(pkg)
+  → MediaOutputDialogManager.createAndShow(pkg, ...)
+```
+
+接收器在 SystemUI manifest 里静态注册，`adb shell dumpsys package com.android.systemui`
+能查到 `MediaOutputDialogReceiver` 带该 action —— 所以发一条广播就能复用系统自己的实现，
+外观 / 动效 / 当前路由高亮 / 投屏组管理全部与通知栏媒体卡同源。
+
+### 三级降级（都在 `outputRoutes()` 内，不动 App 侧）
+
+| 级别 | 做法 | 生效条件 |
+|---|---|---|
+| ① 广播（首选）| `queryBroadcastReceivers` 先确认接收器存在，再 `sendBroadcast` 到 `com.android.systemui` | 正常 |
+| ② 反射兜底 | `Dependency.get(MediaOutputDialogManager::class)` → `createAndShow(pkg, false, null, null, null, null, false, false)` | 广播接收器查不到 |
+| ③ 老路径 | 列 `MediaRouter2Manager` 路由 → 回 `ACTION_OUTPUT_ROUTES`，面板自绘 AlertDialog | ①② 都失败 |
+
+①② 成功时**不再回广播**，App 侧 `showRouteDialog()` 不会被触发，因此设计上不会叠两层对话框。
+日志取证串：`[FlymeArk/liveExpand] output → system dialog, pkg=...`。
+
+### 需要用户实测确认（本轮未验证）
+
+- 点「输出」是否真的弹出 Flyme 媒体输出面板；
+- 是否出现两层对话框（系统面板 + 自绘 AlertDialog 叠加）；
+- 选择其他设备能否正常切换路由。
+
+回滚成本极低：只要让 ①② 返回 false，行为立刻回到 v3.15.48。
+
+版本 `versionCode 72 / 3.15.49`。
+
+## 2026-11-05 · v3.15.47 / v3.15.48 迷你条结构改造（图标 + 角标 + 展开箭头 + 内嵌胶囊）
+
+> 实况通知**迷你条**（`rl_live_base → rl_header_live`）第一次做**结构**改动，
+> 此前（v3.15.44/45）只改颜色与背景。
+>
+> 红线：**只对消息类生效**——音乐 / 进度类的 `iv_circle_progress_live` 是播放进度指示器，
+> 换成箭头会直接废功能。判定复用 `ArkConstants.MESSAGE_LIVE_PKGS`（微信 / QQ）
+> 并显式排除 `MEDIA_APP_PKGS`，没有新造判定。
+>
+> 空心圆 **不 `removeView`、只设 `GONE`**（系统逻辑仍在读写它）；
+> 箭头 `clickable=false` / `focusable=false`，点击冒泡到整行（原生点整行即展开）。
+
+### 结构
+
+```
+rl_header_live (RelativeLayout, 实测 1116×182px = 319×52dp)
+  ├─ [新增] ArkMiniIconView  40dp 图标 + 右上角 16dp 未读角标（自绘，48dp 方块）
+  ├─ title_header_live       ← 左移距 66dp、加粗、CENTER_VERTICAL
+  ├─ content_header_live     ← 左移距同上
+  ├─ iv_circle_progress_live ← GONE（不删）
+  └─ [新增] ArkMiniArrowView 34dp 中性圆底 + chevron down
+```
+
+### v3.15.47 首版踩的两个坑（v3.15.48 用自绘抹平）
+
+1. **子 View 溢出被裁**：角标要压到图标右上角外侧，`FrameLayout` 上设了
+   `clipChildren=false` 仍被裁（实机截图角标顶/右被切平）。
+2. **文字色被主题盖回**：运行时 `new TextView()` 拿的是 SystemUI 主题，
+   `setTextColor(白)` 之后数字仍是**黑的**。
+   → 改为一个 `ArkMiniIconView` 全自绘：`canvas.clipPath` 只裁图标本身，数字走 `Paint` 上色。
+
+### v3.15.48 四项验收修正
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 图标 / 标题垂直对齐 | 图标按 header 中线居中，标题贴顶 → 实机量得差 43px（12dp）| 标题加 `CENTER_VERTICAL`，两者中线重合；**不动字号/行高** |
+| 角标形状 | `maxOf(badgeH, textW + pad)` → 两位数撑成胶囊 | 直径**恒定** `badgeH`；数字放不下按比例缩字号（下限 8sp），`>99` 显示 `99` |
+| 角标数字色 | 黑（被主题覆盖）| `Paint.color = BRAND_ON_LIGHT`，恒白，不随深浅模式变 |
+| 背景 | 通栏白玻璃，从屏幕左沿铺到右沿挡住壁纸 | 外层包 `InsetDrawable`：水平 8dp / 垂直 4dp → 内嵌 pill，左右露出壁纸 |
+
+复用判断穿透 `InsetDrawable` 取内层 `ArkMiniBarGlass`（`oursGlass()`），避免每次通知刷新重建（v3.15.37 坑）。
+**没有**用 margin / padding / layoutParams 缩宽度——header 宽度参与胶囊收窄计算与整行点击区。
+
+### 几何取值（`ArkTokens` + hook 内常量）
+
+| 量 | 值 | 依据 |
+|---|---|---|
+| 图标 | 40dp + `RADIUS_CHIP_DP`(10dp) 圆角 | 设计稿 38px/54px 折算 |
+| 图标距 header 左 | 10dp（本体距玻璃左沿 6dp）| 内嵌 8dp + 设计稿 10px 内距 |
+| 图标 → 标题 | 12dp | 设计稿 13px 折算 |
+| 角标 | 16dp 正圆 + 1.5dp 白环 + 12sp 白字（自适应缩到 8sp）| 设计稿 15px/38px |
+| 箭头圆底 | 34dp（v3.15.47 曾是 44dp）| 胶囊只剩 44dp 高，按设计稿 42/54 = 0.78 折算 |
+| 箭头距玻璃右沿 | 9dp | 胶囊右端是半径 22dp 的半圆，小于 9dp 会压到弧线 |
+
+### 已知取舍
+
+- 40dp 图标放进 44dp 高的胶囊后只剩 2dp 上下留白，比设计稿（38/54）更满；
+  角标也因此几乎贴到胶囊上沿。要更松只能把图标缩到 ~32dp，本轮按用户已认可的 40dp 保留。
+- 标题 / 副标题的「右移」是给 `TextView` 加 `paddingLeft`，宽度仍由通知模板测量决定，
+  不牵动 `ArkMorphAnim` 的起点计算；副标题一旦真有内容就不做垂直居中（退回模板堆叠，避免压字）。
+- 未读数字复用 v3.15.34 的 `ArkMessageLiveInjector.sessionMessageCount()`（visibility 从
+  `private` 放宽到 `internal`）。该函数「只在 > 1 时返回条数，拿不到返回 0」，
+  所以 0 按「这个会话 1 条」显示 1；只有连标题/正文都取不到时才隐藏角标，不显示 0。
+
+### 需要用户实测确认（本轮未验证）
+
+- 微信 / QQ 迷你条的图标、加粗标题、角标、箭头在真机上的观感；
+- 音乐 / 进度类迷你条的空心圆是否确实原样保留（代码路径上走不到结构分支，但未实测）。
+
+版本 `versionCode 71 / 3.15.48`（v3.15.47 为 70）。
+
+## 2026-11-05 · v3.15.46 通知卡 / 音乐卡对齐 IslandCapsuleUI 设计稿（纯视觉）
+
+> 目标：把设计包 `NotificationCapsule.kt` / `MusicCapsule.kt` / `IslandComponents.kt` /
+> `view/res/*` 的视觉规范，校准到本工程**已存在**的两张大卡上。两张卡是本模块自己
+> APK 内的 Activity（不是注入 SystemUI 的 View），可以自由设窗口背景，但
+> `WINDOW_BLUR_AVAILABLE` 仍为 false（面板无跨窗口模糊，恒走 96% 降级基底）。
+>
+> 只动视觉：圆角 / 间距 / 字号 / 字重 / 颜色层级 / 描边 / 投影 / chip 与封面形状。
+> **不动**业务逻辑、数据获取、反射字段名、动画时序、`ArkMorphAnim` 起点计算与点击行为；
+> 不引入 Compose、不新建 View 类、不新增第二套配色（全部走 `ArkTokens`）。
+
+### 逐项差距表 · 通知卡（`activity_message_panel.xml` + `ArkMessagePanelActivity`）
+
+| 项 | 设计值 | 改前 | 改后 |
+|---|---|---|---|
+| 内容内边距 | S4 = 16dp 四周 | 16 / 18 / 16 | 16 四周（`ark_space_16`）|
+| 头像 | `Avatar` 40dp + `RadiusChip` 10dp 圆角 | 54dp 正圆（oval outline）| 40dp + 10dp 圆角块（roundRect outline）|
+| 头像→文字 | S3 = 12dp | 14dp | 12dp |
+| 标题 | `TypeTitle` 16sp SemiBold 一级色 | 17sp（style 18sp 覆盖成 17）| 16sp SemiBold（新增 `ArkPanelTitleSmall`）|
+| 时间 | `TypeCaption` 12sp 三级色 | 12sp 二级色 | 12sp 三级色（`ArkPanelTime`，tnum）|
+| 标题/时间间距 | S1 = 4dp | 2dp | 4dp |
+| 头部分割线 | 1dp `divider` | 无 | 1dp `ark_divider`（运行时按 `p.light` 下发）|
+| 分割线上下 | S3 = 12dp | — | 12dp |
+| 正文 | `TypeBody` 14sp 一级色、行高 20sp | 15sp / 1.25 倍行距 / 硬编码 `#E6FFFFFF` | 14sp + `lineSpacingExtra 6sp`（`ArkPanelBody`）|
+| CTA 高度 | `MinTouch` 48dp | 约 20dp（wrap）| 48dp |
+| CTA 底板 | `brandContainer @60%` + `RadiusChip` 10dp | 无 | 自绘 chip：10dp 圆角 + `#99E7EEFF`（暗 `#9923304C`）|
+| CTA 文案 | `TypeBody` 14sp Medium **一级色** | 11sp 三级色 | 14sp Medium 一级色（`ArkPanelCta`）|
+| CTA 文案内容 | `$source · 进入会话` | `微信 · 点击进入会话` | `微信 · 进入会话`（`ark_msg_hint_open` 去「点击」）|
+| 品牌圆点 | S2 = 8dp 品牌色 | 8dp，但用通知里的 App 主色 | 8dp `ArkTokens.BRAND_*` |
+| 尾部箭头 | `ChevronRight` 20dp 品牌色 | 无 | `ic_ark_chevron` 20dp（fill = `@color/ark_brand`）|
+| 右上 App 图标 | 设计稿无此项 | 18dp，被 `imageTintList` 染成单色方块 | 18dp，恢复原生彩色（与音乐卡一致）|
+
+### 逐项差距表 · 音乐卡（`activity_capsule_panel.xml` + `ArkCapsulePanelActivity`）
+
+| 项 | 设计值 | 改前 | 改后 |
+|---|---|---|---|
+| 内容内边距 | S4 = 16dp 四周 | 16 / 18 / 16 | 16 四周 |
+| 封面 | `Cover` 56dp + `RadiusCover` 14dp + 1dp 50% 白描边 | 62dp 直角、无描边 | 56dp + 14dp 圆角（roundRect outline 裁切）+ `bg_ark_cover_frame` 1dp 描边（slot 留 1dp padding）|
+| 封面→文字 | S3 = 12dp | 14dp | 12dp |
+| 标题 / 歌手 | 18sp SemiBold / 14sp 二级色、间距 S1 | 18sp / 14sp、间距 3dp | 间距 4dp |
+| 进度条轨道 | 4dp 平铺，未播放段中性 `#E9ECF2` | 3dp，轨道色 = 玻璃 ink 混色 | 4dp（`PROGRESS_HEIGHT_DP`）+ `TRACK_NEUTRAL_LIGHT` |
+| 拖拽圆点 | 13dp + 3px 白环 + 投影 | 11dp 实心，无环无投影 | 13dp + 1dp 白环 + 一层淡投影 |
+| 主按钮 | 56dp 品牌圆 + 品牌色投影 | 58dp，无投影 | 56dp（`ark_play`）+ 6dp 投影（API 28+ 用 `outlineSpot/AmbientShadowColor` 上品牌色）|
+| 次级按钮 | 22dp 光学图标、热区 ≥ 44dp | 24dp 图标 / 46dp 热区 | 22dp（padding 13dp）/ 48dp（`ark_touch`）|
+| 按钮间距 | `SpaceBetween` | 左右各 18dp / 10dp | 左右各 16dp / 8dp（镜像对称）|
+| 卡片材质 | 28dp 圆角 + 18dp 投影 + 1px 内高光 | 28dp + 18dp + 内侧**压暗** | 28dp + 18dp + 1px 白内高光；边缘光 1.6dp → 1dp |
+
+### 改动文件
+
+- `app/src/main/res/layout/activity_message_panel.xml`（结构 + 全部间距/字号/形状）
+- `app/src/main/res/layout/activity_capsule_panel.xml`（封面槽、按钮尺寸/间距、内边距）
+- `app/src/main/java/com/flymeark/ArkMessagePanelActivity.kt`（头像圆角、CTA 底板、文字层级、分割线、chevron、图标不再染色）
+- `app/src/main/java/com/flymeark/ArkCapsulePanelActivity.kt`（封面圆角裁切、播放主按钮品牌圆 + 投影、轨道中性色）
+- `app/src/main/java/com/flymeark/ArkProgressBar.kt`（4dp 轨道 / 13dp 圆点 + 白环 + 投影）
+- `app/src/main/java/com/flymeark/ArkLiquidGlassDrawable.kt`（内高光取代内侧压暗、边缘光 1dp）
+- `app/src/main/java/com/flymeark/ArkTokens.kt`（`BRAND_CONTAINER*`、`TRACK_NEUTRAL_*`、`COVER_STROKE`、`PROGRESS_THUMB_*`、`PLAY_SHADOW_DP`）
+- 新增 `app/src/main/java/com/flymeark/ArkChipDrawable.kt`（自绘圆角 chip，见下）
+- 新增 `res/drawable/bg_ark_cover_frame.xml`、`res/drawable/ic_ark_chevron.xml`
+- `res/values|values-night/colors.xml`（`ark_brand_container`、`ark_cover_stroke`）、`styles.xml`（`ArkPanelTitleSmall` / `ArkPanelBody` / `ArkPanelCta`）、`dimens.xml`（`ark_avatar` / `ark_cover` / `ark_play` / `ark_space_13`）、`values/strings.xml`（`ark_msg_hint_open`）
+
+### 关键取证（为什么多了个自绘 Drawable）
+
+真机取证（Flyme / 481QHGFN226P5）：系统深色模式下，framework 的
+`GradientDrawable` / `ColorDrawable` **填充色会被系统改写** —— `#FFE7EEFF` 在屏上是
+`#FF171102`（精确反色）、近白分割线被反成深色，且 `setBackgroundTintList()` 覆写品牌色
+**不生效**；而自绘 `Drawable` 的填充只被轻微压暗（`#2F6BFF` → `(38,86,204)`）。
+CTA 底板与播放主按钮的品牌圆因此改由 `ArkChipDrawable` 绘制（只画圆角实心矩形，
+色值/半径全部来自 `ArkTokens`），保证「浅蓝底 + 黑字」这一对不会被系统拆开。
+
+### 取舍（用户已知并接受）
+
+- **深色模式下的 CTA**：设计稿是 `brandContainer@60%` 浅色实心底 + 一级色文字。
+  系统深色模式仍会把这块浅底反色成近黑，此时黑字对比度不足。**本轮按用户要求
+  「先不考虑深色模式，优先和设计稿一致」，接受该边界**，不再为绕开它改成描边样式。
+- **82% 玻璃 + blur 30 未落地**：面板窗口开 blurBehind 会糊整屏（v3.15.42 实测），
+  `WINDOW_BLUR_AVAILABLE` 保持 false → 恒 96% 基底（与 v3.15.43「基底必须够厚」一致）。
+- **未采纳的设计项**（工程侧无数据源，属结构改动，超本轮范围）：
+  未读徽标（无未读数）、关键词 chip 行（无关键词数据）、设备输出 chip（只有点击后才
+  拉路由列表，拿不到常驻设备名）、seek 热区 48dp（会侵入封面区并改变点击命中区域）。
+- **布局尺寸改动的连带风险**：`ArkMorphAnim` 用 `margin = 10dp` 与实测内容高度算
+  终点矩形，卡片外层 `layout_marginHorizontal` 仍为 10dp；本轮只改内容尺寸，
+  展开动画按内容高度自适应，装机后已回看两卡展开过程无跑偏。
+- 图标圆角层级 28 → 14 → 7：卡 28dp、封面 14dp 已落地；设计稿两处自相矛盾
+  （`IslandTokens.RadiusIcon = 6.dp` vs 规范图「7」），保留 6dp 不另造 token。
+
+### 验证要点
+
+- 消息卡：浅蓝 CTA 底板 + 黑色「微信 · 进入会话」+ 蓝色 chevron；头像 40dp 圆角块；
+  标题 16sp SemiBold、时间 12sp 三级色；1dp 分割线；正文 14sp / 行高 20sp。
+- 音乐卡：封面 56dp 圆角 + 1dp 描边；进度条 4dp 轨道、未播放段浅灰 `#E9ECF2`、
+  13dp 圆点带白环；播放键 56dp 品牌圆（带品牌色投影）；四个次级图标 22dp / 48dp 热区。
+- 回归：两卡 morph 展开/收起动画一致；点卡片进会话 / 拉起音乐 App 不变；mini bar
+  hook 本轮未动（`[FlymeArk/miniBarStyle] styled: ...` 照常）；`[FlymeArk/glass] t.intercept`
+  不应出现（`REWRITE_SYSTEM_TINT` 仍 false）。
+
+- versionCode 69 / 3.15.46
+
 ## 2026-11-05 · v3.15.45 迷你条强制铺玻璃 + 空心圆可见性（设计包适配，不改架构）
 
 > 设计包 `IslandCapsuleUI` 已交付（zip 在本机）。按其中 `WindowBlurHelper` 的研判落地：

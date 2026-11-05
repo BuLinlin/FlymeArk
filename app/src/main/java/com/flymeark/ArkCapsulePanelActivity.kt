@@ -13,6 +13,7 @@ import android.content.IntentFilter
 import android.content.res.Configuration
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
+import android.graphics.Outline
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
@@ -22,6 +23,7 @@ import android.os.SystemClock
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.ImageView
@@ -137,6 +139,9 @@ class ArkCapsulePanelActivity : Activity() {
 
     /** v3.15.42：当前液态玻璃参数（morph 动画层创建时要用，早于 applyPalette 生效时序） */
     private lateinit var paletteGlass: GlassParams
+
+    /** v3.15.46：播放主按钮的品牌圆（自绘，见 ArkChipDrawable） */
+    private lateinit var playChip: ArkChipDrawable
 
     /** 最近一次点击 ❤ 的时间：既是点击锁，也是「锁定期内不采信推送旧状态」的依据 */
     private var lastFavAt = 0L
@@ -274,12 +279,27 @@ class ArkCapsulePanelActivity : Activity() {
         outputBtn = findViewById(R.id.panel_output)
         appIconView = findViewById(R.id.panel_app_icon)
 
+        // v3.15.46：播放主按钮的品牌圆用自绘 chip 承载（半径给足即被钳成圆形）。
+        // 原因见 ArkChipDrawable 类注释：系统深色模式会改写浅色 ShapeDrawable 的填充，
+        // setBackgroundTintList 覆写品牌色在真机上并不生效，自绘才稳定。
+        // 必须早于 applyPalette()：否则首帧品牌圆会停在默认色，等下一次配色才纠正。
+        playChip = ArkChipDrawable(
+            fillColor = ArkTokens.BRAND_LIGHT,
+            radiusPx = ArkTokens.MIN_TOUCH_DP * resources.displayMetrics.density,
+        )
+        playBtn.background = playChip
+
         // v3.15.42：多点采样背景亮度/复杂度 → 自动决定玻璃深浅与着色浓度
         nightMode =
             (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
         paletteGlass = ArkLiquidGlass.resolve(this, nightMode)
         applyPalette()
+
+        // v3.15.46：封面按设计稿 RadiusCover = 14dp 圆角裁切（纯绘制，不影响轮播位移逻辑）；
+        // 外框描边由 panel_cover_slot 的 bg_ark_cover_frame + 1dp padding 提供。
+        roundCover(coverA)
+        roundCover(coverB)
 
         // 点空白收起；点卡片跳转音乐 App（对齐系统媒体卡行为）
         root.setOnClickListener { dismiss() }
@@ -297,6 +317,22 @@ class ArkCapsulePanelActivity : Activity() {
 
         // v3.15.1：首帧就把收藏图标画出来（默认未收藏），不要等 SystemUI 推收藏状态
         updateFavIcon()
+    }
+
+    /**
+     * v3.15.46：把封面 ImageView 裁成 RadiusCover 圆角。
+     *
+     * 纯绘制属性（clipToOutline + 圆角 outline），不改测量、不改轮播的 translationX 逻辑；
+     * 描边由父容器 `panel_cover_slot` 的背景 drawable 提供，因此这里不再画边。
+     */
+    private fun roundCover(view: ImageView) {
+        val radius = ArkTokens.RADIUS_COVER_DP * resources.displayMetrics.density
+        view.clipToOutline = true
+        view.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(v: View, outline: Outline) {
+                outline.setRoundRect(0, 0, v.width, v.height, radius)
+            }
+        }
     }
 
     /** 右上角媒体 App 图标（v3.15：跟随 SystemUI 传来的真实播放 App；取不到则隐藏） */
@@ -596,12 +632,30 @@ class ArkCapsulePanelActivity : Activity() {
             if (favKnown && favState) albumColor ?: iconInk else iconInk
         )
 
-        // 播放器主按钮：品牌色圆形（bg_ark_play_btn.xml）直接生效，不再覆盖玻璃；
-        // 图标 tint 用品牌上文字色，保证压在品牌圆上可读（v3.15.44 回归修正 D1）
-        // 进度条轨道也吃玻璃 ink，避免死白/死黑
-        progressBar.trackColor = ArkLiquidGlass.ink(
-            if (p.light) ArkTokens.TRACK_LIGHT else ArkTokens.TRACK_DARK, p
-        )
+        // 播放器主按钮：品牌色圆形（自绘 ArkChipDrawable，半径给足被钳成圆），
+        // 图标 tint 用品牌上文字色，保证压在品牌圆上可读（v3.15.44 回归修正 D1）。
+        // v3.15.46：圆底色按 p.light 下发 —— values-night 的品牌色与壁纸采样结论
+        // 可能相反（系统夜间 + 亮壁纸），会出现「浅蓝圆 + 白色图标」的对比度塌陷。
+        if (this::playChip.isInitialized) {
+            playChip.setFill(if (p.light) ArkTokens.BRAND_LIGHT else ArkTokens.BRAND_DARK)
+        }
+        // v3.15.46（04 规范）：主按钮加品牌色投影。API 28+ 才能给阴影上色，
+        // 低版本退回默认阴影色；outline 用圆形，阴影才会跟着圆走。
+        playBtn.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(v: View, outline: Outline) {
+                outline.setOval(0, 0, v.width, v.height)
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            val brand = if (p.light) ArkTokens.BRAND_LIGHT else ArkTokens.BRAND_DARK
+            playBtn.outlineSpotShadowColor = brand
+            playBtn.outlineAmbientShadowColor = brand
+        }
+        playBtn.elevation = ArkTokens.PLAY_SHADOW_DP * resources.displayMetrics.density
+
+        // 进度条轨道色：v3.15.46 按 02 规范改用中性色（不再吃玻璃 ink 混色）
+        progressBar.trackColor =
+            if (p.light) ArkTokens.TRACK_NEUTRAL_LIGHT else ArkTokens.TRACK_NEUTRAL_DARK
     }
 
     // ------------------------------------------------------------------

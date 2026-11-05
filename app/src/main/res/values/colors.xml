@@ -14,8 +14,12 @@
     <!-- 品牌 / 轨道 / 分割线 -->
     <color name="ark_brand">#FF2F6BFF</color>
     <color name="ark_brand_on">#FFFFFFFF</color>
+    <color name="ark_brand_container">#FFE7EEFF</color>
     <color name="ark_track">#FFD9DEE7</color>
-    <color name="ark_divider">#FFE4E8EF</color>
+
+    <!-- v3.15.46：封面描边 token（设计稿 island_cover_frame.xml 的 #80FFFFFF，亮暗同值） -->
+    <!-- 封面 1dp 描边 = 设计稿 view/res/drawable/island_cover_frame.xml 的 #80FFFFFF -->
+    <color name="ark_cover_stroke">#80FFFFFF</color>
 
     <!-- 82% 玻璃：配合窗口背景模糊使用 -->
     <color name="ark_glass_top">#D1FDFEFF</color>

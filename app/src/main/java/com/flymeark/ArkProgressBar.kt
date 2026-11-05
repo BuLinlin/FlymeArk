@@ -32,8 +32,26 @@ class ArkProgressBar @JvmOverloads constructor(
     private val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFF7A2F.toInt() }
     private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFF7A2F.toInt() }
 
-    /** 滑块圆点半径（对齐系统媒体卡的 thumb 观感） */
-    private val thumbRadius = resources.displayMetrics.density * 5.5f
+    /** 拖拽圆点的白环（设计稿 02：13dp 圆点 + 3px 白环） */
+    private val thumbRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = 0xFFFFFFFF.toInt()
+    }
+
+    /** 拖拽圆点投影（硬件加速下 setShadowLayer 不保证生效，直接用一层半透明圆近似） */
+    private val thumbShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x33000000 }
+
+    /** 滑块圆点半径：设计稿 13dp 圆点 → 半径 6.5dp（v3.15.46） */
+    private val thumbRadius =
+        resources.displayMetrics.density * (ArkTokens.PROGRESS_THUMB_DP / 2f)
+
+    /** 白环宽度：设计稿写 3px，按 3x 屏折算 1dp（v3.15.46） */
+    private val thumbRingWidth =
+        resources.displayMetrics.density * ArkTokens.PROGRESS_THUMB_RING_DP
+
+    /** 进度线 / 轨道厚度：设计稿 ProgressHeight = 4dp（v3.15.46，原 3dp） */
+    private val trackHeightPx =
+        resources.displayMetrics.density * ArkTokens.PROGRESS_HEIGHT_DP
 
     private var colorAnim: ValueAnimator? = null
 
@@ -98,14 +116,22 @@ class ArkProgressBar @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         val cy = height / 2f
-        val h = (resources.displayMetrics.density * 3).coerceAtLeast(2f)
+        val h = trackHeightPx.coerceAtLeast(2f)
         val r = h / 2f
         canvas.drawRoundRect(0f, cy - h / 2, width.toFloat(), cy + h / 2, r, r, trackPaint)
         if (ratio > 0f) {
             canvas.drawRoundRect(0f, cy - h / 2, width * ratio, cy + h / 2, r, r, barPaint)
         }
-        // 滑块圆点：始终显示，拖到哪跟到哪（系统媒体卡样式）
-        canvas.drawCircle(width * ratio, cy, thumbRadius, thumbPaint)
+        // 滑块圆点：13dp 圆点 + 3px 白环 + 一层很淡的投影（设计稿 02）
+        val cx = width * ratio
+        val shadowDy = resources.displayMetrics.density * 0.5f
+        canvas.drawCircle(
+            cx, cy + shadowDy, thumbRadius + resources.displayMetrics.density,
+            thumbShadowPaint,
+        )
+        canvas.drawCircle(cx, cy, thumbRadius, thumbPaint)
+        thumbRingPaint.strokeWidth = thumbRingWidth
+        canvas.drawCircle(cx, cy, thumbRadius - thumbRingWidth / 2f, thumbRingPaint)
     }
 
     // ------------------------------------------------------------------

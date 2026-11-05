@@ -10,9 +10,11 @@ import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.Rating
 import android.media.session.MediaController
+import android.media.session.MediaSession
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.SystemClock
+import android.os.UserHandle
 import android.view.MotionEvent
 import android.view.View
 import de.robv.android.xposed.XC_MethodHook
@@ -62,6 +64,16 @@ internal object ArkLiveExpandHook {
         "com.flyme.statusbar.livenotification.LiveNotificationController"
     private const val CENTRAL_CLS = "com.android.systemui.statusbar.phone.CentralSurfacesImpl"
     private const val PANEL_ACTIVITY = "com.flymeark.ArkCapsulePanelActivity"
+
+    /**
+     * v3.15.49：系统媒体输出面板的广播入口。
+     * `com.android.systemui.media.dialog.MediaOutputDialogReceiver.onReceive()` 收这条广播，
+     * 读 `package_name` extra 后调 `MediaOutputDialogManager.createAndShow(...)`
+     * （接收器在 SystemUI manifest 里静态注册，`dumpsys package com.android.systemui` 可验）。
+     */
+    private const val ACTION_MEDIA_OUTPUT_DIALOG =
+        "com.android.systemui.action.LAUNCH_MEDIA_OUTPUT_DIALOG"
+    private const val EXTRA_OUTPUT_PACKAGE_NAME = "package_name"
 
     /** 点击最长按压时长 */
     private const val TAP_TIMEOUT_MS = 420L
@@ -1495,14 +1507,109 @@ internal object ArkLiveExpandHook {
     // SystemUI 进程内可调用；系统媒体卡的输出切换就是这套 API）
     // ------------------------------------------------------------------
 
-    /** 面板请求输出路由列表 → 回广播给面板弹窗 */
+    /**
+     * 面板点「输出」→ **直接拉起系统自己的 MediaOutputDialog**（v3.15.49）。
+     *
+     * ## 为什么不再自己画
+     *
+     * v3.15.0 起的做法是「反射 `MediaRouter2Manager` 列路由 → 回广播 → 面板用
+     * `AlertDialog.Builder.setSingleChoiceItems` 弹一个 DeviceDefault 主题的列表」。
+     * 那是**我们自建的第二个对话框**：外观、动效、当前路由高亮、投屏组管理全跟 Flyme
+     * 通知栏媒体卡的输出面板不一样，用户一眼就看出是两个东西。
+     *
+     * 系统其实留了入口：`com.android.systemui.media.dialog.MediaOutputDialogReceiver`
+     * 在 manifest 里注册了 `com.android.systemui.action.LAUNCH_MEDIA_OUTPUT_DIALOG`
+     * （`dumpsys package com.android.systemui` 实证可见），onReceive 里读
+     * `package_name` extra 后调 `MediaOutputDialogManager.createAndShow(...)`。
+     * 也就是说**发一条广播，系统就用它自己的那份实现弹面板**——与通知栏媒体卡同源，
+     * 天然一致，且切换设备、投屏组等逻辑全部复用系统代码。
+     *
+     * ## 三级降级
+     *
+     * ① 广播（首选，`queryBroadcastReceivers` 先确认接收器存在再发）；
+     * ② 广播不可用 → 反射 `Dependency.get(MediaOutputDialogManager::class)` 直接
+     *    `createAndShow(pkg, false, null, null, null, null, false, false)`；
+     * ③ 两者都失败 → 退回 v3.15 的「列路由 → 回 [ArkConstants.ACTION_OUTPUT_ROUTES]」，
+     *    面板侧的自绘弹窗保持原样不动，作为最后兜底。
+     *
+     * ①② 成功时**不再回广播**，所以 App 侧 `showRouteDialog()` 不会弹 —— 不会出现两层对话框。
+     */
     fun outputRoutes(ctx: Context?) {
         val c = ctx ?: return
+        val pkg = currentPkg ?: run {
+            XposedBridge.log("$TAG: output skipped (no media app)")
+            return
+        }
         try {
-            val pkg = currentPkg ?: run {
-                XposedBridge.log("$TAG: output routes skipped (no media app)")
+            if (launchSystemOutputDialog(c, pkg)) {
+                XposedBridge.log("$TAG: output → system dialog, pkg=$pkg")
                 return
             }
+            XposedBridge.log("$TAG: output broadcast unavailable, try reflect")
+            if (launchSystemOutputDialogReflect(pkg)) {
+                XposedBridge.log("$TAG: output → system dialog (reflect), pkg=$pkg")
+                return
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: system output dialog failed: ${t.message}")
+        }
+        XposedBridge.log("$TAG: output → fallback app dialog, pkg=$pkg")
+        replyLegacyRoutes(c, pkg)
+    }
+
+    /** ① 广播拉起系统面板；接收器不存在就返回 false，避免发一条没人收的广播 */
+    private fun launchSystemOutputDialog(ctx: Context, pkg: String): Boolean {
+        val intent = Intent(ACTION_MEDIA_OUTPUT_DIALOG).apply {
+            setPackage(ArkConstants.SYSTEMUI_PKG)
+            putExtra(EXTRA_OUTPUT_PACKAGE_NAME, pkg)
+        }
+        val receivers = try {
+            ctx.packageManager.queryBroadcastReceivers(intent, 0)
+        } catch (_: Throwable) {
+            null
+        }
+        if (receivers.isNullOrEmpty()) return false
+        ctx.sendBroadcast(intent)
+        return true
+    }
+
+    /**
+     * ② 反射兜底：`com.android.systemui.Dependency.get(Class)` 取单例后直接调
+     * `createAndShow(pkg, aboveStatusBar=false, view=null, user=null, token=null,
+     * qsHost=null, isCollapsed=false, isProviderAllowed=false)`。
+     */
+    private fun launchSystemOutputDialogReflect(pkg: String): Boolean = try {
+        val mgrCls = Class.forName("com.android.systemui.media.dialog.MediaOutputDialogManager")
+        val dependencyCls = Class.forName("com.android.systemui.Dependency")
+        val mgr = dependencyCls.getMethod("get", Class::class.java).invoke(null, mgrCls)
+        if (mgr == null) {
+            false
+        } else {
+            val qsHostCls = Class.forName("com.android.systemui.qs.QSHost")
+            mgrCls.getMethod(
+                "createAndShow",
+                String::class.java,
+                java.lang.Boolean.TYPE,
+                View::class.java,
+                UserHandle::class.java,
+                MediaSession.Token::class.java,
+                qsHostCls,
+                java.lang.Boolean.TYPE,
+                java.lang.Boolean.TYPE,
+            ).invoke(mgr, pkg, false, null, null, null, null, false, false)
+            true
+        }
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: reflect output dialog failed: ${t.message}")
+        false
+    }
+
+    /**
+     * ③ 最后兜底（v3.15 原路径）：列路由 → 回广播给面板自绘弹窗。
+     * 保留原样不执行，只有 ①② 都不可用时才走。
+     */
+    private fun replyLegacyRoutes(c: Context, pkg: String) {
+        try {
             val routes = reflectRoutes(c, pkg) ?: run {
                 XposedBridge.log("$TAG: output routes reflect failed")
                 return
@@ -1522,7 +1629,7 @@ internal object ArkLiveExpandHook {
             c.sendBroadcast(intent)
             XposedBridge.log("$TAG: output routes -> ${sorted.map { it.first }} selected=$selectedIndex")
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: outputRoutes failed: ${t.message}")
+            XposedBridge.log("$TAG: replyLegacyRoutes failed: ${t.message}")
         }
     }
 

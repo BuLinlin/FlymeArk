@@ -52,6 +52,17 @@ class ArkMessagePanelActivity : Activity() {
     private lateinit var dotView: View
     private lateinit var appIconView: ImageView
 
+    /** v3.15.46：CTA 底板 / chevron（按 p.light 运行时下发，见 applyPalette） */
+    private lateinit var ctaView: View
+    private lateinit var chevronView: ImageView
+
+    /**
+     * v3.15.46：CTA 底板用自绘 [ArkChipDrawable]。
+     * 系统深色模式会把浅色 ShapeDrawable / ColorDrawable 反色（实测 #FFE7EEFF → #FF171102），
+     * 自绘 Drawable 不受影响，才能保证「浅底 + 深字」始终成对出现。
+     */
+    private lateinit var ctaChip: ArkChipDrawable
+
     private lateinit var morph: ArkMorphAnim
 
     private val handler = Handler(Looper.getMainLooper())
@@ -107,6 +118,25 @@ class ArkMessagePanelActivity : Activity() {
         hintView = findViewById(R.id.msg_hint)
         dotView = findViewById(R.id.msg_dot)
         appIconView = findViewById(R.id.msg_app_icon)
+        ctaView = findViewById(R.id.msg_cta)
+        chevronView = findViewById(R.id.msg_chevron)
+
+        // v3.15.50：时间「刚刚」加 12% 二级色**全圆角**胶囊底（设计稿 rgba(78,87,102,0.12)）。
+        // 用 ArkChipDrawable 的 pill 模式（bounds 变化时按短边一半重算半径），
+        // 而不是新加一个 shape 资源 —— 与 CTA 底板走同一套自绘，绕开 Flyme 深色模式下
+        // framework 形状 drawable 被反色的问题。
+        timeView.background = ArkChipDrawable(
+            fillColor = ArkTokens.TIME_CHIP_FILL,
+            radiusPx = 0f,
+        ).apply { pill = true }
+
+        // v3.15.46：CTA 底板用自绘圆角 chip（原因见 ArkChipDrawable 的类注释）：
+        // 填充 = brandContainer @60%（设计稿 `copy(alpha = 0.6f)`），无描边。
+        ctaChip = ArkChipDrawable(
+            fillColor = ArkTokens.BRAND_CONTAINER_FILL_LIGHT,
+            radiusPx = ArkTokens.RADIUS_CHIP_DP * resources.displayMetrics.density,
+        )
+        ctaView.background = ctaChip
 
         nightMode =
             (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
@@ -131,12 +161,26 @@ class ArkMessagePanelActivity : Activity() {
         timeView.visibility = if (postAt <= 0L) View.GONE else View.VISIBLE
 
         brandColor = i.getIntExtra(ArkConstants.EXTRA_MSG_BRAND, brandColor)
-        dotView.background = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
+        // v3.15.46：CTA 品牌圆点的颜色改由 applyPalette() 统一按品牌 token 下发
+        // （原逻辑用通知里的 App 主色，浅色 App 主色压在 brandContainer@60% 底上会不可见）。
+        // 头像占位块仍用 App 主色，保证取不到头像时也能区分来源应用。
+
+        // 头像：v3.15.46 按设计稿改成 40dp + RadiusChip(10dp) 圆角块（原 54dp 正圆），
+        // 位图同样按 10dp 圆角裁切；底色用通知里的 App 主色，解码失败时至少有色块不空洞。
+        val avatarRadius = ArkTokens.RADIUS_CHIP_DP * resources.displayMetrics.density
+        avatarView.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = avatarRadius
             setColor(brandColor)
         }
+        avatarView.clipToOutline = true
+        avatarView.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                outline.setRoundRect(0, 0, view.width, view.height, avatarRadius)
+            }
+        }
 
-        // 头像：圆形裁剪 + 品牌色底（Icon 解码失败时至少有色块不空洞）
+        // 头像位图（SystemUI 侧解码后随 Intent 带来；本进程没有读通知权限）
         val avatar: Bitmap? =
             if (android.os.Build.VERSION.SDK_INT >= 33) {
                 i.getParcelableExtra(ArkConstants.EXTRA_MSG_AVATAR, Bitmap::class.java)
@@ -144,19 +188,8 @@ class ArkMessagePanelActivity : Activity() {
                 @Suppress("DEPRECATION")
                 i.getParcelableExtra(ArkConstants.EXTRA_MSG_AVATAR)
             }
-        avatarView.background = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(brandColor)
-        }
         if (avatar != null) {
             avatarView.setImageBitmap(avatar)
-            // 方形位图裁成圆形：圆形 outline + clipToOutline
-            avatarView.clipToOutline = true
-            avatarView.outlineProvider = object : ViewOutlineProvider() {
-                override fun getOutline(view: View, outline: Outline) {
-                    outline.setOval(0, 0, view.width, view.height)
-                }
-            }
         }
 
         // 右上角应用图标
@@ -207,16 +240,47 @@ class ArkMessagePanelActivity : Activity() {
 
         // v3.15.44：文字基色统一取 IslandTokens 三级语义色（ArkTokens 镜像），
         // 分支仍按 p.light，第 6 层 ink() 混色与 6 层结构不变。
+        // v3.15.46：按设计稿 NotificationCapsule 重排层级 ——
+        // 标题 = 一级、时间 = 三级（caption）、正文 = 一级、底部 CTA 文案 = 一级
+        // （原 CTA 文案是三级 11sp，对比度与层级都偏弱）。
         val title = if (p.light) ArkTokens.TEXT_PRIMARY_LIGHT else ArkTokens.TEXT_PRIMARY_DARK
-        val sub = if (p.light) ArkTokens.TEXT_SECONDARY_LIGHT else ArkTokens.TEXT_SECONDARY_DARK
+        val caption = if (p.light) ArkTokens.TEXT_TERTIARY_LIGHT else ArkTokens.TEXT_TERTIARY_DARK
         val body = title
-        val hint = if (p.light) ArkTokens.TEXT_TERTIARY_LIGHT else ArkTokens.TEXT_TERTIARY_DARK
+        val hint = title
 
         titleView.setTextColor(ArkLiquidGlass.ink(title, p))
-        timeView.setTextColor(ArkLiquidGlass.ink(sub, p))
+        timeView.setTextColor(ArkLiquidGlass.ink(caption, p))
         textView.setTextColor(ArkLiquidGlass.ink(body, p))
         hintView.setTextColor(ArkLiquidGlass.ink(hint, p))
-        appIconView.imageTintList = ColorStateList.valueOf(ArkLiquidGlass.ink(sub, p))
+
+        // v3.15.46：右上角应用图标不再整体染色（统一 tint 会把彩色 App 图标压成一块深色方块，
+        // 既认不出是微信还是 QQ，也和音乐卡的「原生图标」不一致）；图标本身在 96% 玻璃上已足够清晰。
+
+        // v3.15.46：CTA 品牌圆点走设计稿品牌 token（浅 #2F6BFF / 暗 #8FB0FF）
+        if (this::dotView.isInitialized) {
+            dotView.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (p.light) ArkTokens.BRAND_LIGHT else ArkTokens.BRAND_DARK)
+            }
+        }
+
+        // v3.15.46：CTA 描边色 / chevron 一律按 p.light（壁纸采样结论）运行时下发，
+        // 不吃 values-night 资源 —— 否则「系统夜间 + 亮壁纸」时会错配成
+        // 浅蓝描边压浅玻璃。布局里的 ic_ark_chevron 只作首帧占位。
+        // v3.15.46：CTA 底板 = brandContainer @60%，按 p.light 下发（浅 #99E7EEFF / 深 #9923304C）。
+        // 已知边界：系统深色模式下 Flyme 会把浅色实心底板反色（#FFE7EEFF → #FF171102），
+        // 此时深色文字压在近黑底上对比度不足 —— 本轮以「对齐设计稿」为先，接受该边界并记录。
+        if (this::ctaChip.isInitialized) {
+            ctaChip.setFill(
+                if (p.light) ArkTokens.BRAND_CONTAINER_FILL_LIGHT
+                else ArkTokens.BRAND_CONTAINER_FILL_DARK
+            )
+        }
+        if (this::chevronView.isInitialized) {
+            chevronView.imageTintList = ColorStateList.valueOf(
+                if (p.light) ArkTokens.BRAND_LIGHT else ArkTokens.BRAND_DARK
+            )
+        }
     }
 
     /** 点卡片 → 发送原通知的 contentIntent（进会话）→ 收起 */

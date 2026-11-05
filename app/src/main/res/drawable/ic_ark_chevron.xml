@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.46：CTA 右侧的 chevron（对齐设计稿 Icons.Rounded.ChevronRight）。
+    填充色直接取品牌 token @color/ark_brand（亮 #2F6BFF / 暗 #8FB0FF），
+    运行时不需要再做 tint，也不引入任何魔法色值。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="@color/ark_brand"
+        android:pathData="M9.29,6.71c-0.39,0.39 -0.39,1.02 0,1.41L13.17,12l-3.88,3.88c-0.39,0.39 -0.39,1.02 0,1.41s1.02,0.39 1.41,0l4.59,-4.59c0.39,-0.39 0.39,-1.02 0,-1.41L10.7,6.71c-0.39,-0.39 -1.02,-0.39 -1.41,0z" />
+</vector>

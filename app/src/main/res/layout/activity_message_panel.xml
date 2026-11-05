@@ -1,11 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   v3.15.39：点击消息胶囊展开的消息大卡。
+  v3.15.46：按设计包 `NotificationCapsule.kt` + `IslandComponents.kt` 校准视觉
+  （圆角 / 间距 / 字号 / 色阶层级 / chip 形状），**不动**任何业务逻辑与动画几何。
 
-  结构与 activity_capsule_panel 完全同构（panel_root / panel_card / panel_content
+  结构与 activity_capsule_panel 完全同构（msg_root / msg_card / msg_content
   三层），为的是复用 ArkMorphAnim 的「胶囊长大成卡片」动画：
-   - panel_card 只负责背景与尺寸插值（圆角 30dp 玻璃卡）
-   - panel_content 固定最终尺寸，动画中只做 alpha，超出部分被 clip 掉
+   - msg_card 只负责背景与尺寸插值（终态圆角 28dp 玻璃卡）
+   - msg_content 固定最终尺寸，动画中只做 alpha，超出部分被 clip 掉
+
+  设计稿映射（4dp 栅格）：
+   - 内容内边距 S4 = 16dp（原 18dp 上边距收敛到栅格）
+   - 头像 Avatar = 40dp，圆角 RadiusChip = 10dp（原 54dp 正圆）
+   - 头像 → 文字 S3 = 12dp；标题 TypeTitle = 16sp SemiBold；时间 TypeCaption = 12sp 三级色
+   - v3.15.50：删除头部与正文之间的 1dp 分割线，净间距仍为 S3 = 12dp；
+     时间加 12% 二级色胶囊底（全圆角，padding 8/2dp），宽度 wrap_content 靠左
+   - 正文 TypeBody = 14sp，行高 20sp（14sp + 6sp lineSpacingExtra）
+   - 底部 CTA：48dp 最小触控 + RadiusChip 10dp 圆角 + brandContainer@60% 底，
+     品牌圆点 8dp + 14sp 一级色文案 + 20dp chevron
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/msg_root"
@@ -31,9 +43,9 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:paddingHorizontal="16dp"
-            android:paddingTop="18dp"
-            android:paddingBottom="16dp">
+            android:paddingHorizontal="@dimen/ark_space_16"
+            android:paddingTop="@dimen/ark_space_16"
+            android:paddingBottom="@dimen/ark_space_16">
 
             <!-- 头部：发送者头像 + 名称/时间 + 右上角应用图标 -->
             <LinearLayout
@@ -44,75 +56,98 @@
 
                 <ImageView
                     android:id="@+id/msg_avatar"
-                    android:layout_width="54dp"
-                    android:layout_height="54dp"
+                    android:layout_width="@dimen/ark_avatar"
+                    android:layout_height="@dimen/ark_avatar"
                     android:contentDescription="@string/ark_msg_avatar"
                     android:scaleType="centerCrop" />
 
                 <LinearLayout
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="14dp"
+                    android:layout_marginStart="@dimen/ark_space_12"
                     android:layout_weight="1"
                     android:orientation="vertical">
 
                     <TextView
                         android:id="@+id/msg_title"
-                        style="@style/ArkPanelTitle"
+                        style="@style/ArkPanelTitleSmall"
                         android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:textSize="17sp" />
+                        android:layout_height="wrap_content" />
 
+                    <!--
+                      v3.15.50：时间「刚刚」加 12% 二级色胶囊底（设计稿 rgba(78,87,102,0.12)）。
+                      宽度必须 wrap_content + layout_gravity=start，否则 match_parent 会把
+                      胶囊撑满整行；底色 / 全圆角由 ArkChipDrawable(pill) 在运行时下发。
+                    -->
                     <TextView
                         android:id="@+id/msg_time"
-                        style="@style/ArkPanelSubtitle"
-                        android:layout_width="match_parent"
+                        style="@style/ArkPanelTime"
+                        android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="2dp"
-                        android:textSize="12sp" />
+                        android:layout_gravity="start"
+                        android:layout_marginTop="@dimen/ark_space_4"
+                        android:paddingHorizontal="@dimen/ark_space_8"
+                        android:paddingVertical="@dimen/ark_space_2" />
                 </LinearLayout>
 
                 <ImageView
                     android:id="@+id/msg_app_icon"
                     android:layout_width="18dp"
                     android:layout_height="18dp"
-                    android:layout_marginStart="10dp"
+                    android:layout_marginStart="@dimen/ark_space_8"
                     android:contentDescription="@string/ark_msg_app"
                     android:scaleType="fitCenter" />
             </LinearLayout>
 
-            <!-- 正文 -->
+            <!--
+              正文。v3.15.50：原来这里上面还有一条 1dp 分割线（上下各 12dp），
+              用户认为多余，已删除；净间距仍保持设计稿的 S3 = 12dp。
+            -->
             <TextView
                 android:id="@+id/msg_text"
+                style="@style/ArkPanelBody"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="14dp"
-                android:lineSpacingMultiplier="1.25"
-                android:maxLines="6"
-                android:ellipsize="end"
-                android:textColor="#E6FFFFFF"
-                android:textSize="15sp" />
+                android:layout_marginTop="@dimen/ark_space_12" />
 
-            <!-- 底部：品牌色圆点 + 应用名·进入会话提示 -->
+            <!--
+              底部 CTA：品牌色圆点 + 应用名 · 进入会话 + chevron（整卡点击仍由 msg_card 处理）。
+              v3.15.46：设计稿这里是 brandContainer@60% 的实心 chip；实测 Flyme 深色模式
+              会把这类浅色实心背景反色（#FFE7EEFF → #FF171102），深色文字随之不可读，
+              所以改为「品牌色 1dp 描边 chip + 透明底」（见 ArkChipDrawable），
+              48dp 最小触控、10dp chip 圆角、14sp Medium 一级色文案保持设计值。
+            -->
             <LinearLayout
+                android:id="@+id/msg_cta"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
+                android:layout_marginTop="@dimen/ark_space_12"
                 android:gravity="center_vertical"
-                android:orientation="horizontal">
+                android:minHeight="@dimen/ark_touch"
+                android:orientation="horizontal"
+                android:paddingHorizontal="@dimen/ark_space_12">
 
                 <View
                     android:id="@+id/msg_dot"
-                    android:layout_width="8dp"
-                    android:layout_height="8dp" />
+                    android:layout_width="@dimen/ark_space_8"
+                    android:layout_height="@dimen/ark_space_8" />
 
                 <TextView
                     android:id="@+id/msg_hint"
-                    android:layout_width="wrap_content"
+                    style="@style/ArkPanelCta"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:textSize="11sp"
-                    android:textColor="#8AFFFFFF" />
+                    android:layout_marginStart="@dimen/ark_space_8"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/msg_chevron"
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:layout_marginStart="@dimen/ark_space_4"
+                    android:importantForAccessibility="no"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_ark_chevron" />
             </LinearLayout>
         </LinearLayout>
     </FrameLayout>
