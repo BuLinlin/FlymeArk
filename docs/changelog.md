@@ -2,6 +2,65 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.20 副显示位修复 + 消息胶囊滑动销毁
+
+### 一、副显示位胶囊「消失」的真正根因（音乐胶囊共存问题）
+
+上一版遗留的「存在消息胶囊时音乐胶囊不显示」，与「多条消息第二个胶囊空白」
+是**同一个根因**，且比之前判断的更严重 —— 不是文字空白，是整条胶囊塌缩：
+
+`LiveNotificationView` 的渲染逻辑：
+
+```java
+if (showType == 1 || showType == 6)  setText(info.getTopDisplayText());  // 副位
+else                                  setText(info.getShowText());       // 主位
+```
+
+`topDisplayText` 是全局共享值，只有 `mNotificationEntries.isEmpty()`（无任何通知）
+时才填歌词行，否则恒为空串。而 `getShowWidth()` 在 `showType ∉ {0,4,5}` 时
+**用 mTopDisplayText 算宽度** → 空串宽度 0 → 副位胶囊整体塌缩不可见。
+
+Flyme 的胶囊只有一个主显示位：第 1 条 live 通知占 `mDisplayNotificationInfo`，
+第 2 条进 `mShadeNotificationInfo`（showType=1），音乐胶囊由
+`getTopLyricsDisplayText` 在末尾补进 —— 消息占主位时音乐只能进副位，
+于是被「宽度 0」吞掉。
+
+### 二、修复：`ArkMessageLiveTextHook` 重写为 `ArkLiveShadeTextHook`
+
+只 hook 一个 getter：`LiveNotificationInfo.getTopDisplayText()` ——
+返回 null/空串时回退该 info 自己的 `getShowText()`：
+
+- 副位消息胶囊 → 显示自己的消息正文
+- 副位音乐胶囊 → 显示自己的歌词行
+- 无通知时行为不变（歌词仍是歌词）
+
+不再强改 showType 1→0（旧方案会破坏 `makeShadeVisible`/进度条/副位布局语义）。
+日志带防重（同一 pkg+内容只打一次）。装机日志已确认生效：
+`liveShadeText: topDisplayText empty → fallback showText for com.tencent.mobileqq: '头号调皮鬼: ...'`。
+
+### 三、消息胶囊滑动销毁（`ArkLiveSwipeDismissHook`，新增）
+
+真机反编译确认 Flyme 原生胶囊**没有滑动手势**：
+`LiveNotificationClickHelper.handleTouchEvent` 只判断落点用于拦截下拉，
+`PhoneStatusBarViewController` 在 UP 时固定走 `onLiveNotificationClick(null)`。
+
+hook `LiveNotificationController.handleOnTouchEvent` 实现手势（仅微信/QQ）：
+
+- DOWN：落点在胶囊矩形内记录起点 + 当前通知 key（用与原生相同的 `hitTest`）
+- MOVE：水平位移 > 24dp 且横向占优 → 跟手位移 + 淡出反馈，吞事件（不触发下拉）
+- UP：位移 > 80dp → 朝该方向滑出并清除对应通知；否则弹回
+
+清通知走 SystemUI 删通知的同一条路：反射 `IStatusBarService.onNotificationClear`
+（`NotifCollection.lambda$dismissNotifications$1` 同款调用），SystemUI 无权限直接
+cancel 别人通知。音乐胶囊不启用滑动（避免误清播放通知）。
+
+### 四、验证
+
+- 编译通过，装机，kill 重启 SystemUI（未整机重启）。
+- 待真机验证：①消息 + 音乐胶囊共存显示 ②横向滑动销毁消息胶囊。
+
+---
+
 ## 2026-11-05 · v3.15.19 消息胶囊配色改为固定品牌色
 
 ### 一、底色变黑 + 头像消失（v3.15.18 魅况配方引入的两个回归）
