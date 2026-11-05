@@ -238,44 +238,90 @@ internal object ArkLiveShowFixHook {
     }
 
     /**
-     * 淡出结束后的补写检查。只有同时满足这些条件才动手，避免和系统自己的更新打架：
-     * ① 控制器当前要显示的确实是微信/QQ 的实况；
-     * ② 胶囊 view 正在显示（不是 GONE）；
-     * ③ 文字是空的（正常显示时绝不多手）。
+     * 淡出结束后的补写检查。**每次都打状态日志**——v3.15.36 的 reapply 有四个静默
+     * guard，一条日志都没出，完全无法定位；这里宁可多打。
+     *
+     * 修复条件（满足任一即动手）：
+     * ① 文字为空；
+     * ② 胶囊没展开（mLinearIconText 宽度 ≤ 图标宽度，即用户看到的"图标宽空壳"）；
+     * ③ 文字 view 不可见（alpha < 0.95 或宽度为 0）。
      */
     private fun reapply(ctrl: Any) {
         try {
-            val info = XposedHelpers.getObjectField(ctrl, "mDisplayNotificationInfo") ?: return
-            val pkg = XposedHelpers.callMethod(info, "getPackageName") as? String ?: return
-            if (!ArkConstants.isMessageLiveApp(pkg)) return
+            val info = XposedHelpers.getObjectField(ctrl, "mDisplayNotificationInfo")
+            if (info == null) {
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG reapply skip: info=null")
+                return
+            }
+            val pkg = XposedHelpers.callMethod(info, "getPackageName") as? String
+            if (pkg == null || !ArkConstants.isMessageLiveApp(pkg)) {
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG reapply skip: pkg=$pkg")
+                return
+            }
 
             val view =
                 XposedHelpers.getObjectField(ctrl, "mLiveNotificationDisplay") as? View ?: return
-            if (view.visibility == View.GONE) return
-
             val tv =
                 XposedHelpers.getObjectField(view, "mLiveNotificationText") as? TextView
+            val lin = XposedHelpers.getObjectField(view, "mLinearIconText") as? View
             val text = tv?.text?.toString()
-            if (!text.isNullOrBlank()) return // 系统已经写好了，不动
-
+            val tvW = tv?.width ?: -1
+            val tvA = tv?.alpha ?: -1f
+            val linW = lin?.layoutParams?.width ?: -1
+            val iconW = try {
+                XposedHelpers.getIntField(view, "mLiveNotificationIconWidth")
+            } catch (_: Throwable) {
+                -1
+            }
+            val key = try {
+                XposedHelpers.callMethod(view, "getNotificationKey") as? String
+            } catch (_: Throwable) {
+                null
+            }
             val infoKey = try {
                 XposedHelpers.callMethod(info, "getNotificationKey") as? String
             } catch (_: Throwable) {
                 null
             }
-            XposedHelpers.callMethod(view, "setLiveNotificationInfo", info, false)
-            if (tv != null && tv.alpha != 1f) tv.alpha = 1f
-
-            val linW = try {
-                val lin = XposedHelpers.getObjectField(view, "mLinearIconText") as? View
-                lin?.layoutParams?.width
+            // 测量探针：定位"宽度算出来是 0"到底是不是 Paint 没初始化
+            val paintW = try {
+                val p = XposedHelpers.getObjectField(
+                    view, "mPaintForCalculateTextWidth"
+                ) as? android.text.TextPaint
+                if (p != null && !text.isNullOrBlank()) p.measureText(text).toInt() else -1
             } catch (_: Throwable) {
-                null
+                -1
             }
-            XposedBridge.log(
-                "[${ArkConstants.LOG_TAG}] $TAG reapply: pkg=$pkg key=$infoKey " +
-                    "text='${text ?: "null"}' tvW=${tv?.width} tvA=${tv?.alpha} linW=$linW"
-            )
+
+            val state = "pkg=$pkg vis=${view.visibility} text='${text ?: "null"}' " +
+                "tvW=$tvW tvA=$tvA linW=$linW iconW=$iconW paintW=$paintW key=$key infoKey=$infoKey"
+
+            if (view.visibility == View.GONE) {
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG reapply skip(GONE): $state")
+                return
+            }
+
+            val collapsed = iconW > 0 && linW in 0..(iconW + 8)
+            val needs = text.isNullOrBlank() || collapsed ||
+                (tv != null && (tv.alpha < 0.95f || tv.width <= 0))
+            if (!needs) {
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG reapply ok: $state")
+                return
+            }
+
+            // 先把尺寸/Paint 参数初始化一遍（setViewParam 正常只调一次，幂等），
+            // 否则宽度测量可能拿到的还是未初始化的 Paint
+            try {
+                XposedHelpers.callMethod(view, "setViewParam")
+            } catch (t: Throwable) {
+                XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG setViewParam failed: ${t.message}")
+            }
+            XposedHelpers.callMethod(view, "setLiveNotificationInfo", info, false)
+            if (tv != null) {
+                if (tv.alpha != 1f) tv.alpha = 1f
+                if (tv.visibility != View.VISIBLE) tv.visibility = View.VISIBLE
+            }
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG reapply FIX: $state")
         } catch (t: Throwable) {
             XposedBridge.log(
                 "[${ArkConstants.LOG_TAG}] $TAG reapply error: ${Log.getStackTraceString(t)}"
