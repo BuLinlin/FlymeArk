@@ -80,6 +80,10 @@ internal object ArkLiquidGlass {
     }
 
     /**
+     * v3.15.44：色值统一取自 [ArkTokens]（IslandTokens 的 Kotlin 镜像）。
+     * 只改常量色值 / 投影尺寸 / 不透明度分档；25 点采样、深浅浓度区间、
+     * 自动模式判定与 6 层结构一律不变。
+     *
      * @param nightFallback 采样完全失败时使用的系统夜间模式判定
      */
     fun resolve(ctx: Context, nightFallback: Boolean): GlassParams {
@@ -89,8 +93,9 @@ internal object ArkLiquidGlass {
         val s = sample(ctx)
         val luma = s?.luma ?: if (nightFallback) 0.18f else 0.82f
         val complexity = s?.complexity ?: 0.5f
+        // v3.15.44：兜底环境色对齐 IslandTokens 中性基底（浅 #EFF3F8 / 深 #1B2029）
         val ambient = s?.rgb
-            ?: if (nightFallback) 0xFF1B1B20.toInt() else 0xFFF2F3F6.toInt()
+            ?: if (nightFallback) ArkTokens.NEUTRAL_DARK else ArkTokens.NEUTRAL_LIGHT
 
         val light = if (s != null) {
             if (AUTO_LIGHT_ON_DARK) luma < 0.5f else luma >= 0.5f
@@ -106,7 +111,8 @@ internal object ArkLiquidGlass {
 
         val p = GlassParams(
             light = light,
-            tintRgb = if (light) 0xFFFFFF else Color.rgb(20, 20, 24),
+            // v3.15.44：着色层 RGB 取玻璃渐变端点色；浓度区间 6%–22% / 16%–38% 不变
+            tintRgb = if (light) ArkTokens.GLASS_TOP_RGB_LIGHT else ArkTokens.GLASS_BOTTOM_RGB_DARK,
             tintAlpha = lo + (hi - lo) * complexity,
             ambientRgb = ambient and 0x00FFFFFF,
             ambientLuma = luma,
@@ -117,8 +123,9 @@ internal object ArkLiquidGlass {
             edgePx = edge,
             edgeShift = edge * EDGE_SHIFT_RATIO,
             dispersion = DISPERSION,
-            shadowDp = if (light) 14f else 18f,
-            strokeRgb = if (light) 0x1F000000.toInt() else 0x24FFFFFF.toInt(),
+            // v3.15.44：投影 18dp、描边取 IslandTokens 高光色
+            shadowDp = ArkTokens.ELEVATION_DP.toFloat(),
+            strokeRgb = if (light) ArkTokens.HIGHLIGHT_LIGHT else ArkTokens.HIGHLIGHT_DARK,
         )
         cached = SystemClock.elapsedRealtime() to p
         return p

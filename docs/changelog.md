@@ -2,6 +2,116 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.44 样式对齐 IslandTokens（只迁移视觉 token）
+
+> 本节是**实现约定**，先于代码。用户澄清：「顶部」指实况通知**迷你条**（左边「微信」黑字 +
+> 右边空心圆、半透明磨砂横条），不是下拉栏媒体卡。上一版「媒体卡边缘光」方向整体作废。
+
+### 来源与边界（只调样式，不做功能）
+
+设计稿在本机 `C:/Users/1/WorkBuddy/2026-11-05-14-04-34/IslandCapsuleUI/`：
+
+| 用途 | 文件 |
+|---|---|
+| 唯一令牌源 | `compose/IslandTokens.kt` |
+| View 版亮/暗色值 | `view/res/values/island_tokens.xml`、`view/res/values-night/island_tokens.xml` |
+| 玻璃形状 | `view/res/drawable/island_glass_bg.xml`、`island_glass_bg_opaque.xml`、`island_pill_bg.xml` |
+| 玻璃 Drawable 思路 | `view/IslandGlassDrawable.kt` |
+| 迷你条组件 | `compose/MiniCapsule.kt`（文件头注明「对应原图『微信 + 空心圆』」） |
+| 降级结论 | `compose/IslandTheme.kt` / `compose/WindowBlurHelper.kt` |
+
+**边界**：设计稿是「自建胶囊 UI」方案，与本工程铁律（只 hook 播放器与 SystemUI、不自建胶囊、
+不发通知、无常驻进程）冲突。本轮**只搬视觉 token**，不并入任何代码、不引入 Compose 依赖、
+不新建 View / 窗口 / 布局、不拷贝 `IslandMusicCapsuleView` / `island_music_capsule.xml`、
+不改任何现有 hook 的业务逻辑与动画。设计稿里「空心圆 → 应用图标 + 未读徽标 + 展开箭头」
+属于结构改动，超范围，空心圆保持原样，只规范其颜色。用户转告的两个待改项
+（`import com.ark.island.R`、`android.R.drawable` 占位图标）同样不在本轮范围。
+
+### 亮 / 暗 / 降级 token 对照（唯一数值来源，不另创第二套）
+
+| token | 亮色 | 暗色 |
+|---|---|---|
+| 玻璃渐变顶（angle 270） | `#D1FDFEFF`（82%） | `#DB2A303B`（86%） |
+| 玻璃渐变底 | `#D1EFF3F8` | `#DB1B2029` |
+| 降级顶 / 底（无模糊 / 高对比，96%） | `#F5FDFEFF` / `#F5EFF3F8` | `#F52A303B` / `#F51B2029` |
+| 1dp 高光描边 | `#66FFFFFF`（View 版简化） | `#30FFFFFF` |
+| 文字一级 / 二级 / 三级 | `#161A22` / `#4E5766` / `#5B6472` | `#F4F6FA` / `#C3CAD6` / `#AAB3C2` |
+| 品牌 / 品牌上文字 | `#2F6BFF` / `#FFFFFFFF` | `#8FB0FF` / `#0B1730` |
+| 轨道 / 分割线 | `#D9DEE7` / `#E4E8EF` | `#454C58` / `#33FFFFFF` |
+
+形状 / 排版：迷你条全圆角（44dp 高 → 22dp）、大卡 28dp、封面 14dp、chip 10dp、图标 6dp；
+4dp 间距栅格；标题 18sp SemiBold、正文 14sp、caption 12sp；投影 18dp；最小触控 48dp。
+模糊：窗口级 80px、上限 150px；**系统禁用模糊 / 高对比时玻璃升到 96% 不透明**。
+这一条与 v3.15.43 的修复方向一致：本模块面板是透明窗口、没有跨窗口模糊，
+基底必须够厚，文字不能压在壁纸上。
+
+### 实现约定
+
+1. **约束 1（不改系统玻璃染色）**：`ArkGlobalGlassHook.REWRITE_SYSTEM_TINT` 保持 `false`；
+   不 hook `MzBlurUtils.setBackgroundBlurDrawable`、不碰 `args[4]` 的 `0xB2` 基底。
+2. **约束 2（不重蹈 ee622ad）**：不改 `View.setAlpha()`、不包装 `BackgroundBlurDrawable`、
+   **不全局 hook `View.setBackground`**。迷你条的背景只在**按 id 命中的那个 View** 上设置，
+   且仅当它当前没有系统自带背景；已有系统背景时只做文字色，不覆盖、不削弱任何基底。
+3. **约束 3（不改动画 / 宽度 / 点击）**：新增的迷你条样式 hook 只挂
+   `ExpandableNotificationRow.onNotificationUpdated` / `onAttachedToWindow` 与
+   `NotificationContentView.setContractedChild` / `setExpandedChild` 的 **after**，
+   只读视图、只设背景/描边/文字色/圆环颜色，不改参数、不改返回值、不动测量与动画。
+   `ArkLiveCapsuleStyleHook` 的 `mShowType ∈ {5,6}` 门控**原样保留**，
+   消息胶囊仍交还系统原生渲染，不为套样式放开。
+4. **约束 4（零风险优先）**：迷你条**不改 textSize / 宽高 / padding**——
+   `title_header_live` 的宽度由模板测量决定，动字号会牵动宽度计算；
+   字号 token 只落地到本模块自己的两张大卡 `ArkPanelTitle/Subtitle/Time`。
+   空心圆 `flyme.widget.LiveNotificationCircleProgressBar` 只反射调
+   `setProgressColor` / `setProgressBgColor` / `setTextColor`，失败即静默跳过。
+5. **约束 5（单一令牌源）**：`values/colors.xml` + `values-night/colors.xml` 承载
+   `@color/ark_*`；Kotlin 侧由新增的 `ArkTokens.kt` 一一镜像（与设计稿
+   `IslandTokens.kt` ↔ `island_tokens.xml` 同样的「改色两处同步」约定）。
+   不新增第二份壁纸采样、不改 25 点采样逻辑、不改 6 层结构 / AGSL 折射色散 / 边缘光。
+6. **约束 6（降级分档）**：`ArkLiquidGlassDrawable` 的中性基底对齐到渐变下端色
+   （亮 `#EFF3F8` / 暗 `#1B2029`），不透明度由常量开关 `WINDOW_BLUR_AVAILABLE` 决定：
+   本模块面板无跨窗口模糊 → 走 96%（`0xF5`）档；若日后接入窗口模糊再切到 82%/86%。
+   `ArkLiquidGlass` 的兜底环境色与 `strokeRgb` 同步对齐 token。
+7. **落地清单**：`styles.xml`（18/14/12sp + 三级语义色）、`values-night/styles.xml`、
+   新增 `colors.xml` / `values-night/colors.xml` / `dimens.xml`；
+   `bg_ark_panel.xml`（渐变玻璃 + 28dp + 1dp 高光）、新增 `bg_ark_panel_opaque.xml`（96%）；
+   `bg_ark_play_btn.xml`（品牌色圆形）；`ArkLiquidGlass.kt` / `ArkLiquidGlassDrawable.kt`
+   常量对齐；`ArkMorphAnim` 卡片终态圆角 30dp → 28dp（只改 token，不动动画）；
+   两张大卡的 `applyPalette()` 运行时文字基色 / 轨道色 / 收藏图标普通色同步换成三级
+   token（仍按 `p.light` 分支，第 6 层 `ink()` 不变，否则 XML 样式会被硬编码色覆盖）；
+   新增 `ArkTokens.kt`（Kotlin 令牌镜像）、`ArkMiniBarStyleHook.kt` 并在
+   `ArkEntry` 的 SystemUI 分支安装。
+
+### 为什么选两个 XML 玻璃 drawable 而不是代码切换
+
+`bg_ark_panel` 只服务于首帧占位（morph.prepare 之后由 `ArkLiquidGlassDrawable` 接管），
+运行时玻璃由 Kotlin 常量开关决定档位。纯资源方案不需要在启动时探测模糊能力、
+不改任何 Activity 代码；`values/` 与 `values-night/` 自动选亮暗，
+`bg_ark_panel_opaque.xml` 作为 96% 降级资源预留，代价只是多一个 XML 文件。
+
+### 已知边界（不虚报）
+
+- 播放按钮的 `bg_ark_play_btn.xml` 品牌圆同样是首帧占位：运行时 `applyPalette()` 会
+  `ArkLiquidGlass.attach(playBtn, ...)` 换成 6 层玻璃。要让品牌圆真正生效必须停掉这次
+  attach（属于功能改动），超出「只调样式」，本轮不动，图标 tint 也保持玻璃 ink 以免
+  白图标压在浅玻璃上不可见。
+- 迷你条背景只在其**没有系统原生背景**时设置；若 ROM 已给它下发模糊/波纹底，
+  本轮自动退化为「只改文字色 + 圆环颜色」，不覆盖系统基底。
+- 迷你条字号 / 44dp 高度 / 48dp 触控区未落地，理由见约束 4。
+
+### 验证要点（需装机后真机点按，本轮不做）
+
+- 拉下通知栏看顶部实况迷你条：浅色下是淡蓝白垂直渐变玻璃 + 全圆角 + 1dp 顶部高光描边，
+  「微信 / QQ」文字为 `#161A22` 一级色、可读；空心圆走品牌色 + 轨道色，形状不变。
+- 切深色模式再拉一次：玻璃转深蓝灰、文字转 `#F4F6FA`、描边转 `#30FFFFFF`，
+  文字仍达 AA 对比度。
+- 回归：迷你条宽度与歌词/消息切换动画不变、点击展开行为不变；v3.15.38 的消息胶囊
+  仍是系统原生渲染（不出现空壳）；两张大卡 morph 动画、6 层玻璃、文字 ink 与
+  v3.15.43 一致；系统媒体卡/通知行不出现「背景变红」或发灰。
+- `logcat -s FlymeArk` 应看到 `[FlymeArk/miniBarStyle] ...`，
+  **不应**出现 `[FlymeArk/glass] t.intercept`（全局 tint 改写仍停用）。
+
+- versionCode 67 / 3.15.44
+
 ## 2026-11-05 · v3.15.43 修复「背景变红」：玻璃着色层的语义纠正
 
 > 本节是**实现约定**，先于代码。v3.15.42 装机后用户实测「背景颜色变成了红色」。

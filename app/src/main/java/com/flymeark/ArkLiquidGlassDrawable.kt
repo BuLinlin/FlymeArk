@@ -38,6 +38,14 @@ import java.util.Locale
  * - 玻璃层改为半透明 `half4(c, 0.55)`，底纹 `base = mix(中性色, 环境色, 0.10)`；
  * - 壁纸平均色只用于亮度/复杂度判定与文字 ink 混色，**不再作为玻璃底色**。
  *
+ * ## v3.15.44（只迁移视觉 token）
+ *
+ * 中性基底色 / 降级渐变起点 / 兜底环境色 / `strokeRgb` / 投影尺寸统一对齐
+ * [ArkTokens]（IslandTokens 的 Kotlin 镜像）；基底不透明度由常量开关
+ * [ArkTokens.WINDOW_BLUR_AVAILABLE] 在 82%/86% 与 96% 之间选档，本模块透明窗口
+ * 无跨窗口模糊，默认 96%。**6 层结构、AGSL 折射色散、边缘光、25 点壁纸采样
+ * 与深浅浓度区间一律未动。**
+ *
  * AGSL 通过**反射**构造 RuntimeShader：模块 minSdk 26，避免低版本加载本类时
  * 因找不到 `android.graphics.RuntimeShader` 而抛 NoClassDefFoundError。
  * 设备是 API 36，正常运行走 AGSL；失败时降级为纯渐变玻璃，功能不受影响。
@@ -99,7 +107,9 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
         shader = buildAgsl(params)
         agslReady = shader != null
         glassPaint.shader = if (agslReady) shader else fallbackGradient()
-        basePaint.color = (0xE6 shl 24) or (neutralRgb() and 0x00FFFFFF)
+        // v3.15.44：中性基底色与不透明度档位对齐 IslandTokens；
+        // 6 层结构、AGSL 折射色散、边缘光一律不变。
+        basePaint.color = (baseAlpha() shl 24) or (neutralRgb() and 0x00FFFFFF)
         Log.i(
             TAG,
             "glass ${if (agslReady) "AGSL enabled" else "gradient fallback"}: " +
@@ -107,6 +117,7 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
                 "luma=${String.format(Locale.US, "%.2f", params.ambientLuma)} " +
                 "complexity=${String.format(Locale.US, "%.2f", params.complexity)} " +
                 "neutral=#${Integer.toHexString(neutralRgb())} " +
+                "baseAlpha=#${Integer.toHexString(baseAlpha())} " +
                 "ambient=#${Integer.toHexString(params.ambientRgb)}"
         )
         applyEdgeColors()
@@ -116,14 +127,36 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
     /** AGSL 不可用（低版本 / shader 编译失败 / uniform 写入失败）时的渐变玻璃 */
     private fun fallbackGradient(): LinearGradient = LinearGradient(
         0f, 0f, rect.width().coerceAtLeast(1f), rect.height().coerceAtLeast(1f),
-        // 起点必须是中性色；v3.15.42 用 ambient 混色做起点会带出壁纸的红色
-        0xFF000000.toInt() or (neutralRgb() and 0x00FFFFFF),
+        // 起点必须是中性色；v3.15.42 用 ambient 混色做起点会带出壁纸的红色。
+        // v3.15.44：起点改用 IslandTokens 玻璃渐变顶端色。
+        0xFF000000.toInt() or (glassTopRgb() and 0x00FFFFFF),
         (140 shl 24) or (params.tintRgb and 0x00FFFFFF),   // 终点 55% 半透明 tint
         Shader.TileMode.CLAMP,
     )
 
-    /** 玻璃的中性基底：浅色近白、深色近黑。壁纸平均色只在底纹里占 10% 权重 */
-    private fun neutralRgb(): Int = if (params.light) 0xF7F8FA else Color.rgb(18, 18, 22)
+    /**
+     * ⓪ 中性基底：v3.15.43 是 `#F7F8FA` / `rgb(18,18,22)`，v3.15.44 对齐到
+     * IslandTokens 玻璃渐变下端色的不透明版本（浅 `#EFF3F8` / 深 `#1B2029`）。
+     * 它承担文字对比度；壁纸平均色只在 AGSL 底纹里占 10% 权重。
+     */
+    private fun neutralRgb(): Int =
+        if (params.light) ArkTokens.NEUTRAL_LIGHT else ArkTokens.NEUTRAL_DARK
+
+    /** 玻璃渐变顶端色（不含 alpha），降级渐变与 AGSL 底纹共用同一组 token */
+    private fun glassTopRgb(): Int =
+        if (params.light) ArkTokens.GLASS_TOP_RGB_LIGHT else ArkTokens.GLASS_TOP_RGB_DARK
+
+    /**
+     * v3.15.44 降级分档：面板窗口没有跨窗口模糊 → 恒走 96% 档。
+     * 与 v3.15.43「基底必须够厚、文字不能压在壁纸上」的修复方向一致。
+     * 单一常量开关，不新增采样、不新增配色表；日后接入窗口模糊只需把
+     * [ArkTokens.WINDOW_BLUR_AVAILABLE] 置 true，即切回 82% / 86%。
+     */
+    private fun baseAlpha(): Int = if (ArkTokens.WINDOW_BLUR_AVAILABLE) {
+        if (params.light) ArkTokens.ALPHA_GLASS_LIGHT else ArkTokens.ALPHA_GLASS_DARK
+    } else {
+        ArkTokens.ALPHA_FALLBACK
+    }
 
     private fun updateVolumeGradient() {
         volumePaint.shader = LinearGradient(

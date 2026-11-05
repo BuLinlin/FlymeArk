@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.44：IslandTokens 的 View 侧镜像（浅色）。
+    唯一令牌源 = C:/Users/1/WorkBuddy/2026-11-05-14-04-34/IslandCapsuleUI/compose/IslandTokens.kt，
+    并与 view/res/values/island_tokens.xml 一一对应。
+    Kotlin 侧常量见 ArkTokens.kt —— 改色必须三处同步，禁止在组件里写魔法数字。
+-->
+<resources>
+    <!-- 文字三级（在 #F7F9FC 玻璃底上均 ≥ 4.5:1） -->
+    <color name="ark_text_primary">#FF161A22</color>
+    <color name="ark_text_secondary">#FF4E5766</color>
+    <color name="ark_text_tertiary">#FF5B6472</color>
+
+    <!-- 品牌 / 轨道 / 分割线 -->
+    <color name="ark_brand">#FF2F6BFF</color>
+    <color name="ark_brand_on">#FFFFFFFF</color>
+    <color name="ark_track">#FFD9DEE7</color>
+    <color name="ark_divider">#FFE4E8EF</color>
+
+    <!-- 82% 玻璃：配合窗口背景模糊使用 -->
+    <color name="ark_glass_top">#D1FDFEFF</color>
+    <color name="ark_glass_bottom">#D1EFF3F8</color>
+    <!-- 96% 玻璃：系统禁用模糊 / 高对比文字时的降级 -->
+    <color name="ark_glass_top_opaque">#F5FDFEFF</color>
+    <color name="ark_glass_bottom_opaque">#F5EFF3F8</color>
+    <!-- 1dp 顶部高光描边（View 版简化，Compose 版是渐隐渐变） -->
+    <color name="ark_highlight">#66FFFFFF</color>
+</resources>

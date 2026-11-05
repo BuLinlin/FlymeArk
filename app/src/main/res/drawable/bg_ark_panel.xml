@@ -1,10 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 展开面板卡片背景：深色玻璃 + 极细高光描边 -->
+<!--
+    v3.15.44 展开面板卡片背景：垂直渐变玻璃（angle 270 = 上→下）
+    + 28dp 圆角 + 1dp 高光描边。亮/暗由 values / values-night 的
+    @color/ark_glass_top|bottom|highlight 自动选择。
+    仅作首帧占位：morph.prepare 之后由 ArkLiquidGlassDrawable（96% 档）接管。
+-->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">
-    <solid android:color="#F018181C" />
+    <gradient
+        android:angle="270"
+        android:startColor="@color/ark_glass_top"
+        android:endColor="@color/ark_glass_bottom"
+        android:type="linear" />
+    <corners android:radius="@dimen/ark_radius_card" />
     <stroke
-        android:width="1dp"
-        android:color="#24FFFFFF" />
-    <corners android:radius="30dp" />
+        android:width="@dimen/ark_stroke"
+        android:color="@color/ark_highlight" />
 </shape>

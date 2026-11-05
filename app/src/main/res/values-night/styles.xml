@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.44：暗色下三个文字样式的显式覆盖。
+    色值本身由 values-night/colors.xml 的同名 @color/ark_* 提供；
+    这里保留完整的字号/字重/省略属性，避免覆盖时丢掉 values/styles.xml 的其它 item。
+-->
+<resources>
+    <style name="ArkPanelTitle">
+        <item name="android:textSize">18sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">600</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkPanelSubtitle">
+        <item name="android:textSize">14sp</item>
+        <item name="android:textColor">@color/ark_text_secondary</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkPanelTime">
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/ark_text_tertiary</item>
+        <item name="android:fontFeatureSettings">tnum</item>
+    </style>
+</resources>

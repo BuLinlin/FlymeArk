@@ -13,7 +13,6 @@ import android.content.IntentFilter
 import android.content.res.Configuration
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
-import android.graphics.Color
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
@@ -572,10 +571,13 @@ class ArkCapsulePanelActivity : Activity() {
         // 卡片本体：morph.prepare 之后由 ArkLiquidGlassDrawable 接管
         if (this::morph.isInitialized) morph.setGlass(p)
 
-        val title = if (p.light) 0xE6000000.toInt() else Color.WHITE
-        val sub = if (p.light) 0x99000000.toInt() else 0xB3FFFFFF.toInt()
-        val time = if (p.light) 0x80000000.toInt() else 0x8AFFFFFF.toInt()
-        val icon = if (p.light) 0xE6000000.toInt() else Color.WHITE
+        // v3.15.44：文字基色统一取 IslandTokens 三级语义色（ArkTokens 镜像），
+        // 仍按 p.light 分支，保证「浅玻璃配深字 / 深玻璃配浅字」的对比度逻辑不变；
+        // 第 6 层 ink() 混色与 6 层结构一律不动。
+        val title = if (p.light) ArkTokens.TEXT_PRIMARY_LIGHT else ArkTokens.TEXT_PRIMARY_DARK
+        val sub = if (p.light) ArkTokens.TEXT_SECONDARY_LIGHT else ArkTokens.TEXT_SECONDARY_DARK
+        val time = if (p.light) ArkTokens.TEXT_TERTIARY_LIGHT else ArkTokens.TEXT_TERTIARY_DARK
+        val icon = title
 
         // 第 6 层：文字着色（浅玻璃正片叠底 / 深玻璃叠加提亮）
         titleView.setTextColor(ArkLiquidGlass.ink(title, p))
@@ -596,7 +598,7 @@ class ArkCapsulePanelActivity : Activity() {
         ArkLiquidGlass.attach(playBtn, p, 29f * resources.displayMetrics.density)
         // 进度条轨道也吃玻璃 ink，避免死白/死黑
         progressBar.trackColor = ArkLiquidGlass.ink(
-            if (p.light) 0x26000000 else 0x33FFFFFF.toInt(), p
+            if (p.light) ArkTokens.TRACK_LIGHT else ArkTokens.TRACK_DARK, p
         )
     }
 
@@ -753,7 +755,8 @@ class ArkCapsulePanelActivity : Activity() {
         // 状态未定：空心 + 半透明，明确表达「还没拿到真值」，而不是假装修未收藏
         favBtn.alpha = if (favKnown) 1f else 0.42f
         // 已收藏用专辑主题色点亮（系统媒体卡同款思路）；未收藏用普通图标色
-        val plain = if (nightMode) Color.WHITE else 0xE6000000.toInt()
+        // v3.15.44：普通图标色对齐一级文字 token
+        val plain = if (nightMode) ArkTokens.TEXT_PRIMARY_DARK else ArkTokens.TEXT_PRIMARY_LIGHT
         favBtn.imageTintList = ColorStateList.valueOf(
             if (faved) albumColor ?: plain else plain
         )

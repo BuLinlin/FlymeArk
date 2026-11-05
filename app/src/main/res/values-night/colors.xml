@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.44：IslandTokens 的 View 侧镜像（暗色）。
+    与 values/colors.xml 同名一一覆盖；来源 compose/IslandTokens.kt 的 Dark 对象。
+-->
+<resources>
+    <!-- 暗色：文字在 #222832 玻璃底上同样 ≥ 4.5:1 -->
+    <color name="ark_text_primary">#FFF4F6FA</color>
+    <color name="ark_text_secondary">#FFC3CAD6</color>
+    <color name="ark_text_tertiary">#FFAAB3C2</color>
+
+    <color name="ark_brand">#FF8FB0FF</color>
+    <color name="ark_brand_on">#FF0B1730</color>
+    <color name="ark_track">#FF454C58</color>
+    <color name="ark_divider">#33FFFFFF</color>
+
+    <!-- 86% 玻璃 -->
+    <color name="ark_glass_top">#DB2A303B</color>
+    <color name="ark_glass_bottom">#DB1B2029</color>
+    <!-- 96% 降级 -->
+    <color name="ark_glass_top_opaque">#F52A303B</color>
+    <color name="ark_glass_bottom_opaque">#F51B2029</color>
+    <color name="ark_highlight">#30FFFFFF</color>
+</resources>

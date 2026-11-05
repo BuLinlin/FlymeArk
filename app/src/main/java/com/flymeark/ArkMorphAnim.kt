@@ -117,7 +117,8 @@ internal class ArkMorphAnim(
         if (startRect.height() > finalRect.height()) startRect.bottom = startRect.top + finalRect.height()
 
         startRadius = minOf(startRect.height() / 2f, dp(18).toFloat())
-        finalRadius = dp(30).toFloat()
+        // v3.15.44：卡片终态圆角对齐 IslandTokens.RadiusCard = 28dp（只改 token，不动动画）
+        finalRadius = dp(ArkTokens.RADIUS_CARD_DP).toFloat()
 
         // v3.15.42：attach 会装上 6 层液态玻璃背景 + elevation 投影 + 圆角 outline。
         // XML 的 bg_ark_panel 只是首帧占位，morph.prepare 之后一律由玻璃 Drawable 接管。

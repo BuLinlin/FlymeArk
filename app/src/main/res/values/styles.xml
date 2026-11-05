@@ -14,25 +14,32 @@
         <item name="android:forceDarkAllowed">false</item>
     </style>
 
-    <!-- 面板内文字样式：避免受系统字体/夜间模式影响 -->
+    <!--
+        v3.15.44：面板内文字统一到 IslandTokens 的三级语义色 + 18/14/12sp。
+        色值统一走 @color/ark_*（values/colors.xml 与 values-night/colors.xml 覆盖），
+        组件里不再写十六进制魔法数字。
+        fontFamily + textFontWeight=600 对应设计稿的 SemiBold；textFontWeight 在
+        API 28+ 生效，低版本仍有 sans-serif-medium 兜底。
+    -->
     <style name="ArkPanelTitle">
-        <item name="android:textSize">20sp</item>
-        <item name="android:textStyle">bold</item>
-        <item name="android:textColor">#FFFFFFFF</item>
+        <item name="android:textSize">18sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">600</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
         <item name="android:maxLines">1</item>
         <item name="android:ellipsize">end</item>
     </style>
 
     <style name="ArkPanelSubtitle">
         <item name="android:textSize">14sp</item>
-        <item name="android:textColor">#B3FFFFFF</item>
+        <item name="android:textColor">@color/ark_text_secondary</item>
         <item name="android:maxLines">1</item>
         <item name="android:ellipsize">end</item>
     </style>
 
     <style name="ArkPanelTime">
-        <item name="android:textSize">11sp</item>
-        <item name="android:textColor">#8AFFFFFF</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/ark_text_tertiary</item>
         <item name="android:fontFeatureSettings">tnum</item>
     </style>
 </resources>

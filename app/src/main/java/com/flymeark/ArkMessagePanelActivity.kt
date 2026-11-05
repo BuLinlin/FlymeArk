@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
-import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
@@ -206,10 +205,12 @@ class ArkMessagePanelActivity : Activity() {
         val p = glassParams
         if (this::morph.isInitialized) morph.setGlass(p)
 
-        val title = if (p.light) 0xE6000000.toInt() else Color.WHITE
-        val sub = if (p.light) 0x99000000.toInt() else 0xB3FFFFFF.toInt()
-        val body = if (p.light) 0xD9000000.toInt() else 0xE6FFFFFF.toInt()
-        val hint = if (p.light) 0x80000000.toInt() else 0x8AFFFFFF.toInt()
+        // v3.15.44：文字基色统一取 IslandTokens 三级语义色（ArkTokens 镜像），
+        // 分支仍按 p.light，第 6 层 ink() 混色与 6 层结构不变。
+        val title = if (p.light) ArkTokens.TEXT_PRIMARY_LIGHT else ArkTokens.TEXT_PRIMARY_DARK
+        val sub = if (p.light) ArkTokens.TEXT_SECONDARY_LIGHT else ArkTokens.TEXT_SECONDARY_DARK
+        val body = title
+        val hint = if (p.light) ArkTokens.TEXT_TERTIARY_LIGHT else ArkTokens.TEXT_TERTIARY_DARK
 
         titleView.setTextColor(ArkLiquidGlass.ink(title, p))
         timeView.setTextColor(ArkLiquidGlass.ink(sub, p))

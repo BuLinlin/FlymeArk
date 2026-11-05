@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v3.15.44：形状 / 间距 / 排版尺寸 token（源 compose/IslandTokens.kt，4dp 栅格） -->
+<resources>
+    <dimen name="ark_radius_card">28dp</dimen>
+    <dimen name="ark_radius_pill">22dp</dimen>
+    <dimen name="ark_radius_cover">14dp</dimen>
+    <dimen name="ark_radius_chip">10dp</dimen>
+    <dimen name="ark_radius_icon">6dp</dimen>
+    <dimen name="ark_mini_height">44dp</dimen>
+    <dimen name="ark_stroke">1dp</dimen>
+    <dimen name="ark_elevation">18dp</dimen>
+    <dimen name="ark_touch">48dp</dimen>
+    <dimen name="ark_space_4">4dp</dimen>
+    <dimen name="ark_space_8">8dp</dimen>
+    <dimen name="ark_space_12">12dp</dimen>
+    <dimen name="ark_space_16">16dp</dimen>
+</resources>
