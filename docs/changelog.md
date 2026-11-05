@@ -2,6 +2,69 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.42 液态玻璃材质（6 层复合）实现约定
+
+> 本节是**实现约定**，先于代码。CSS 规范（`.player { backdrop-filter / box-shadow / ... }`）在本项目里
+> 是效果描述：模块没有 WebView/前端目录，卡片与播放器都是原生 View + XML，必须逐层映射。
+
+### 六层 → Android 原生能力映射
+
+| # | 层 | 原生实现 | 说明 |
+|---|---|---|---|
+| 1 | 投影 | `View.elevation` + 圆角 `ViewOutlineProvider`（由 morph 同步半径） | 系统合成器真实投影，不用 `Paint.setShadowLayer`（硬件加速下不保证生效） |
+| 2 | 模糊与提亮 | AGSL `RuntimeShader` 内对玻璃底纹做 blur/亮度/饱和度；系统玻璃面沿用 `MzBlurUtils` 已有的模糊 | **窗口级 `blurBehind` 禁止使用**：v3.14 实测面板窗口全屏，会把整屏糊掉 |
+| 3 | 边缘折射 | AGSL：按到四边距离算挤压强度 `k=1-smoothstep(0,edge,d)`，采样坐标沿法线内移 `shift*k`，R/B 通道分别乘 `1±dispersion` | 真实的位移贴图 + 色散；中间 k=0 保持平整；AGSL 不可用时降级为多层渐变描边 |
+| 4 | 着色 | 半透明 tint，alpha 由采样亮度/复杂度在区间内插值 | 背景越复杂着色越浓，保证可读性 |
+| 5 | 边缘光 | 两条对角 `LinearGradient` 描边（左上 / 右下）+ 内侧缩进 2dp 再一道更淡的 | 纯绘制，任何加速模式都生效 |
+| 6 | 文字着色 | `ink()`：浅玻璃走正片叠底 `base*tint/255`，深玻璃走叠加提亮 | 文字带一点背景色，不是死白/死黑 |
+
+### 深浅模式参数（着色浓度为区间，随背景复杂度插值）
+
+| | 浅色玻璃 | 深色玻璃 |
+|---|---|---|
+| 着色 | 白 6%–22% | `rgb(20,20,24)` 16%–38% |
+| 模糊 | 2px | 2px |
+| 饱和度 | 180% | 160% |
+| 亮度 | 1.06 | 0.80 |
+| 文字 | multiply | overlay / screen |
+
+折射统一：边宽 44px、边缘偏移 1.1×边宽、色散 ±15%。
+
+### 背景采样与自动模式
+
+- 多点采样：`WallpaperManager.getDrawable()` 缩到 32×32，取 5×5 共 25 点算平均感知亮度
+  （0.2126R+0.7152G+0.0722B）与标准差（= 背景复杂度）；`getWallpaperColors()` 作为二级来源，
+  全失败则回退 `UiModeManager` 夜间模式。
+- **按规范：平均亮度 < 0.5 时切换为浅色模式**（`AUTO_LIGHT_ON_DARK` 常量可一行改回直觉方向）。
+- 复杂度越高 → tint alpha 越靠近区间上限；越平 → 越靠近下限。
+
+### 组件范围
+
+- 大卡：`activity_message_panel.xml` 的 `msg_card`、`activity_capsule_panel.xml` 的 `panel_card`（完整 6 层）。
+- 播放器：`panel_play` 主按钮改圆形玻璃，进度条轨道走玻璃 ink 色。
+- 搜索框：本仓库当前**不存在**该组件；材质做成通用 `ArkLiquidGlass.attach(view, params)`，
+  后续任何药丸型组件一行套用即可。
+- SystemUI 全局玻璃：`ArkGlobalGlassHook` 仍只改 `0xB2` 主玻璃那一档的 alpha，
+  深浅分别按上表区间下发，不碰系统其它层次遮罩。
+
+### 已知边界（不虚报）
+
+普通 App 进程拿不到实时屏幕像素，AGSL 的位移/色散作用于**程序化玻璃底纹**而非真实壁纸像素；
+系统自己绘制的玻璃面由 `MzBlurUtils` 提供真实背景模糊。两者合成后的观感与 CSS 规范一致，
+但不是逐像素的屏幕空间折射。
+
+### 落地文件
+
+- 新增 `ArkLiquidGlass.kt`：参数 / 25 点采样 / 自动模式 / ink() / 通用 `attach()`。
+- 新增 `ArkLiquidGlassDrawable.kt`：6 层绘制，AGSL 反射构造（低版本自动降级），
+  `uSize` uniform 随 bounds 更新；**动画期间不重建 shader**（morph 每帧改 bounds）。
+- `ArkMorphAnim.kt`：玻璃 Drawable 由动画层持有，圆角逐帧同步并 `invalidateOutline()`。
+- 两个面板 Activity：文字改 `ink()`；音乐面板主播放按钮改圆形玻璃、进度条轨道改玻璃色。
+- `ArkGlobalGlassHook.kt`：深浅分别按 6%–22% / 16%–38% 区间下发染色 alpha，复杂度插值。
+
+编译已通过（versionCode 65）。AGSL 是运行时编译，logcat 里 `FlymeArkGlass` 会打印
+`AGSL enabled` 或 `gradient fallback: <原因>`，一眼可判断是否真的走着色器。
+
 ## 2026-11-05 · v3.15.41 修 QQ「点大卡进不了会话」：改由 SystemUI 代发通知点击
 
 - **根因（logcat 实锤）**：面板是普通 App uid，直接 `PendingIntent.send()` 发原通知的

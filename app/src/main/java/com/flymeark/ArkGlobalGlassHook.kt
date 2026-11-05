@@ -1,6 +1,7 @@
 package com.flymeark
 
 import android.graphics.Color
+import android.view.View
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -8,7 +9,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.Collections
 
 /**
- * 全局毛玻璃参数统一入口。
+ * 全局毛玻璃参数统一入口（v3.15.42：接入液态玻璃的「着色层」浓度规范）。
  *
  * Flyme 所有玻璃面（下拉媒体卡 / 通知行 / 横屏横幅 / 低电量提示 / 锁屏插件 /
  * 状态栏热区）最终都汇到 `MzBlurUtils.setBackgroundBlurDrawable`，传参结构统一：
@@ -21,18 +22,20 @@ import java.util.Collections
  * )
  * ```
  *
- * `BackgroundBlurDrawable` 的实现决定了两个透明度各管一层：
- *  - `setColor(color)`  → `mPaint.setColor(color)`，颜色（含 alpha）就是盖在模糊上的染色；
- *  - `setAlpha(a)`      → 只写 `mAlpha`，控制交给 SurfaceFlinger 的模糊强度，不碰染色。
- * 所以"玻璃白得发死"要改的是 color 里的 alpha，改 setAlpha 没用。
+ * `BackgroundBlurDrawable` 的两个透明度各管一层：
+ *  - `setColor(color)` → `mPaint.setColor(color)`，颜色（含 alpha）是盖在模糊上的染色；
+ *  - `setAlpha(a)`     → 只写 `mAlpha`，控制交给 SurfaceFlinger 的模糊强度，不碰染色。
+ * 所以改玻璃观感必须改 color 里的 alpha，改 setAlpha 没用。
  *
- * 系统给主玻璃的染色是 `0xB2FFFFFF`（浅色）/ `0xB21A1A1A`（深色），70% 的底色糊在
- * 模糊层上，壁纸的颜色和饱和度被洗得只剩一层灰白。这里把这一档降到 58%/64%，
- * **RGB 原样保留**，只放开透明度 —— 等于把玻璃调透，不是换一套配色，
- * 因此不会和系统自己的主题色逻辑打架。
+ * 系统给主玻璃的染色是 `0xB2FFFFFF`（浅）/ `0xB21A1A1A`（深），即 70%。
+ * 现在按液态玻璃规范改成**深浅分别配置 + 随背景复杂度自动插值**的区间：
+ * 浅色白 6%–22%、深色 rgb(20 20 24) 16%–38%。复杂度来自 [ArkLiquidGlass] 的
+ * 多点背景采样；RGB 原样保留，只替换 alpha，因此不会和系统自己的主题色逻辑打架。
  *
  * 注意：SystemUI 里还有 `0x66FFFFFF` / `0x1AFFFFFF` 这类更淡的遮罩，那是系统有意
  * 做出来的层次，必须原样放过，只动 0xB2 这一档。
+ *
+ * 若实机觉得系统通知卡过透、文字可读性下降，把下面四个区间常量整体上调即可。
  */
 internal object ArkGlobalGlassHook {
 
@@ -42,14 +45,16 @@ internal object ArkGlobalGlassHook {
     /** 系统主玻璃染色的原始 alpha（浅色 0xB2FFFFFF / 深色 0xB21A1A1A 共用） */
     private const val SOURCE_ALPHA = 0xB2     // 70%
 
-    /** 浅色玻璃目标不透明度 */
-    private const val LIGHT_ALPHA = 0x94      // 58%（保守档；43% 为极限档，待定稿）
-
-    /** 深色玻璃目标不透明度 */
-    private const val DARK_ALPHA = 0xA3       // 64%
-
-    /** 明暗分界：tint 亮度高于此值视为"白色玻璃" */
+    /** 明暗分界：tint 亮度高于此值视为「白色玻璃」 */
     private const val LIGHT_LUMA = 0.5f
+
+    /** 浅色玻璃着色浓度区间：白 6%–22% */
+    private const val LIGHT_LO = 0.06f
+    private const val LIGHT_HI = 0.22f
+
+    /** 深色玻璃着色浓度区间：rgb(20 20 24) 16%–38% */
+    private const val DARK_LO = 0.16f
+    private const val DARK_HI = 0.38f
 
     /** 每个调用方只打一条日志，避免刷屏 */
     private val logged: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
@@ -69,10 +74,24 @@ internal object ArkGlobalGlassHook {
                     if ((original ushr 24) != SOURCE_ALPHA) return
 
                     val rgb = original and 0x00FFFFFF
-                    val target = if (luma(rgb) > LIGHT_LUMA) LIGHT_ALPHA else DARK_ALPHA
+                    val light = luma(rgb) > LIGHT_LUMA
+                    // args[0] 是承载玻璃的 View，用它拿 Context 做背景采样（结果带 2s 缓存）
+                    val ctx = (args[0] as? View)?.context
+                    val complexity = ctx?.let {
+                        try {
+                            ArkLiquidGlass.resolve(it, false).complexity
+                        } catch (_: Throwable) {
+                            0.5f
+                        }
+                    } ?: 0.5f
+
+                    val lo = if (light) LIGHT_LO else DARK_LO
+                    val hi = if (light) LIGHT_HI else DARK_HI
+                    val tint = lo + (hi - lo) * complexity
+                    val target = (tint * 255f).toInt().coerceIn(0, 255)
                     val replaced = (target shl 24) or rgb
                     args[4] = replaced
-                    logOnce(original, replaced)
+                    logOnce(original, replaced, light, tint, complexity)
                 }
             })
         }
@@ -85,13 +104,14 @@ internal object ArkGlobalGlassHook {
             0.0722f * Color.blue(rgb)) / 255f
     }
 
-    private fun logOnce(original: Int, replaced: Int) {
+    private fun logOnce(original: Int, replaced: Int, light: Boolean, tint: Float, complexity: Float) {
         val caller = callerName()
         if (!logged.add(caller + "#" + Integer.toHexString(original))) return
         XposedBridge.log(
             "[${ArkConstants.LOG_TAG}/glass] $caller  " +
                 "#${Integer.toHexString(original)} → #${Integer.toHexString(replaced)}" +
-                " (${if (luma(original and 0x00FFFFFF) > LIGHT_LUMA) "浅色玻璃" else "深色玻璃"})"
+                " (${if (light) "浅色玻璃" else "深色玻璃"} 着色 ${(tint * 100).toInt()}%" +
+                " · 背景复杂度 ${String.format(java.util.Locale.US, "%.2f", complexity)})"
         )
     }
 

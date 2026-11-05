@@ -62,6 +62,9 @@ class ArkMessagePanelActivity : Activity() {
     private var nightMode = false
     private var closing = false
 
+    /** v3.15.42：液态玻璃参数，由 bindViews 采样一次，morph 与文字着色共用 */
+    private lateinit var glassParams: GlassParams
+
     /** 点卡片进会话的防抖（避免连点拉起多个会话页） */
     private var lastOpenAt = 0L
 
@@ -83,11 +86,7 @@ class ArkMessagePanelActivity : Activity() {
         bindData()
         bindActions()
 
-        morph = ArkMorphAnim(
-            root, card, content,
-            if (nightMode) 0xC216161A.toInt() else 0xC9FAFAFA.toInt(),
-            if (nightMode) 0x24FFFFFF.toInt() else 0x1F000000.toInt()
-        )
+        morph = ArkMorphAnim(root, card, content, glassParams)
         card.alpha = 0f
         root.post {
             morph.prepare(capsuleRect())
@@ -113,6 +112,7 @@ class ArkMessagePanelActivity : Activity() {
         nightMode =
             (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
+        glassParams = ArkLiquidGlass.resolve(this, nightMode)
         applyPalette()
     }
 
@@ -195,26 +195,27 @@ class ArkMessagePanelActivity : Activity() {
         card.setOnClickListener { openConversation() }
     }
 
-    /** 深浅模式配色（与音乐面板 applyPalette 同一套） */
+    /**
+     * v3.15.42：液态玻璃配色。卡片本体由 [ArkMorphAnim] 持有的玻璃 Drawable 绘制，
+     * 这里只负责第 6 层「文字着色」——正片叠底 / 叠加提亮，让文字带一点背景色。
+     */
     private fun applyPalette() {
-        val cardBg = if (nightMode) 0xC216161A.toInt() else 0xC9FAFAFA.toInt()
-        val stroke = if (nightMode) 0x24FFFFFF.toInt() else 0x1F000000.toInt()
-        if (this::morph.isInitialized) morph.setColors(cardBg, stroke)
-        (card.background as? GradientDrawable)?.apply {
-            setColor(cardBg)
-            setStroke((resources.displayMetrics.density * 1).toInt(), stroke)
+        if (!this::glassParams.isInitialized) {
+            glassParams = ArkLiquidGlass.resolve(this, nightMode)
         }
+        val p = glassParams
+        if (this::morph.isInitialized) morph.setGlass(p)
 
-        val title = if (nightMode) Color.WHITE else 0xE6000000.toInt()
-        val sub = if (nightMode) 0xB3FFFFFF.toInt() else 0x99000000.toInt()
-        val body = if (nightMode) 0xE6FFFFFF.toInt() else 0xD9000000.toInt()
-        val hint = if (nightMode) 0x8AFFFFFF.toInt() else 0x80000000.toInt()
+        val title = if (p.light) 0xE6000000.toInt() else Color.WHITE
+        val sub = if (p.light) 0x99000000.toInt() else 0xB3FFFFFF.toInt()
+        val body = if (p.light) 0xD9000000.toInt() else 0xE6FFFFFF.toInt()
+        val hint = if (p.light) 0x80000000.toInt() else 0x8AFFFFFF.toInt()
 
-        titleView.setTextColor(title)
-        timeView.setTextColor(sub)
-        textView.setTextColor(body)
-        hintView.setTextColor(hint)
-        appIconView.imageTintList = ColorStateList.valueOf(sub)
+        titleView.setTextColor(ArkLiquidGlass.ink(title, p))
+        timeView.setTextColor(ArkLiquidGlass.ink(sub, p))
+        textView.setTextColor(ArkLiquidGlass.ink(body, p))
+        hintView.setTextColor(ArkLiquidGlass.ink(hint, p))
+        appIconView.imageTintList = ColorStateList.valueOf(ArkLiquidGlass.ink(sub, p))
     }
 
     /** 点卡片 → 发送原通知的 contentIntent（进会话）→ 收起 */

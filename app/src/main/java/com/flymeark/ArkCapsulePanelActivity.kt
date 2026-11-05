@@ -15,7 +15,6 @@ import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
-import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -137,9 +136,8 @@ class ArkCapsulePanelActivity : Activity() {
     /** 跳转防抖时间戳 */
     private var lastOpenAppAt = 0L
 
-    /** 当前配色（morph 动画层创建时要用，早于 applyPalette 生效时序） */
-    private var paletteCard = 0xFF18181C.toInt()
-    private var paletteStroke = 0x24FFFFFF.toInt()
+    /** v3.15.42：当前液态玻璃参数（morph 动画层创建时要用，早于 applyPalette 生效时序） */
+    private lateinit var paletteGlass: GlassParams
 
     /** 最近一次点击 ❤ 的时间：既是点击锁，也是「锁定期内不采信推送旧状态」的依据 */
     private var lastFavAt = 0L
@@ -206,7 +204,7 @@ class ArkCapsulePanelActivity : Activity() {
         bindData()
         bindActions()
 
-        morph = ArkMorphAnim(root, card, content, paletteCard, paletteStroke)
+        morph = ArkMorphAnim(root, card, content, paletteGlass)
         // 第一帧先按胶囊尺寸摆好（此时不可见，避免「完整卡片闪一下再缩回去」），
         // 第二帧再显示并开始长大。
         card.alpha = 0f
@@ -277,10 +275,11 @@ class ArkCapsulePanelActivity : Activity() {
         outputBtn = findViewById(R.id.panel_output)
         appIconView = findViewById(R.id.panel_app_icon)
 
-        // v3.13：样式对齐系统媒体卡 —— 配色按深浅模式一套走
+        // v3.15.42：多点采样背景亮度/复杂度 → 自动决定玻璃深浅与着色浓度
         nightMode =
             (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
+        paletteGlass = ArkLiquidGlass.resolve(this, nightMode)
         applyPalette()
 
         // 点空白收起；点卡片跳转音乐 App（对齐系统媒体卡行为）
@@ -553,47 +552,52 @@ class ArkCapsulePanelActivity : Activity() {
     private fun setNight(night: Boolean) {
         if (night == nightMode) return
         nightMode = night
+        // 广播可能在 bindViews 之前到达，此时 lateinit view 还没绑定
+        if (!this::titleView.isInitialized) return
+        // 主题切换常常伴随壁纸切换，重新采样一次以刷新玻璃浓度
+        ArkLiquidGlass.invalidateCache()
+        paletteGlass = ArkLiquidGlass.resolve(this, nightMode)
         applyPalette()
     }
 
     // ------------------------------------------------------------------
-    // 深浅模式配色（v3.13，对齐系统媒体卡：浅色 70% 白玻璃 / 深色 70% 深灰玻璃）
+    // 液态玻璃配色（v3.15.42：6 层复合，深浅浓度按背景采样插值）
     // ------------------------------------------------------------------
 
     private fun applyPalette() {
-        val cardBg = if (nightMode) 0xC216161A.toInt() else 0xC9FAFAFA.toInt()
-        val stroke = if (nightMode) 0x24FFFFFF.toInt() else 0x1F000000.toInt()
-        paletteCard = cardBg
-        paletteStroke = stroke
-        if (this::morph.isInitialized) {
-            // morph.prepare 会把卡片背景换成它自己的 drawable，颜色必须经它下发
-            morph.setColors(cardBg, stroke)
+        if (!this::paletteGlass.isInitialized) {
+            paletteGlass = ArkLiquidGlass.resolve(this, nightMode)
         }
-        (card.background as? GradientDrawable)?.apply {
-            setColor(cardBg)
-            setStroke((resources.displayMetrics.density * 1).toInt(), stroke)
-        } ?: android.util.Log.w("FlymeArk", "panel card bg is ${card.background?.javaClass?.name}")
+        val p = paletteGlass
+        // 卡片本体：morph.prepare 之后由 ArkLiquidGlassDrawable 接管
+        if (this::morph.isInitialized) morph.setGlass(p)
 
-        val title = if (nightMode) Color.WHITE else 0xE6000000.toInt()
-        val sub = if (nightMode) 0xB3FFFFFF.toInt() else 0x99000000.toInt()
-        val time = if (nightMode) 0x8AFFFFFF.toInt() else 0x80000000.toInt()
-        val icon = if (nightMode) Color.WHITE else 0xE6000000.toInt()
-        val playBg = if (nightMode) 0x2EFFFFFF.toInt() else 0x26000000.toInt()
+        val title = if (p.light) 0xE6000000.toInt() else Color.WHITE
+        val sub = if (p.light) 0x99000000.toInt() else 0xB3FFFFFF.toInt()
+        val time = if (p.light) 0x80000000.toInt() else 0x8AFFFFFF.toInt()
+        val icon = if (p.light) 0xE6000000.toInt() else Color.WHITE
 
-        titleView.setTextColor(title)
-        artistView.setTextColor(sub)
-        timeCurrent.setTextColor(time)
-        timeTotal.setTextColor(time)
-        prevBtn.imageTintList = ColorStateList.valueOf(icon)
-        nextBtn.imageTintList = ColorStateList.valueOf(icon)
-        playBtn.imageTintList = ColorStateList.valueOf(icon)
-        outputBtn.imageTintList = ColorStateList.valueOf(icon)
+        // 第 6 层：文字着色（浅玻璃正片叠底 / 深玻璃叠加提亮）
+        titleView.setTextColor(ArkLiquidGlass.ink(title, p))
+        artistView.setTextColor(ArkLiquidGlass.ink(sub, p))
+        timeCurrent.setTextColor(ArkLiquidGlass.ink(time, p))
+        timeTotal.setTextColor(ArkLiquidGlass.ink(time, p))
+        val iconInk = ArkLiquidGlass.ink(icon, p)
+        prevBtn.imageTintList = ColorStateList.valueOf(iconInk)
+        nextBtn.imageTintList = ColorStateList.valueOf(iconInk)
+        playBtn.imageTintList = ColorStateList.valueOf(iconInk)
+        outputBtn.imageTintList = ColorStateList.valueOf(iconInk)
         favBtn.imageTintList = ColorStateList.valueOf(
-            // 已收藏：跟专辑主题色走（系统媒体卡同款思路），未收藏用普通图标色
-            if (favKnown && favState) albumColor ?: icon else icon
+            // 已收藏：跟专辑主题色走（系统媒体卡同款思路），未收藏用玻璃 ink 色
+            if (favKnown && favState) albumColor ?: iconInk else iconInk
         )
-        (playBtn.background as? GradientDrawable)?.setColor(playBg)
-        progressBar.trackColor = if (nightMode) 0x33FFFFFF.toInt() else 0x26000000
+
+        // 播放器主按钮：同一套玻璃材质做成圆形（58dp / 2 半径）
+        ArkLiquidGlass.attach(playBtn, p, 29f * resources.displayMetrics.density)
+        // 进度条轨道也吃玻璃 ink，避免死白/死黑
+        progressBar.trackColor = ArkLiquidGlass.ink(
+            if (p.light) 0x26000000 else 0x33FFFFFF.toInt(), p
+        )
     }
 
     // ------------------------------------------------------------------

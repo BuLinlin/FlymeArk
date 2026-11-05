@@ -5,7 +5,6 @@ import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.content.res.Resources
 import android.graphics.Rect
-import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.View
 import android.view.animation.DecelerateInterpolator
@@ -41,9 +40,8 @@ internal class ArkMorphAnim(
     private val root: View,
     private val card: View,
     private val content: View,
-    /** 卡片底色/描边色：与 applyPalette 同源（v3.13.1 起不能硬编码，否则盖掉深浅配色） */
-    private var cardColor: Int = 0xFF18181C.toInt(),
-    private var strokeColor: Int = 0x24FFFFFF.toInt()
+    /** v3.15.42：液态玻璃参数（着色浓度由背景采样决定，不再硬编码底色） */
+    private var glassParams: GlassParams
 ) {
 
     private val density = root.resources.displayMetrics.density
@@ -53,8 +51,8 @@ internal class ArkMorphAnim(
     private var finalRadius = 0f
     private var startRadius = 0f
 
-    /** 卡片背景：XML 的 shape 无法动态改圆角，这里用同色同描边的 GradientDrawable 代替 */
-    private val bg = GradientDrawable()
+    /** 卡片背景：液态玻璃 Drawable，圆角随动画逐帧变化 */
+    private lateinit var bg: ArkLiquidGlassDrawable
 
     private var animator: ValueAnimator? = null
     private var prepared = false
@@ -121,24 +119,19 @@ internal class ArkMorphAnim(
         startRadius = minOf(startRect.height() / 2f, dp(18).toFloat())
         finalRadius = dp(30).toFloat()
 
-        // 与 res/drawable/bg_ark_panel.xml 同描边、同圆角逻辑，但圆角要能随动画变化，
-        // 所以用代码构造；颜色来自 Activity 的配色系统（深浅模式），不再硬编码。
-        bg.shape = GradientDrawable.RECTANGLE
-        bg.setColor(cardColor)
-        bg.setStroke(dp(1), strokeColor)
-        bg.cornerRadius = finalRadius
-        card.background = bg
+        // v3.15.42：attach 会装上 6 层液态玻璃背景 + elevation 投影 + 圆角 outline。
+        // XML 的 bg_ark_panel 只是首帧占位，morph.prepare 之后一律由玻璃 Drawable 接管。
+        bg = ArkLiquidGlass.attach(card, glassParams, finalRadius)
 
         applyRect(startRect, startRadius, 0f)
     }
 
-    /** 配色变化（深浅模式切换）时由 Activity 调用，动画中/后都生效 */
-    fun setColors(color: Int, stroke: Int) {
-        cardColor = color
-        strokeColor = stroke
+    /** 深浅模式 / 采样浓度变化（主题切换）时由 Activity 调用，动画中/后都生效 */
+    fun setGlass(p: GlassParams) {
+        glassParams = p
         if (prepared) {
-            bg.setColor(color)
-            bg.setStroke(dp(1), stroke)
+            bg.setGlass(p)
+            card.invalidateOutline()
         }
     }
 
@@ -203,6 +196,8 @@ internal class ArkMorphAnim(
         lp.height = r.height().coerceAtLeast(0)
         card.layoutParams = lp
         bg.cornerRadius = radius
+        // outline 决定投影形状，圆角变了必须让系统重新取一次
+        card.invalidateOutline()
         content.alpha = contentAlpha
     }
 
