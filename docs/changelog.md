@@ -2,6 +2,25 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.38 空壳真凶：歌词切换动画误伤消息胶囊
+
+v3.15.37 日志证明数据层完全正常（`tvW=182 tvA=1.0 linW=267`，文字已写入、
+宽度已展开），屏幕上却是纯色空条——问题必然在绘制层。逐层排查后定位到
+**v3.3 的歌词切换动画 hook 误伤了消息胶囊**：
+
+- `ArkLiveCapsuleStyleHook` 的 hook #3 盯着**所有** `setLiveNotificationInfo`
+  调用，文字一变就跑 `slideSwitch()` 三段 ViewPropertyAnimator 链
+  （旧词左移淡出 → 换字+alpha=0 → 新词滑入）。
+- 消息胶囊每条消息都伴随系统淡出/`resetState()`，动画链中途被打断后
+  **translationX 停在胶囊外的偏移位置 / alpha 停在 0**，文字渲染不出来。
+  日志里 alpha 读到 1.0 是 ShowFixHook 复位过的，translationX 无人复位。
+- 音乐胶囊一直正常，正是因为它是该动画的服务对象（链条完整）。
+
+修复：三个 hook（`getCalculatedWidth` 已有门控、`startScaleXAnim`、
+`setLiveNotificationInfo` after）全部加 `mShowType ∈ {5,6}` 判定
+（`isLyricsView`），消息胶囊完全交还系统原生渲染；ShowFixHook 的
+prefill / reapply 继续兜底补字。
+
 ## 2026-11-05 · v3.15.36 空壳根因实锤：resetState() 在淡出后抹掉 prefill 内容
 
 用户 v3.15.35 实测：条数已正确（`有 3 条新消息`，与卡片标题一致）、影子不再重复、

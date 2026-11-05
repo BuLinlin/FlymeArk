@@ -108,11 +108,14 @@ internal object ArkLiveCapsuleStyleHook {
         }
 
         // 2) 拦掉原生的「原地换字 + alpha 淡入」，切换改由下面的 setLiveNotificationInfo 统一负责
+        //    v3.15.38：只对歌词胶囊（showType 5/6）生效——消息胶囊的 slideSwitch 三段动画链
+        //    被系统重置打断后会停在半路（alpha=0 或 translationX 停在胶囊外），渲染成空壳。
         ArkHooks.quiet("$TAG startScaleXAnim") {
             XposedHelpers.findAndHookMethod(
                 VIEW_CLS, lpp.classLoader, "startScaleXAnim",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!isLyricsView(param.thisObject)) return
                         param.result = null
                     }
                 }
@@ -128,6 +131,7 @@ internal object ArkLiveCapsuleStyleHook {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
                             val view = param.thisObject as? View ?: return
+                            if (!isLyricsView(view)) return
                             val tv = textViewOf(view) ?: return
                             val text = XposedHelpers.getObjectField(view, "mShowText")
                                 as? String ?: return
@@ -142,6 +146,14 @@ internal object ArkLiveCapsuleStyleHook {
                 }
             )
         }
+    }
+
+    /** 歌词胶囊判定：mShowType 为 5（音乐胶囊）或 6（AOD 歌词）。消息胶囊一律放行原生渲染 */
+    private fun isLyricsView(view: Any?): Boolean = try {
+        val t = XposedHelpers.getIntField(view, "mShowType")
+        t == 5 || t == 6
+    } catch (_: Throwable) {
+        false
     }
 
     private fun textViewOf(view: Any): TextView? =
