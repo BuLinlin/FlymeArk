@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  v3.15.39：点击消息胶囊展开的消息大卡。
+
+  结构与 activity_capsule_panel 完全同构（panel_root / panel_card / panel_content
+  三层），为的是复用 ArkMorphAnim 的「胶囊长大成卡片」动画：
+   - panel_card 只负责背景与尺寸插值（圆角 30dp 玻璃卡）
+   - panel_content 固定最终尺寸，动画中只做 alpha，超出部分被 clip 掉
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/msg_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/transparent"
+    android:clickable="true"
+    android:focusable="true">
+
+    <FrameLayout
+        android:id="@+id/msg_card"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="10dp"
+        android:background="@drawable/bg_ark_panel"
+        android:clickable="true"
+        android:clipChildren="true"
+        android:clipToPadding="true"
+        android:focusable="true">
+
+        <LinearLayout
+            android:id="@+id/msg_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingHorizontal="16dp"
+            android:paddingTop="18dp"
+            android:paddingBottom="16dp">
+
+            <!-- 头部：发送者头像 + 名称/时间 + 右上角应用图标 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <ImageView
+                    android:id="@+id/msg_avatar"
+                    android:layout_width="54dp"
+                    android:layout_height="54dp"
+                    android:contentDescription="@string/ark_msg_avatar"
+                    android:scaleType="centerCrop" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="14dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/msg_title"
+                        style="@style/ArkPanelTitle"
+                        android:textSize="17sp" />
+
+                    <TextView
+                        android:id="@+id/msg_time"
+                        style="@style/ArkPanelSubtitle"
+                        android:layout_marginTop="2dp"
+                        android:textSize="12sp" />
+                </LinearLayout>
+
+                <ImageView
+                    android:id="@+id/msg_app_icon"
+                    android:layout_width="18dp"
+                    android:layout_height="18dp"
+                    android:layout_marginStart="10dp"
+                    android:contentDescription="@string/ark_msg_app"
+                    android:scaleType="fitCenter" />
+            </LinearLayout>
+
+            <!-- 正文 -->
+            <TextView
+                android:id="@+id/msg_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:lineSpacingMultiplier="1.25"
+                android:maxLines="6"
+                android:ellipsize="end"
+                android:textColor="#E6FFFFFF"
+                android:textSize="15sp" />
+
+            <!-- 底部：品牌色圆点 + 应用名·进入会话提示 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <View
+                    android:id="@+id/msg_dot"
+                    android:layout_width="8dp"
+                    android:layout_height="8dp" />
+
+                <TextView
+                    android:id="@+id/msg_hint"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:textSize="11sp"
+                    android:textColor="#8AFFFFFF" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+</FrameLayout>

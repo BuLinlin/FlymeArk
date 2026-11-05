@@ -2,6 +2,27 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.39 消息胶囊点击 → 展开大卡（ArkMessagePanelActivity）
+
+v3.15.38 用户实测通过（胶囊一出现即带占位文字）。消息胶囊的最后一环：
+此前点击消息胶囊在 `launchPanel` 里被 `isMediaApp` 判定挡掉，**没有任何反应**。
+
+新增消息大卡，与音乐面板（ArkCapsulePanelActivity）完全同构：
+
+- **动画**：复用 `ArkMorphAnim`「胶囊长大成卡片」，收起缩回胶囊位置；
+  `ACTION_PANEL_STATE` 广播同一套胶囊淡出/恢复联动。
+- **样式**：同一张 30dp 圆角玻璃卡（bg_ark_panel）+ 同一套深浅模式配色；
+  内容为 发送者头像（圆形+品牌色底）/ 名称 / 相对时间 / 正文（≤6行）/
+  品牌色圆点 + 「微信 · 点击进入会话」提示。
+- **数据**：SystemUI 进程从 `mNotificationEntries`
+  （`getRepresentativeEntry().getSbn()`，与系统 `updateStatusBarIcons` 同源）
+  取 postTime 最新的**原通知**（排除影子 tag）：title / text / largeIcon /
+  contentIntent 全部有权限可读，随 Intent 传给面板进程。
+- **交互**：点卡片 → 发送原通知 contentIntent（进会话）→ 收起；
+  点空白 / 返回键 → 收起；通知已被清掉时兜底拉应用主界面。
+- **隐私**：不设 `showWhenLocked` —— 聊天正文只出现在解锁后的展开卡里，
+  锁屏点胶囊无动作（胶囊本体仍是「有新消息 · 点击查看」占位）。
+
 ## 2026-11-05 · v3.15.38 空壳真凶：歌词切换动画误伤消息胶囊
 
 v3.15.37 日志证明数据层完全正常（`tvW=182 tvA=1.0 linW=267`，文字已写入、

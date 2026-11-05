@@ -247,6 +247,25 @@ object ArkConstants {
      */
     const val EXTRA_PANEL_NIGHT = "panel_night"
 
+    // ------------------------------------------------------------------
+    // 消息胶囊展开面板（v3.15.39）
+    // ------------------------------------------------------------------
+
+    /** 消息面板：发送者 / 群名（String） */
+    const val EXTRA_MSG_TITLE = "msg_title"
+
+    /** 消息面板：正文（String，可能多行） */
+    const val EXTRA_MSG_TEXT = "msg_text"
+
+    /** 消息面板：发送者头像（Bitmap，可缺省） */
+    const val EXTRA_MSG_AVATAR = "msg_avatar"
+
+    /** 消息面板：通知 postTime（Long，毫秒） */
+    const val EXTRA_MSG_TIME = "msg_time"
+
+    /** 消息面板：品牌色（Int，ARGB） */
+    const val EXTRA_MSG_BRAND = "msg_brand"
+
     /** Xposed 日志 TAG（logcat / LSPosed 日志里搜这个） */
     const val LOG_TAG = "FlymeArk"
 

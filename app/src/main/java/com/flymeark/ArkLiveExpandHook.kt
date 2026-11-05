@@ -1700,12 +1700,19 @@ internal object ArkLiveExpandHook {
                 return
             }
         val pkg = XposedHelpers.callMethod(info, "getPackageName") as? String
-        if (!ArkConstants.isMediaApp(pkg)) {
+        if (!ArkConstants.isMediaApp(pkg) && !ArkConstants.isMessageLiveApp(pkg)) {
             XposedBridge.log("$TAG: launch skipped (pkg=$pkg)")
             return
         }
 
         val ctx = XposedHelpers.getObjectField(ctrl, "mContext") as? Context ?: return
+
+        // v3.15.39：消息胶囊（微信 / QQ）→ 消息大卡（ArkMessagePanelActivity），
+        // 与音乐面板共用冷却 / 原生点击屏蔽 / 胶囊淡出联动。
+        if (pkg != null && ArkConstants.isMessageLiveApp(pkg)) {
+            launchMessagePanel(ctrl, ctx, pkg, now)
+            return
+        }
 
         val showText = (XposedHelpers.callMethod(info, "getShowText") as? String)
             ?.trim()?.takeIf { it.isNotEmpty() }
@@ -1779,7 +1786,159 @@ internal object ArkLiveExpandHook {
         }
     }
 
-    /** 一次 MediaSession 快照（当前媒体 App：QQ音乐/网易云音乐） */
+    // ------------------------------------------------------------------
+    // v3.15.39：消息胶囊 → 消息大卡
+    // ------------------------------------------------------------------
+
+    /** 消息大卡类名 */
+    private const val MESSAGE_PANEL_ACTIVITY = "com.flymeark.ArkMessagePanelActivity"
+
+    /**
+     * 拉起消息大卡。
+     *
+     * 数据源：`LiveNotificationController.mNotificationEntries`（List<PipelineEntry>），
+     * 反编译确认 `updateStatusBarIcons` 就是靠它遍历通知的
+     * （`getRepresentativeEntry().getSbn()`），SystemUI 进程读 extras /
+     * largeIcon / contentIntent 都有权限 —— 本面板进程没有，所以数据必须在这边取好。
+     *
+     * 取「postTime 最新的一条原通知」（tag != 影子 tag）：同一 App 同时有多条通知时，
+     * 最新的那条就是胶囊正在代表的消息。
+     */
+    private fun launchMessagePanel(ctrl: Any, ctx: Context, pkg: String, now: Long) {
+        val sbn = latestMessageSbn(ctrl, pkg) ?: run {
+            XposedBridge.log("$TAG: msg panel skipped (no source notification for $pkg)")
+            // 通知已经被清掉了：直接按包名拉主界面兜底，别让点击完全没反应
+            try {
+                ctx.packageManager.getLaunchIntentForPackage(pkg)?.let {
+                    it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ctx.startActivity(it)
+                }
+            } catch (_: Throwable) {
+            }
+            return
+        }
+
+        val n = try { XposedHelpers.callMethod(sbn, "getNotification") as? Notification } catch (_: Throwable) { null }
+        val extras = try { n?.extras } catch (_: Throwable) { null }
+        val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+        val text = (extras?.getCharSequence(Notification.EXTRA_TEXT)
+            ?: extras?.getCharSequence(Notification.EXTRA_BIG_TEXT))?.toString()?.trim()
+
+        // largeIcon 的静态类型在不同 framework 下有 Bitmap / Icon 两种，运行时按实际类型取
+        val largeIconObj = try { XposedHelpers.getObjectField(n, "largeIcon") } catch (_: Throwable) { null }
+        val avatar = (largeIconObj as? Bitmap)
+            ?: avatarBitmapOf(ctx, largeIconObj as? android.graphics.drawable.Icon)
+        val postAt = try { XposedHelpers.callMethod(sbn, "getPostTime") as? Long ?: 0L } catch (_: Throwable) { 0L }
+        val contentIntent = n?.contentIntent
+
+        val intent = Intent().apply {
+            setClassName(ArkConstants.APP_PKG, MESSAGE_PANEL_ACTIVITY)
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_NO_ANIMATION
+            )
+            putExtra(ArkConstants.EXTRA_MSG_TITLE, title ?: "")
+            putExtra(ArkConstants.EXTRA_MSG_TEXT, text ?: "")
+            putExtra(ArkConstants.EXTRA_MSG_TIME, postAt)
+            putExtra(ArkConstants.EXTRA_MSG_BRAND, ArkConstants.brandColorOf(pkg))
+            putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, pkg)
+            putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
+            avatar?.let { putExtra(ArkConstants.EXTRA_MSG_AVATAR, it) }
+            contentIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
+            // 胶囊矩形：面板以它为展开动画起点（长大）与收起终点（缩回）
+            capsuleRectOnScreen(ctrl)?.let { r ->
+                putExtra(ArkConstants.EXTRA_CAPSULE_LEFT, r[0])
+                putExtra(ArkConstants.EXTRA_CAPSULE_TOP, r[1])
+                putExtra(ArkConstants.EXTRA_CAPSULE_WIDTH, r[2])
+                putExtra(ArkConstants.EXTRA_CAPSULE_HEIGHT, r[3])
+            }
+        }
+
+        try {
+            ctx.startActivity(intent)
+            lastLaunchAt = now
+            clickHandledAt = now
+            XposedBridge.log(
+                "$TAG: msg panel launched, pkg=$pkg title='$title' textLen=${text?.length ?: 0} avatar=${avatar != null}"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG msg startActivity failed: ${t.message}")
+        }
+    }
+
+    /** mNotificationEntries 里 postTime 最新的微信/QQ 原通知（排除影子通知） */
+    private fun latestMessageSbn(ctrl: Any, pkg: String): Any? = try {
+        val entries = XposedHelpers.getObjectField(ctrl, "mNotificationEntries") as? List<*>
+        var best: Any? = null
+        var bestAt = -1L
+        entries?.forEach { pe ->
+            if (pe == null) return@forEach
+            val entry = try {
+                XposedHelpers.callMethod(pe, "getRepresentativeEntry") ?: return@forEach
+            } catch (_: Throwable) {
+                return@forEach
+            }
+            val sbn = try {
+                XposedHelpers.callMethod(entry, "getSbn") ?: return@forEach
+            } catch (_: Throwable) {
+                return@forEach
+            }
+            val p = try {
+                XposedHelpers.callMethod(sbn, "getPackageName") as? String
+            } catch (_: Throwable) {
+                null
+            } ?: return@forEach
+            if (p != pkg) return@forEach
+            val tag = try {
+                XposedHelpers.callMethod(sbn, "getTag") as? String
+            } catch (_: Throwable) {
+                null
+            }
+            if (tag == ArkMessageLiveInjector.SHADOW_TAG) return@forEach
+            val at = try {
+                XposedHelpers.callMethod(sbn, "getPostTime") as? Long ?: 0L
+            } catch (_: Throwable) {
+                0L
+            }
+            if (at >= bestAt) {
+                bestAt = at
+                best = sbn
+            }
+        }
+        best
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: latestMessageSbn failed: ${t.message}")
+        null
+    }
+
+    /** largeIcon → Bitmap（位图型直接取，其余走 loadDrawable 转码；失败返回 null） */
+    private fun avatarBitmapOf(ctx: Context, icon: android.graphics.drawable.Icon?): Bitmap? {
+        if (icon == null) return null
+        return try {
+            // TYPE_BITMAP(1) / TYPE_ADAPTIVE_BITMAP(5)：getBitmap 直接取
+            val t = XposedHelpers.callMethod(icon, "getType") as? Int
+            if (t == 1 || t == 5) {
+                XposedHelpers.callMethod(icon, "getBitmap") as? Bitmap
+            } else {
+                val d = XposedHelpers.callMethod(icon, "loadDrawable", ctx)
+                    as? android.graphics.drawable.Drawable ?: return null
+                val w = d.intrinsicWidth.takeIf { it > 0 } ?: 128
+                val h = d.intrinsicHeight.takeIf { it > 0 } ?: 128
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                val c = android.graphics.Canvas(bmp)
+                d.setBounds(0, 0, w, h)
+                d.draw(c)
+                bmp
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 一次 MediaSession 快照（当前媒体 App：QQ音乐/网易云音乐）
+     */
     private class SessionSnapshot(
         val title: String?,
         val artist: String?,

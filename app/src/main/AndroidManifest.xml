@@ -37,6 +37,19 @@
             android:windowSoftInputMode="stateAlwaysHidden"
             android:showWhenLocked="true" />
 
+        <!-- v3.15.39：点击消息胶囊展开的消息大卡（微信 / QQ）。
+             不设 showWhenLocked：聊天正文不允许出现在锁屏上（胶囊本体只是占位文案），
+             锁屏点胶囊无动作。 -->
+        <activity
+            android:name=".ArkMessagePanelActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Ark.CapsulePanel"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.flymeark.msgpanel"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|fontScale"
+            android:windowSoftInputMode="stateAlwaysHidden" />
+
         <!-- LSPosed 模块元数据 -->
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription" android:value="一个针对魅族实况通知的优化模块插件。在 LSPosed 中勾选并启用推荐应用，然后到 设置-通知与状态栏-实况通知 里打开对应 App 的开关即可&#10;开发者：多爱梦" />
