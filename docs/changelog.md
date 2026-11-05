@@ -2,6 +2,28 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.27~29 影子通知隐藏定稿（高度钳零 + tag 判定）
+
+三个根因，全部由真机探针定位：
+
+- **v3.15.27 隐藏方式换成「高度钳零」**。v3.15.26 的 `setVisibility(GONE)` 只在首次绑定
+  有效，影子通知更新时行被复用、系统重算布局又设回 VISIBLE，玻璃卡复发。
+  改为 hook `ExpandableNotificationRow` 的 `getIntrinsicHeight` / `getMinHeight()` /
+  `getMinHeight(boolean)` / `getCollapsedHeight` / `getMaxExpandHeight`，影子行返回 0，
+  并把 alpha 设 0。这些方法每帧布局都会调用，系统重置 visibility 也绕不过去。
+- **v3.15.27 tag 判定取代 extras 判定**。探针打出 `probe-err:
+  android.app.Notification#getExtras[]`：**SystemUI 进程里反射调
+  `Notification.getExtras()` 直接抛 NoSuchMethodError**（Flyme 改动），
+  此前用 extras 里的 `KEY_SHADOW` 判定每条都落到 false。
+  改用 `sbn.getTag() == "flymeark_live_msg"`（影子通知固定 tag），一次命中。
+- **v3.15.29 展开形态不被压掉**。高度钳零会连点胶囊弹出的实况大卡一起吃掉。
+  在钳零前判断 `isExpanded()` / `isHeadsUpState()`：展开/横幅状态不钳零且恢复 alpha=1，
+  收起时才压 0。
+- **v3.15.29 销毁同步修复**。`onNotificationRemoved` 里同样用 `getExtras()` 判定，异常把
+  整段 try 吞掉 → 清除逻辑从未执行 → **胶囊永驻**。改为 tag 判定（tag 不是影子才同步清除）。
+
+真机验证：通知栏无玻璃空卡 ✓、原生卡片保留 ✓、状态栏胶囊（绿底+头像+白字）正常 ✓。
+
 ## 2026-11-05 · v3.15.26 影子通知落地修复（Context + 行级隐藏）
 
 - **v3.15.25**：`AndroidAppHelper.currentApplication()` 在微信/QQ notify 时仍为 null
