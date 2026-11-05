@@ -1,6 +1,7 @@
 package com.flymeark
 
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -184,19 +185,16 @@ internal object ArkLiveShadowHook {
                     }
                     if (tag == ArkMessageLiveInjector.SHADOW_TAG) return
                     clearShadowNotification(param.thisObject, pkg)
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    XposedBridge.log(
+                        "[${ArkConstants.LOG_TAG}] $TAG removal sync error: ${Log.getStackTraceString(t)}"
+                    )
                 }
             }
         }
 
-        ArkHooks.quiet("$TAG onNotificationRemoved(2)") {
-            XposedHelpers.findAndHookMethod(
-                NOTIF_LISTENER, lpp.classLoader, "onNotificationRemoved",
-                "android.service.notification.StatusBarNotification",
-                "android.service.notification.NotificationListenerService\$RankingMap",
-                hook
-            )
-        }
+        // 只 hook 3 参版本：SystemUI 的 2 参 onNotificationRemoved 内部会转调 3 参，
+        // 两个都 hook 会导致同一次移除触发两次清理（v3.15.34 日志已见重复调用）。
         ArkHooks.quiet("$TAG onNotificationRemoved(3)") {
             XposedHelpers.findAndHookMethod(
                 NOTIF_LISTENER, lpp.classLoader, "onNotificationRemoved",
@@ -208,24 +206,95 @@ internal object ArkLiveShadowHook {
         }
     }
 
+    /**
+     * 清掉某 App 的影子通知。
+     *
+     * v3.15.34 走 `IStatusBarService.onNotificationClear` 一直失败（日志只有
+     * `clear shadow failed: null`，异常 message 为 null 说明是 NPE，拿不到堆栈就没法定位）。
+     *
+     * v3.15.35 改为**优先用 listener 自己的 `cancelNotification(key)`**：
+     * SystemUI 的 `NotificationListener extends NotificationListenerService`，
+     * 本身就有监听器权限，取消一条别人发的通知是这个类的本职能力，不需要拼 uid / 反射 binder。
+     * key 也优先从 `getActiveNotifications()` 里直接取真实值，不自己拼。
+     */
     private fun clearShadowNotification(listener: Any, pkg: String) {
+        val key = activeShadowKey(listener, pkg) ?: buildShadowKey(listener, pkg)
+        if (key == null) {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG shadow key unresolved for $pkg")
+            return
+        }
         try {
-            val ctx = try {
-                XposedHelpers.callMethod(listener, "getContext") as? android.content.Context
-            } catch (_: Throwable) {
-                null
-            } ?: XposedHelpers.getObjectField(listener, "mContext") as? android.content.Context
-                ?: return
-            val uid = ctx.packageManager.getApplicationInfo(pkg, 0).uid
-            val key = "0|$pkg|${ArkMessageLiveInjector.SHADOW_ID}|" +
-                "${ArkMessageLiveInjector.SHADOW_TAG}|$uid"
+            XposedHelpers.callMethod(listener, "cancelNotification", key)
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG shadow cancelled for $pkg key=$key")
+            return
+        } catch (t: Throwable) {
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG listener cancel failed: ${Log.getStackTraceString(t)}"
+            )
+        }
+        clearViaStatusBarService(listener, pkg, key)
+    }
 
+    /** 从 listener 当前持有的活动通知里找出影子的真实 key（最可靠，不依赖 key 格式） */
+    private fun activeShadowKey(listener: Any, pkg: String): String? = try {
+        val arr = XposedHelpers.callMethod(listener, "getActiveNotifications") as? Array<*>
+        arr?.firstNotNullOfOrNull { item ->
+            if (item == null) return@firstNotNullOfOrNull null
+            val p = XposedHelpers.callMethod(item, "getPackageName") as? String
+            val tag = XposedHelpers.callMethod(item, "getTag") as? String
+            if (p == pkg && tag == ArkMessageLiveInjector.SHADOW_TAG) {
+                XposedHelpers.callMethod(item, "getKey") as? String
+            } else {
+                null
+            }
+        }
+    } catch (t: Throwable) {
+        XposedBridge.log(
+            "[${ArkConstants.LOG_TAG}] $TAG active notifications failed: ${Log.getStackTraceString(t)}"
+        )
+        null
+    }
+
+    /** 手工拼 key（兜底）：`0|pkg|id|tag|uid` */
+    private fun buildShadowKey(listener: Any, pkg: String): String? = try {
+        val ctx = listenerContext(listener) ?: return null
+        val uid = ctx.packageManager.getApplicationInfo(pkg, 0).uid
+        "0|$pkg|${ArkMessageLiveInjector.SHADOW_ID}|" +
+            "${ArkMessageLiveInjector.SHADOW_TAG}|$uid"
+    } catch (t: Throwable) {
+        XposedBridge.log(
+            "[${ArkConstants.LOG_TAG}] $TAG build key failed: ${Log.getStackTraceString(t)}"
+        )
+        null
+    }
+
+    private fun listenerContext(listener: Any): android.content.Context? {
+        try {
+            (XposedHelpers.callMethod(listener, "getContext") as? android.content.Context)
+                ?.let { return it }
+        } catch (_: Throwable) {
+        }
+        for (f in arrayOf("mContext", "mBarServiceContext")) {
+            try {
+                (XposedHelpers.getObjectField(listener, f) as? android.content.Context)
+                    ?.let { return it }
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
+    /** 最后兜底：直接找 statusbar 服务清通知 */
+    private fun clearViaStatusBarService(listener: Any, pkg: String, key: String) {
+        try {
+            val ctx = listenerContext(listener) ?: return
+            val uid = ctx.packageManager.getApplicationInfo(pkg, 0).uid
             val binder = Class.forName("android.os.ServiceManager")
                 .getMethod("getService", String::class.java)
                 .invoke(null, "statusbar") as? android.os.IBinder ?: return
             val iface = Class.forName("com.android.internal.statusbar.IStatusBarService\$Stub")
                 .getMethod("asInterface", android.os.IBinder::class.java)
-                .invoke(null, binder)
+                .invoke(null, binder) ?: return
 
             val visibilityCls =
                 Class.forName("com.android.internal.statusbar.NotificationVisibility")
@@ -239,9 +308,13 @@ internal object ArkLiveShadowHook {
                 visibilityCls
             ).invoke(iface, pkg, 0, key, 1, 1, null)
 
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG shadow cleared for $pkg")
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG shadow cleared via statusbar for $pkg uid=$uid"
+            )
         } catch (t: Throwable) {
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG clear shadow failed: ${t.message}")
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG clear via statusbar failed: ${Log.getStackTraceString(t)}"
+            )
         }
     }
 }

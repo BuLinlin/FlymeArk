@@ -59,6 +59,16 @@ internal object ArkMessageLiveInjector {
     /** 每个 App 一条影子通知，id 固定 */
     const val SHADOW_ID = 0x4B000001
 
+    /**
+     * 防重入标记。`NotificationManager.notify(int,Notification)` 内部会转调
+     * `notify(String,int,Notification)`，两个重载都被 hook 时同一条原始通知会生成两条影子。
+     * before 置 true、after 复位，内层调用命中 true 直接跳过。
+     */
+    private val inNotify = ThreadLocal<Boolean>()
+
+    /** 标记「这次 hook 调用拥有 inNotify」，只有拥有者才能在 after 里复位 */
+    private const val OWNER_KEY = "flymeark_notify_owner"
+
     fun isShadowNotification(n: Notification): Boolean = try {
         n.extras?.getBoolean(KEY_SHADOW) == true
     } catch (_: Throwable) {
@@ -120,7 +130,7 @@ internal object ArkMessageLiveInjector {
         // v3.15.33：胶囊只放隐私占位，不放昵称 / 群名 / 正文。
         // 正文仍在原生通知卡片里，点卡片或点胶囊都能进会话，信息不丢。
         val appLabel = ArkConstants.messageAppLabel(pkg)
-        val count = sessionMessageCount(extras, rawText)
+        val count = sessionMessageCount(extras, rawText, rawTitle)
         val content = if (count > 1) {
             "有 $count 条新消息 · 点击查看"
         } else {
@@ -214,20 +224,28 @@ internal object ArkMessageLiveInjector {
      *
      * 按可靠性依次回退：
      * ① 正文前缀 `[4条]xxx: yyy` —— 微信自己写的会话未读数，最准；
-     * ② MessagingStyle 的 `android.messages` 数组 —— 统计与最新一条同 sender 的条数；
-     * ③ `android.textLines` —— 每行 `名字: 内容`，统计与最后一行同名者的条数；
-     * ④ 都拿不到返回 0，只显示「有新消息」，宁可不报数也不报错数。
+     * ② 标题后缀 `群名(2条新消息)` —— **QQ 走这条**（实测 title=佩奇VIP通知38群(2条新消息)，
+     *    正文只有最新一条、number=0，条数只在标题里）；
+     * ③ MessagingStyle 的 `android.messages` 数组 —— 统计与最新一条同 sender 的条数；
+     * ④ `android.textLines` —— 每行 `名字: 内容`，统计与最后一行同名者的条数；
+     * ⑤ 都拿不到返回 0，只显示「有新消息」，宁可不报数也不报错数。
      */
     private val COUNT_IN_TEXT = Regex("""(\d+)\s*条""")
 
-    private fun sessionMessageCount(extras: Bundle, text: String?): Int {
-        // ① 微信 / TIM 风格
+    private fun sessionMessageCount(extras: Bundle, text: String?, title: String?): Int {
+        // ① 微信 / TIM 风格：正文前缀 [4条]
         if (!text.isNullOrBlank()) {
             val n = COUNT_IN_TEXT.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
             if (n > 1) return n
         }
 
-        // ② MessagingStyle
+        // ② QQ 风格：标题后缀 (2条新消息)
+        if (!title.isNullOrBlank()) {
+            val n = COUNT_IN_TEXT.find(title)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            if (n > 1) return n
+        }
+
+        // ③ MessagingStyle
         try {
             val msgs = extras.getParcelableArray("android.messages")
             if (!msgs.isNullOrEmpty()) {
@@ -245,7 +263,7 @@ internal object ArkMessageLiveInjector {
         } catch (_: Throwable) {
         }
 
-        // ③ textLines
+        // ④ textLines
         try {
             val lines = extras.getCharSequenceArray("android.textLines")
             if (!lines.isNullOrEmpty()) {
@@ -315,14 +333,32 @@ internal object ArkMessageLiveInjector {
         val notifyHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
+                    // 防重入：`notify(int,Notification)` 内部会转调
+                    // `notify(String,int,Notification)`，两个重载都被 hook 时同一条消息会
+                    // post 两次影子（v3.15.34 日志实测：同一 tid 相隔 5ms 两条 "shadow posted"）。
+                    // 用 ThreadLocal 标记外层调用，内层直接跳过；顺带也挡住 postShadow 自身
+                    // 调用 nm.notify 造成的递归。
+                    if (inNotify.get() == true) return
                     val n = param.args.filterIsInstance<Notification>().firstOrNull() ?: return
                     // 影子通知自身的发布：放行，不再生成影子
                     if (isShadowNotification(n)) return
                     if (!isMessageNotification(n)) return
+                    // 只有「真正把标记置位的那次调用」才有权在 after 里复位。
+                    // 否则内层调用（postShadow 里的 nm.notify）会在自己的 after 里提前把标记清掉，
+                    // 等外层原方法继续转调 notify(String,int,Notification) 时标记已失效 → 又重复 post。
+                    param.setObjectExtra(OWNER_KEY, true)
+                    inNotify.set(true)
                     // 原通知**不做任何修改**，只在旁边补一条实况影子通知
                     postShadow(pkg, n, param.thisObject)
                 } catch (t: Throwable) {
                     XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")
+                }
+            }
+
+            override fun afterHookedMethod(param: MethodHookParam) {
+                if (param.getObjectExtra(OWNER_KEY) == true) {
+                    param.setObjectExtra(OWNER_KEY, null)
+                    inNotify.set(false)
                 }
             }
         }

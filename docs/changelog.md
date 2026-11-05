@@ -2,6 +2,26 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.35 条数补 QQ 标题来源 + 修重复影子 + 修影子清不掉
+
+v3.15.34 装上后从模块日志与 `dumpsys notification` 抓到三个确凿问题：
+
+1. **QQ 条数永远是 0** —— 之前只用正则扫 `EXTRA_TEXT`，但 QQ 的条数在**标题**里：
+   `android.title=佩奇VIP通知38群(2条新消息)`，正文只有最新一条、`number=0`。
+   → 正则依次扫正文（微信 `[4条]`）与标题（QQ `(2条新消息)`）。
+2. **同一条消息 post 两条影子** —— 日志里同一 tid 相隔 5ms 出现两条 `shadow posted`。
+   `NotificationManager.notify(int,Notification)` 内部转调
+   `notify(String,int,Notification)`，两个重载都被 hook 时命中两次。
+   → 加 ThreadLocal 防重入（before 置位 / after 复位），内层调用直接跳过。
+3. **影子通知清不掉（胶囊永驻）** —— 日志只有 `clear shadow failed: null`，
+   异常 message 为 null 说明是 NPE，无从定位。原实现手工拼 key +
+   反射 `IStatusBarService.onNotificationClear`，任一环节炸掉就静默失败。
+   → 改为优先调 SystemUI listener 自身（`NotificationListener extends
+   NotificationListenerService`）的 `cancelNotification(key)`，key 直接从
+   `getActiveNotifications()` 取真实值；失败才回退 IStatusBarService，且异常一律打完整堆栈。
+
+另外 `onNotificationRemoved` 只 hook 3 参版本（2 参内部转调 3 参，双 hook 会清理两次）。
+
 ## 2026-11-05 · v3.15.34 条数改「按会话统计」+ 连续消息不再卡住
 
 用户反馈两点：**连续发消息胶囊会卡住**、**条数统计错了**（要的是"当前这个人给我发了多少条"）。
