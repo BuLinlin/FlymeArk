@@ -2,7 +2,20 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
-## 2026-11-05 · v3.15.21 通知栏恢复 × 一键清除
+## 2026-11-05 · v3.15.23 撤销 sbn.isLive 拦截（修复胶囊点击失效）
+
+- **撤销 v3.15.22 的 `StatusBarNotification.isLive()` 调用栈分流 hook**。该方案虽让通知栏渲染链读到 false，
+  但同时切断了 `NotificationStackScrollLayout.addTrackingLiveExpandableView` 的实况视图触摸追踪，
+  导致**状态栏胶囊无法点击**。已验证：撤掉后点击恢复。
+- **新的逆向结论**：SystemUI 渲染实况卡片时，从通知自身布局里找三个 Flyme 约定插槽
+  `rl_header_live`(0x010206da)、`iv_extends1_live`(0x0102066e)、`iv_extends2_live`(0x0102066f)。
+  魅况能显示内容是因为它自带含这些 id 的 RemoteViews；微信/QQ 用的是系统模板，没有这些插槽，
+  所以实况卡片必然渲染成「空白玻璃底 + 空心圆」。
+- 也就是说：**同一条通知上，「原生通知卡片」与「实况卡片」互斥**，无法靠拦 `isLive()` 两全。
+  如需原生卡片样式，必须拆成两条通知（原通知不注入 + 另一条实况通知供胶囊使用），
+  并在 ShadeListBuilder 层把实况通知从通知栏列表里过滤掉。
+
+## 2026-11-05 · v3.15.21 通知栏恢复 × 一键清除（行级标志，已被 v3.15.22/23 取代）
 
 ### 问题
 
