@@ -2,6 +2,19 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.26 影子通知落地修复（Context + 行级隐藏）
+
+- **v3.15.25**：`AndroidAppHelper.currentApplication()` 在微信/QQ notify 时仍为 null
+  （Application 未创建 / push 子进程），影子通知被跳过（日志 `no app context`）。
+  改为从 `NotificationManager.mContext`（notify 的 thisObject 持有）取 Context，
+  任何时机都可用；同时移除 App 侧 cancel hook（App 取消任意通知都会误清胶囊），
+  销毁同步统一走 SystemUI 的 onNotificationRemoved。
+- **v3.15.26**：`ShadeListBuilder.applyFilters` 在 Flyme 管线中从未被调用（探针 0 命中），
+  数据层过滤不可行。uiautomator 确认实况卡就是 `notification_stack_scroller` 里的
+  `expandableNotificationRow`（framework 实况模板 `rl_live_base`/`rl_header_live`），
+  改在 `ExpandableView.setLiveNotification`（行绑定必经）里对影子行 GONE、
+  复用恢复 VISIBLE。真机验证：原生卡片 ✓、玻璃卡消失 ✓、状态栏胶囊恢复 ✓。
+
 ## 2026-11-05 · v3.15.24 双通知拆分：通知栏原生卡片 + 独立实况胶囊
 
 **架构改动**：微信/QQ 的消息胶囊不再靠"篡改原通知"实现，改为两条通知分工。

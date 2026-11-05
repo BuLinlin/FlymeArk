@@ -80,14 +80,34 @@ internal object ArkMessageLiveInjector {
         null
     }
 
+    /**
+     * 取可用 Context。**优先用 NotificationManager 实例自带的 `mContext`**：
+     * v3.15.24 实测微信/QQ 在 notify 时 `AndroidAppHelper.currentApplication()` 仍返回 null
+     * （Application 尚未创建 / 调用发生在 push 子进程），导致影子通知被整个跳过。
+     * NotificationManager 的 `mContext` 是构造时就持有的，任何时机都可用。
+     */
+    private fun contextOf(nm: Any?): Context? {
+        try {
+            if (nm != null) {
+                val c = XposedHelpers.getObjectField(nm, "mContext") as? Context
+                if (c != null) return c
+            }
+        } catch (_: Throwable) {
+        }
+        return appContext()
+    }
+
     /** 发布/更新影子实况通知（不影响原通知） */
-    private fun postShadow(pkg: String, src: Notification) {
-        val ctx = appContext() ?: run {
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG no app context, skip shadow")
+    private fun postShadow(pkg: String, src: Notification, nmAny: Any?) {
+        val nm = nmAny as? NotificationManager
+        val ctx = contextOf(nmAny) ?: run {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG no context, skip shadow")
             return
         }
-        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return
+        if (nm == null) {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG no NotificationManager, skip shadow")
+            return
+        }
 
         val extras = try { src.extras } catch (_: Throwable) { null } ?: return
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
@@ -176,15 +196,6 @@ internal object ArkMessageLiveInjector {
         }
     }
 
-    /** 取消影子通知（原通知被清掉时同步） */
-    fun cancelShadow(ctx: Context) {
-        try {
-            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            nm?.cancel(SHADOW_TAG, SHADOW_ID)
-        } catch (_: Throwable) {
-        }
-    }
-
     /**
      * 取消息发送者头像。优先 extras 里现成的 `android.largeIcon`（Icon 类型，跨进程不丢），
      * 不要用 `Icon.createWithBitmap` 重建——实测重建的 Icon parcel 到 SystemUI 后读回 null。
@@ -219,23 +230,17 @@ internal object ArkMessageLiveInjector {
                     if (isShadowNotification(n)) return
                     if (!isMessageNotification(n)) return
                     // 原通知**不做任何修改**，只在旁边补一条实况影子通知
-                    postShadow(pkg, n)
+                    postShadow(pkg, n, param.thisObject)
                 } catch (t: Throwable) {
                     XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")
                 }
             }
         }
 
-        // 原通知被 App 自己取消时，同步撤掉影子（避免胶囊残留）
-        val cancelHook = object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                try {
-                    val ctx = appContext() ?: return
-                    cancelShadow(ctx)
-                } catch (_: Throwable) {
-                }
-            }
-        }
+        // 注：不在 App 侧 hook cancel 同步影子。App 的 cancel 调用可能来自任意通知
+        // （登录提示、下载进度等），一律清影子会让胶囊莫名消失。
+        // 销毁同步统一放在 SystemUI 的 onNotificationRemoved（ArkLiveShadowHook），
+        // 只在「这个 App 的消息通知真的被移除」时才清。
 
         ArkHooks.quiet("$TAG notify") {
             val nmClass = XposedHelpers.findClass("android.app.NotificationManager", lpp.classLoader)
@@ -249,19 +254,6 @@ internal object ArkMessageLiveInjector {
                     nmClass, "notify",
                     String::class.java, Int::class.javaPrimitiveType, Notification::class.java, notifyHook
                 )
-            }
-            ArkHooks.quiet("$TAG cancel(id)") {
-                XposedHelpers.findAndHookMethod(
-                    nmClass, "cancel", Int::class.javaPrimitiveType, cancelHook
-                )
-            }
-            ArkHooks.quiet("$TAG cancel(tag,id)") {
-                XposedHelpers.findAndHookMethod(
-                    nmClass, "cancel", String::class.java, Int::class.javaPrimitiveType, cancelHook
-                )
-            }
-            ArkHooks.quiet("$TAG cancelAll") {
-                XposedHelpers.findAndHookMethod(nmClass, "cancelAll", cancelHook)
             }
         }
     }
