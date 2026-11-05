@@ -21,7 +21,9 @@ class ArkEntry : IXposedHookLoadPackage {
 
     override fun handleLoadPackage(lpp: XC_LoadPackage.LoadPackageParam) {
         when (lpp.packageName) {
-            "android" -> {
+            // system_server 在不同 LSPosed 上可能以 "android" 或 "system" 上报包名，
+            // 两个都接住，否则模块进不去系统进程（[ArkLiveAllowHook] 不加载）。
+            "android", "system" -> {
                 ArkLiveAllowHook.install(lpp)
                 return
             }

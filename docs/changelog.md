@@ -2,6 +2,21 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.30 作用域补全（system + android 双声明）
+
+- 真机取证（`/data/adb/lspd/config/modules_config.db` 的 `scope` 表）确认模块已勾选的
+  作用域为：`android` / `system` / `systemui` / `settings` / 微信 / QQ / QQ音乐 / 网易云。
+- 问题：`scope.list` 只声明了 `system`，而本机 LSPosed 把「推荐应用」标签打在
+  **Flyme 系统服务（包名 android）** 那条上，「系统框架（system）」没有标签，
+  用户不知道该勾哪个。
+- 修复：`scope.list` 与 `arrays.xml` 的 `xposed_scope` 同时声明 `system` 和 `android`；
+  [ArkEntry] 与 [ArkLiveAllowHook] 的进程判断也同时接受这两个包名，
+  保证任何 LSPosed 展示形态下模块都能进系统进程。
+- 顺带修 [ArkLiveAllowHook] 的方法查找：原实现只遍历 `NotificationManagerService$N`
+  内部类，本机日志为 `no inner class declares setNotificationLiveAllowForPackage`。
+  Flyme 把签名声明在 `RankingConfig` 接口里，改为「内部类 → 自身及父类链 →
+  实现 RankingConfig 的内部类」三级回退。
+
 ## 2026-11-05 · v3.15.27~29 影子通知隐藏定稿（高度钳零 + tag 判定）
 
 三个根因，全部由真机探针定位：

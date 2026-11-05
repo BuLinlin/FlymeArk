@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- LSPosed 推荐作用域：安装后管理器据此提示勾选。
-         「system」= 系统框架（system_server），用于感知用户切换「实况通知」开关的动作，
-         让关闭开关实时生效（hook setNotificationLiveAllowForPackage）。
-         注意：LSPosed 里 system_server 的 scope key 是「system」，不是「android」。 -->
+         系统进程必须勾选，否则 [ArkLiveAllowHook] 不加载。
+         v3.15.30 起同时声明 `system` 与 `android` 两个 key：不同版本的 LSPosed 对
+         system_server 的展示名不一致（本机 Flyme 上「Flyme 系统服务(android)」带推荐标签，
+         「系统框架(system)」没有），两个都声明才能保证用户在任何一台上都能看到推荐提示。 -->
     <string-array name="xposed_scope">
-        <!-- 系统框架（system_server）：感知实况通知开关的「用户动作」，关闭实时生效 -->
+        <!-- 系统进程（system_server）：感知实况通知开关的「用户动作」，关闭实时生效 -->
         <item>system</item>
+        <item>android</item>
         <!-- 目标播放器：QQ音乐（打开魅族状态栏歌词通道） -->
         <item>com.tencent.qqmusic</item>
         <!-- 目标播放器：网易云音乐（同为魅族状态栏歌词协议，v3.15 起支持） -->

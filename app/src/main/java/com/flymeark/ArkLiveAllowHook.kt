@@ -31,7 +31,7 @@ internal object ArkLiveAllowHook {
     private const val TAG = "liveAllow"
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
-        if (lpp.packageName != "android") return
+        if (lpp.packageName != "android" && lpp.packageName != "system") return
 
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: hook setNotificationLiveAllowForPackage")
 
@@ -43,40 +43,78 @@ internal object ArkLiveAllowHook {
         val nmCls = XposedHelpers.findClass(
             "com.android.server.notification.NotificationManagerService", lpp.classLoader
         )
+
+        val callback = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val pkg = param.args[0] as? String ?: return
+                    if (!ArkConstants.isMediaApp(pkg)) return
+                    val allow = param.args[2] as? Boolean ?: return
+                    XposedBridge.log(
+                        "[${ArkConstants.LOG_TAG}] $TAG: user toggled live for $pkg -> $allow"
+                    )
+                    notifySystemUI(pkg, allow)
+                } catch (t: Throwable) {
+                    XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")
+                }
+            }
+        }
+
+        fun tryHook(m: java.lang.reflect.Method?): Boolean {
+            if (m == null) return false
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG: hooking ${m.declaringClass.name}#${m.name}"
+            )
+            XposedBridge.hookMethod(m, callback)
+            return true
+        }
+
+        fun findIn(cls: Class<*>): java.lang.reflect.Method? = try {
+            cls.getDeclaredMethod(
+                "setNotificationLiveAllowForPackage",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Boolean::class.javaPrimitiveType
+            )
+        } catch (_: Throwable) {
+            null
+        }
+
         var hooked = false
+        // ① 内部类（早期版本 / 通用 ROM：方法在 INotificationManager$Stub 的实现里）
         for (inner in nmCls.declaredClasses) {
             if (!inner.name.startsWith("com.android.server.notification.NotificationManagerService$")) continue
-            val m = try {
-                inner.getDeclaredMethod(
-                    "setNotificationLiveAllowForPackage",
-                    String::class.java,
-                    Int::class.javaPrimitiveType,
-                    Boolean::class.javaPrimitiveType
-                )
-            } catch (_: Throwable) {
-                null
-            } ?: continue
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: hooking ${inner.name}")
-            XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    try {
-                        val pkg = param.args[0] as? String ?: return
-                        if (!ArkConstants.isMediaApp(pkg)) return
-                        val allow = param.args[2] as? Boolean ?: return
+            if (tryHook(findIn(inner))) {
+                hooked = true
+                break
+            }
+        }
+        // ② 自身及父类链（Flyme 可能把实现放在别的类里）
+        if (!hooked) {
+            var c: Class<*>? = nmCls
+            while (c != null && !hooked) {
+                if (tryHook(findIn(c))) hooked = true
+                c = c.superclass
+            }
+        }
+        // ③ RankingConfig 接口（Flyme 把签名声明在接口里，实现在私有类）
+        if (!hooked) {
+            for (inner in nmCls.declaredClasses) {
+                for (iface in inner.interfaces) {
+                    if (iface.name.endsWith("RankingConfig")) {
                         XposedBridge.log(
-                            "[${ArkConstants.LOG_TAG}] $TAG: user toggled live for $pkg -> $allow"
+                            "[${ArkConstants.LOG_TAG}] $TAG: RankingConfig impl = ${inner.name}"
                         )
-                        notifySystemUI(pkg, allow)
-                    } catch (t: Throwable) {
-                        XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")
+                        if (tryHook(findIn(inner))) hooked = true
                     }
                 }
-            })
-            hooked = true
-            break
+            }
         }
         if (!hooked) {
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: no inner class declares setNotificationLiveAllowForPackage")
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG: setNotificationLiveAllowForPackage not found; " +
+                    "开关实时同步不可用（胶囊功能不受影响）"
+            )
         }
     }
 
