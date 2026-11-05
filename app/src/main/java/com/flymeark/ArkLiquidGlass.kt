@@ -123,9 +123,9 @@ internal object ArkLiquidGlass {
             edgePx = edge,
             edgeShift = edge * EDGE_SHIFT_RATIO,
             dispersion = DISPERSION,
-            // v3.15.44：投影 18dp、描边取 IslandTokens 高光色
+            // v3.15.44：投影 18dp；描边与边缘高光同源（applyEdgeColors 实际读取，非死参数）
             shadowDp = ArkTokens.ELEVATION_DP.toFloat(),
-            strokeRgb = if (light) ArkTokens.HIGHLIGHT_LIGHT else ArkTokens.HIGHLIGHT_DARK,
+            strokeRgb = if (light) 0x66FFFFFF.toInt() else 0x5AFFFFFF.toInt(),
         )
         cached = SystemClock.elapsedRealtime() to p
         return p

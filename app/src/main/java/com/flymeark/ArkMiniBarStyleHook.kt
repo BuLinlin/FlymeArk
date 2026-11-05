@@ -80,8 +80,9 @@ internal object ArkMiniBarStyleHook {
     @Volatile
     private var circleId = 0
 
-    /** 每个头部 + 深浅组合只打一条日志，避免通知刷新时刷屏 */
+    /** 每个头部 + 深浅组合只打一条日志，避免通知刷新时刷屏（上限兜底，防长驻进程缓慢增长） */
     private val logged: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
+    private const val LOGGED_CAP = 512
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         if (lpp.packageName != ArkConstants.SYSTEMUI_PKG) return
@@ -141,8 +142,8 @@ internal object ArkMiniBarStyleHook {
             applyCircle(root, night)
 
             // 背景是唯一会替换 View 已有状态的操作，带保守 guard
-            if (header != null) applyBackground(header, night)
-            logOnce(header ?: root, night)
+            val bgApplied = if (header != null) applyBackground(header, night) else false
+            logOnce(header ?: root, night, bgApplied)
         } catch (t: Throwable) {
             XposedBridge.log("[$TAG] style skipped: $t")
         }
@@ -152,12 +153,16 @@ internal object ArkMiniBarStyleHook {
      * 只在头部**没有系统原生背景**时铺玻璃；已有背景（模糊底 / ripple / 不透明基底）
      * 一律不覆盖，退化成「只改文字色 + 圆环颜色」，绝不削弱系统提供的对比度基底。
      */
-    private fun applyBackground(header: View, night: Boolean) {
+    private fun applyBackground(header: View, night: Boolean): Boolean {
         val current = header.background
-        if (current != null && current !is ArkMiniBarGlass) return
+        if (current != null && current !is ArkMiniBarGlass) {
+            // 系统已给头部下发了模糊/波纹/不透明底 → 不覆盖，退化只改文字色 + 圆环颜色
+            return false
+        }
         // 同深浅且已是我们自己的玻璃 → 不重建，避免通知刷新时反复分配
-        if (current is ArkMiniBarGlass && current.night == night) return
+        if (current is ArkMiniBarGlass && current.night == night) return false
         header.background = ArkMiniBarGlass(night, header.resources.displayMetrics.density)
+        return true
     }
 
     /** 一级色给标题、二级色给副标题；不改字号（见文件头「克制项」） */
@@ -220,11 +225,13 @@ internal object ArkMiniBarStyleHook {
         idsReady = true
     }
 
-    private fun logOnce(v: View, night: Boolean) {
+    private fun logOnce(v: View, night: Boolean, bgApplied: Boolean) {
         val key = System.identityHashCode(v).toString() + "/" + night
+        if (logged.size > LOGGED_CAP) logged.clear()
         if (!logged.add(key)) return
         XposedBridge.log(
-            "[$TAG] styled: night=$night header=#$headerId title=#$titleId circle=#$circleId"
+            "[$TAG] styled: night=$night header=#$headerId title=#$titleId circle=#$circleId" +
+                if (bgApplied) "" else " (bg skipped: existing system background)"
         )
     }
 

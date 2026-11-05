@@ -587,15 +587,17 @@ class ArkCapsulePanelActivity : Activity() {
         val iconInk = ArkLiquidGlass.ink(icon, p)
         prevBtn.imageTintList = ColorStateList.valueOf(iconInk)
         nextBtn.imageTintList = ColorStateList.valueOf(iconInk)
-        playBtn.imageTintList = ColorStateList.valueOf(iconInk)
+        playBtn.imageTintList = ColorStateList.valueOf(
+            if (p.light) ArkTokens.BRAND_ON_LIGHT else ArkTokens.BRAND_ON_DARK
+        )
         outputBtn.imageTintList = ColorStateList.valueOf(iconInk)
         favBtn.imageTintList = ColorStateList.valueOf(
             // 已收藏：跟专辑主题色走（系统媒体卡同款思路），未收藏用玻璃 ink 色
             if (favKnown && favState) albumColor ?: iconInk else iconInk
         )
 
-        // 播放器主按钮：同一套玻璃材质做成圆形（58dp / 2 半径）
-        ArkLiquidGlass.attach(playBtn, p, 29f * resources.displayMetrics.density)
+        // 播放器主按钮：品牌色圆形（bg_ark_play_btn.xml）直接生效，不再覆盖玻璃；
+        // 图标 tint 用品牌上文字色，保证压在品牌圆上可读（v3.15.44 回归修正 D1）
         // 进度条轨道也吃玻璃 ink，避免死白/死黑
         progressBar.trackColor = ArkLiquidGlass.ink(
             if (p.light) ArkTokens.TRACK_LIGHT else ArkTokens.TRACK_DARK, p

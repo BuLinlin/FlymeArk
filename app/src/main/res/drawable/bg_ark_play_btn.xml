@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    v3.15.44 播放/暂停主按钮：品牌色圆形（亮 #2F6BFF / 暗 #8FB0FF）。
-    仅作首帧占位：运行时 applyPalette() 会用 ArkLiquidGlass.attach 换成 6 层玻璃，
-    因此图标 tint 继续保持玻璃 ink 色，不改成品牌上的白色，避免浅玻璃上白图标不可见。
+    v3.15.44 播放/暂停主按钮：品牌色圆形（亮 #2F6BFF / 暗 #8FB0FF），
+    运行时由 bg_ark_play_btn.xml 直接生效（已移除 applyPalette 里的 ArkLiquidGlass.attach
+    覆盖，见 v3.15.44 回归修正 D1）；图标 tint 走 ArkTokens.BRAND_ON_*（亮白 / 深蓝），
+    保证压在品牌圆上可读。
 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="oval">

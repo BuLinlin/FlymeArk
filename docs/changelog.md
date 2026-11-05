@@ -73,7 +73,7 @@
    `ArkLiquidGlass` 的兜底环境色与 `strokeRgb` 同步对齐 token。
 7. **落地清单**：`styles.xml`（18/14/12sp + 三级语义色）、`values-night/styles.xml`、
    新增 `colors.xml` / `values-night/colors.xml` / `dimens.xml`；
-   `bg_ark_panel.xml`（渐变玻璃 + 28dp + 1dp 高光）、新增 `bg_ark_panel_opaque.xml`（96%）；
+   `bg_ark_panel.xml`（渐变玻璃 + 28dp + 1dp 高光，仅首帧占位）；
    `bg_ark_play_btn.xml`（品牌色圆形）；`ArkLiquidGlass.kt` / `ArkLiquidGlassDrawable.kt`
    常量对齐；`ArkMorphAnim` 卡片终态圆角 30dp → 28dp（只改 token，不动动画）；
    两张大卡的 `applyPalette()` 运行时文字基色 / 轨道色 / 收藏图标普通色同步换成三级
@@ -81,19 +81,25 @@
    新增 `ArkTokens.kt`（Kotlin 令牌镜像）、`ArkMiniBarStyleHook.kt` 并在
    `ArkEntry` 的 SystemUI 分支安装。
 
-### 为什么选两个 XML 玻璃 drawable 而不是代码切换
+### 为什么只留一个 XML 玻璃 drawable
 
 `bg_ark_panel` 只服务于首帧占位（morph.prepare 之后由 `ArkLiquidGlassDrawable` 接管），
-运行时玻璃由 Kotlin 常量开关决定档位。纯资源方案不需要在启动时探测模糊能力、
-不改任何 Activity 代码；`values/` 与 `values-night/` 自动选亮暗，
-`bg_ark_panel_opaque.xml` 作为 96% 降级资源预留，代价只是多一个 XML 文件。
+运行时玻璃由 Kotlin 常量开关 `WINDOW_BLUR_AVAILABLE` 决定档位。纯资源方案不需要在启动时
+探测模糊能力、不改任何 Activity 代码；`values/` 与 `values-night/` 自动选亮暗。
+**QA 第 1 轮删除了原本新增的 `bg_ark_panel_opaque.xml`**：它是 0 引用的死资源——
+两张大卡运行时恒走 96%（面板无跨窗口模糊，`baseAlpha()` 返 `0xF5`），首帧又因
+`card.alpha=0f` 不可见，96% 预留档既不会被引用也不会被看到；与其留死文件，不如删掉。
+注意：**82%/86% 玻璃渐变 token 本轮只落地到迷你条 `ArkMiniBarGlass`**，两张大卡因窗口无模糊
+恒为 96% 不透明基底（与 v3.15.43「基底必须够厚」一致），验收时不要误以为大卡已换渐变。
 
 ### 已知边界（不虚报）
 
-- 播放按钮的 `bg_ark_play_btn.xml` 品牌圆同样是首帧占位：运行时 `applyPalette()` 会
-  `ArkLiquidGlass.attach(playBtn, ...)` 换成 6 层玻璃。要让品牌圆真正生效必须停掉这次
-  attach（属于功能改动），超出「只调样式」，本轮不动，图标 tint 也保持玻璃 ink 以免
-  白图标压在浅玻璃上不可见。
+- 播放按钮 `bg_ark_play_btn.xml` 品牌圆：**已落地可见**（v3.15.44 回归修正 D1）。QA 第 1 轮
+  发现原 `applyPalette()` 里的 `ArkLiquidGlass.attach(playBtn, ...)` 会在首帧绘制前无条件把
+  背景换成 6 层玻璃，导致品牌圆与 `brandOn` 图标色永远不可见；已改为**移除该次 attach**
+  （纯样式，不碰任何业务逻辑 / 动画 / 测量），并把 `playBtn.imageTintList` 换成
+  `ArkTokens.BRAND_ON_*`（亮白 / 深蓝），保证图标压在品牌圆上可读。代价：播放钮少一层 6 层
+  玻璃与 18dp 投影，属样式取舍。
 - 迷你条背景只在其**没有系统原生背景**时设置；若 ROM 已给它下发模糊/波纹底，
   本轮自动退化为「只改文字色 + 圆环颜色」，不覆盖系统基底。
 - 迷你条字号 / 44dp 高度 / 48dp 触控区未落地，理由见约束 4。
@@ -109,6 +115,24 @@
   v3.15.43 一致；系统媒体卡/通知行不出现「背景变红」或发灰。
 - `logcat -s FlymeArk` 应看到 `[FlymeArk/miniBarStyle] ...`，
   **不应**出现 `[FlymeArk/glass] t.intercept`（全局 tint 改写仍停用）。
+
+### 回归修正（QA 第 1 轮 · D1–D4 已修，D5–D7 已知）
+
+QA 用全新视角独立回归，路由 `Engineer`，发现 7 项（P1×2 / P2×2 / P3×3）+ 1 项运行时残留。
+本轮在**同一版本号 v3.15.44（versionCode 67）** 上做最小纯样式返工（commit 接在 `2bbf5bb` 之后），
+未 bump 版本——该版本尚未装机，属于同一次视觉特性交付的修正。
+
+| ID | 级 | 文件:行 | 现象 | 修正 |
+|---|---|---|---|---|
+| D1 | P1 | `ArkCapsulePanelActivity.kt:598/590` | `attach(playBtn)` 首帧前覆盖品牌圆，XML 品牌圆 + `brandOn` 图标色永远不可见 | 移除 playBtn 的 `attach`，`playBtn.imageTintList` 改用 `ArkTokens.BRAND_ON_*`；保留 `bg_ark_play_btn.xml` |
+| D2 | P1 | `bg_ark_panel_opaque.xml` | 0 引用死资源；大卡恒 96% 与 82/86% 首帧占位不符 | 删除死资源；明确 82/86% 只落地迷你条，大卡恒 96% |
+| D3 | P2 | `ArkLiquidGlass.kt:128` ↔ `ArkLiquidGlassDrawable.kt:170` | `params.strokeRgb` 被赋 `HIGHLIGHT_*` 但 `applyEdgeColors` 从不读，是死参数 | `strokeRgb` 改为与边缘高光同源的 `0x66FFFFFF`/`0x5AFFFFFF`，`applyEdgeColors` 改用 `params.strokeRgb`（渲染结果不变） |
+| D4 | P2 | `ArkMiniBarStyleHook.kt:155/223` | `logOnce` 不论背景是否铺上都打 `styled`，guard 命中时静默不生效、logcat 误报成功 | `applyBackground` 返回 Boolean，`logOnce` 携带 `bgApplied`；被系统背景跳过时打 `bg skipped` |
+
+已知问题（记为已知，不阻塞装机）：
+- D5（P3）：仍存少量未使用占位——`ArkTokens` 作为设计稿全量镜像保留 19/47 常量、`dimens.xml` 部分未用；属「镜像文件全量保留」取舍，无害。
+- D6（P3）：`HIGHLIGHT_LIGHT=#66FFFFFF` 与设计 token `#FFFFFFFF` 不一致——但设计稿自身 `island_glass_bg.xml` 描边即硬编码 `#66`，实现取 drawable 实际值，合理不判 bug。
+- D7（P3）：`logged` 集合以 `identityHashCode` 为 key 且只增不清，SystemUI 长驻进程下长期缓慢增长；已加 `LOGGED_CAP=512` 上限兜底，hash 复用仍可能偶发抑制日志，属可接受的低优先级问题。
 
 - versionCode 67 / 3.15.44
 

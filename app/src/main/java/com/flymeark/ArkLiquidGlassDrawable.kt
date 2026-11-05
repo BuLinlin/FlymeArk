@@ -168,7 +168,7 @@ internal class ArkLiquidGlassDrawable(initial: GlassParams) : Drawable() {
     }
 
     private fun applyEdgeColors() {
-        val hi = if (params.light) 0x66FFFFFF.toInt() else 0x5AFFFFFF.toInt()
+        val hi = params.strokeRgb
         val clear = Color.TRANSPARENT
         val dim = if (params.light) 0x12000000 else 0x0CFFFFFF
         // 同一条对角渐变让左上与右下同时起亮，中段留空 → 「左上、右下各一道光」
