@@ -40,6 +40,8 @@ class ArkEntry : IXposedHookLoadPackage {
                 ArkLiveShadeTextHook.install(lpp)
                 // 消息胶囊滑动销毁（原生只有点击，无滑动）
                 ArkLiveSwipeDismissHook.install(lpp)
+                // 微信/QQ 通知在通知栏保持普通卡片（恢复 × 一键清除）
+                ArkLiveRowNormalizeHook.install(lpp)
                 // 专辑封面写入 smallIcon + 清 showType=5 单色滤镜
                 ArkLiveCoverHook.install(lpp)
                 // 胶囊宽度收窄 + 歌词横向滑入

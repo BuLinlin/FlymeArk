@@ -2,6 +2,39 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.21 通知栏恢复 × 一键清除
+
+### 问题
+
+用户反馈：注入 live 字段后，通知栏里的微信/QQ 通知变成 Flyme 实况小卡（压缩高度、
+玻璃底、右上角只有空心圆圈），**原来的 × 一键清除没有了**，滑动也删不掉。
+
+### 根因：两个 live 标志被混为一谈
+
+- **状态栏胶囊**由 `StatusBarNotification.isLive()`（extras 的 `notification.live.type`）驱动；
+- **通知栏那一行的样式**由视图字段 `ExpandableView.mIsLiveNotification` 驱动
+  （`onFinishInflate` 时 `setLiveNotification(sbn.isLive())` 写入）。
+
+行一旦被标记 live：`getMinHeight()` 走 live public view、
+`NotificationStackScrollLayout.addTrackingLiveExpandableView` 悬浮跟踪、
+长按 guts 走 `NotificationInfo.mzBindGuts` 的 live 分支（只有"实况通知设置"）——
+整条通知变成不可清除的实况卡。
+
+### 修复：`ArkLiveRowNormalizeHook`（新增）
+
+hook `ExpandableView.setLiveNotification(boolean)`：当行属于微信/QQ 时强制写 false。
+通知栏里恢复成普通微信/QQ 通知卡片（头像 + 正文 + × 按钮 + 原生滑动删除）；
+状态栏胶囊不受影响（它只认 SBN 的 extras，不认这个视图字段）。
+其余 live 通知（音乐播放通知）保持原样。
+
+### 验证
+
+- 编译通过，装机，SystemUI 已重启（未整机重启），hook 安装日志确认。
+- 状态栏胶囊仍正常显示（截图确认 QQ 亮蓝胶囊在）。
+- 待用户拉通知栏确认：QQ/微信卡片是否恢复普通样式、× 是否可点。
+
+---
+
 ## 2026-11-05 · v3.15.20 副显示位修复 + 消息胶囊滑动销毁
 
 ### 一、副显示位胶囊「消失」的真正根因（音乐胶囊共存问题）
