@@ -266,6 +266,19 @@ object ArkConstants {
     /** 消息面板：品牌色（Int，ARGB） */
     const val EXTRA_MSG_BRAND = "msg_brand"
 
+    /**
+     * 消息面板 → SystemUI：点卡片进会话（v3.15.41）。
+     * 面板是普通 App uid，直接 `PendingIntent.send()` 发微信/QQ 的通知 PI 会撞上
+     * Android 15 的 BAL 后台启动限制（QQ 的 PI 创建方未 opt-in，日志里
+     * `Background activity launch blocked / result code=3 bal_blocked`）。
+     * 改由 SystemUI 调 `startNotificationPendingIntentForLiveCapsule(entry)`，
+     * 与系统「点胶囊 / 点通知卡片」走同一条豁免路径。
+     */
+    const val ACTION_PANEL_OPEN_MSG = "com.flymeark.PANEL_OPEN_MSG"
+
+    /** 消息面板 → SystemUI：原通知的 key（StatusBarNotification.getKey()） */
+    const val EXTRA_MSG_NOTIF_KEY = "msg_notif_key"
+
     /** Xposed 日志 TAG（logcat / LSPosed 日志里搜这个） */
     const val LOG_TAG = "FlymeArk"
 

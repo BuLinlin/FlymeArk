@@ -1838,6 +1838,11 @@ internal object ArkLiveExpandHook {
             ?: avatarBitmapOf(ctx, extrasLargeIcon as? android.graphics.drawable.Icon)
         val postAt = try { XposedHelpers.callMethod(sbn, "getPostTime") as? Long ?: 0L } catch (_: Throwable) { 0L }
         val contentIntent = n?.contentIntent
+        val notifKey = try {
+            XposedHelpers.callMethod(sbn, "getKey") as? String
+        } catch (_: Throwable) {
+            null
+        }
 
         val intent = Intent().apply {
             setClassName(ArkConstants.APP_PKG, MESSAGE_PANEL_ACTIVITY)
@@ -1852,6 +1857,7 @@ internal object ArkLiveExpandHook {
             putExtra(ArkConstants.EXTRA_MSG_BRAND, ArkConstants.brandColorOf(pkg))
             putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, pkg)
             putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
+            putExtra(ArkConstants.EXTRA_MSG_NOTIF_KEY, notifKey)
             avatar?.let { putExtra(ArkConstants.EXTRA_MSG_AVATAR, it) }
             contentIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
             // 胶囊矩形：面板以它为展开动画起点（长大）与收起终点（缩回）
@@ -1872,6 +1878,73 @@ internal object ArkLiveExpandHook {
             )
         } catch (t: Throwable) {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG msg startActivity failed: ${t.message}")
+        }
+    }
+
+    /**
+     * v3.15.41：SystemUI 代发「点消息大卡 → 进会话」。
+     *
+     * 面板进程直接 `PendingIntent.send()` 会被 Android 15 的 BAL 拦掉（QQ 的通知 PI
+     * 创建方没有 opt-in，logcat 实锤 `bal_blocked`；微信因自身权限恰好能过）。
+     * 这里走系统自己的胶囊点击方法 `startNotificationPendingIntentForLiveCapsule(entry)`，
+     * 由 SystemUI 身份发出，与点通知卡片享受同样的豁免。
+     */
+    fun openMessageNotification(ctx: Context, key: String?, pkg: String?) {
+        if (key.isNullOrBlank()) {
+            XposedBridge.log("$TAG: open msg: no key")
+            return
+        }
+        val ctrl = ctrlRef?.get()
+        if (ctrl == null) {
+            XposedBridge.log("$TAG: open msg: no controller")
+            return
+        }
+        try {
+            val starter = XposedHelpers.getObjectField(ctrl, "mNotificationActivityStarter")
+            val entries = XposedHelpers.getObjectField(ctrl, "mNotificationEntries") as? List<*>
+            var target: Any? = null
+            entries?.forEach { pe ->
+                if (pe == null) return@forEach
+                val entry = try {
+                    XposedHelpers.callMethod(pe, "getRepresentativeEntry")
+                } catch (_: Throwable) {
+                    return@forEach
+                } ?: return@forEach
+                val sbn = try {
+                    XposedHelpers.callMethod(entry, "getSbn")
+                } catch (_: Throwable) {
+                    return@forEach
+                } ?: return@forEach
+                val k = try {
+                    XposedHelpers.callMethod(sbn, "getKey") as? String
+                } catch (_: Throwable) {
+                    null
+                }
+                if (k == key) target = entry
+            }
+            if (starter != null && target != null) {
+                XposedHelpers.callMethod(
+                    starter, "startNotificationPendingIntentForLiveCapsule", target
+                )
+                XposedBridge.log("$TAG: open msg via SystemUI starter, key=$key")
+                return
+            }
+            XposedBridge.log("$TAG: open msg entry missing (starter=$starter key=$key)")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: open msg starter failed: ${t.message}")
+        }
+
+        // 兜底：通知已被清掉时至少把 App 主界面拉起来（同样由 SystemUI 身份发起）
+        if (!pkg.isNullOrBlank()) {
+            try {
+                ctx.packageManager.getLaunchIntentForPackage(pkg)?.let {
+                    it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ctx.startActivity(it)
+                    XposedBridge.log("$TAG: open msg fallback launcher $pkg")
+                }
+            } catch (t: Throwable) {
+                XposedBridge.log("$TAG: open msg fallback failed: ${t.message}")
+            }
         }
     }
 

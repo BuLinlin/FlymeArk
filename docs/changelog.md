@@ -2,6 +2,20 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.41 修 QQ「点大卡进不了会话」：改由 SystemUI 代发通知点击
+
+- **根因（logcat 实锤）**：面板是普通 App uid，直接 `PendingIntent.send()` 发原通知的
+  contentIntent 会撞上 Android 15 的 BAL 后台启动限制。QQ 的通知 PI 创建方未 opt-in：
+  `Background activity launch blocked / (BAL_BLOCK) result code=3 moveToFront=bal_blocked`，
+  intent 是 `com.tencent.mobileqq/.activity.SplashActivity`。微信的 PI 恰好带允许标记，所以只有 QQ 进不去。
+- 面板点卡片 → 广播 `ACTION_PANEL_OPEN_MSG`（带原通知 key + 包名）→ `SystemUILiveHost`
+  收到后调 `ArkLiveExpandHook.openMessageNotification()` → 从 `ctrl.mNotificationEntries`
+  按 key 找回 `NotificationEntry`，反射调系统胶囊点击用的
+  `NotificationActivityStarter.startNotificationPendingIntentForLiveCapsule(entry)`，
+  由 SystemUI 身份发出，与点通知卡片走同一条豁免路径。
+- 找不到 entry（通知已被清）时兜底拉 App 主界面；面板侧保留旧 `pi.send()` 作为
+  key 缺失/广播失败时的兜底，微信行为不变。
+
 ## 2026-11-05 · v3.15.40 修「点胶囊没反应」：面板布局缺宽度声明，Activity 启动即崩
 
 - **根因（logcat 实锤）**：`activity_message_panel.xml` 里 `msg_title` / `msg_time` 只写了

@@ -99,6 +99,15 @@ internal object SystemUILiveHost {
                                 intent.getStringExtra(ArkConstants.EXTRA_ROUTE_ID)
                             )
 
+                        // v3.15.41：点消息大卡 → 由 SystemUI 代发原通知的 contentIntent
+                        // （面板自己发会被 Android 15 BAL 拦掉，QQ 尤其明显）
+                        ArkConstants.ACTION_PANEL_OPEN_MSG ->
+                            ArkLiveExpandHook.openMessageNotification(
+                                context,
+                                intent.getStringExtra(ArkConstants.EXTRA_MSG_NOTIF_KEY),
+                                intent.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)
+                            )
+
                         // v3.1：面板展开/收起 → 淡出/恢复状态栏胶囊
                         ArkConstants.ACTION_PANEL_STATE -> {
                             val visible =
@@ -140,6 +149,7 @@ internal object SystemUILiveHost {
             addAction(ArkConstants.ACTION_PANEL_OUTPUT_LIST)
             addAction(ArkConstants.ACTION_PANEL_OUTPUT_TRANSFER)
             addAction(ArkConstants.ACTION_LIVE_ALLOW_CHANGED)
+            addAction(ArkConstants.ACTION_PANEL_OPEN_MSG)
         }
         try {
             if (Build.VERSION.SDK_INT >= 33) {

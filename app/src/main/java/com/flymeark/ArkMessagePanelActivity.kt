@@ -223,6 +223,26 @@ class ArkMessagePanelActivity : Activity() {
         if (now - lastOpenAt < 800L) return
         lastOpenAt = now
 
+        // v3.15.41：优先交给 SystemUI 代发原通知的 contentIntent。
+        // 我们自己 send PendingIntent 时，QQ 的通知 PI 创建方未 opt-in Android 15 BAL，
+        // 系统直接 `Background activity launch blocked`（微信碰巧能过），表现为「点卡片没反应」。
+        val key = intent?.getStringExtra(ArkConstants.EXTRA_MSG_NOTIF_KEY)
+        val pkg = intent?.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)
+        if (!key.isNullOrBlank()) {
+            try {
+                sendBroadcast(
+                    Intent(ArkConstants.ACTION_PANEL_OPEN_MSG)
+                        .setPackage(ArkConstants.SYSTEMUI_PKG)
+                        .putExtra(ArkConstants.EXTRA_MSG_NOTIF_KEY, key)
+                        .putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, pkg)
+                )
+                dismiss()
+                return
+            } catch (_: Throwable) {
+            }
+        }
+
+        // 兜底：拿不到 key / 广播发失败时，仍用旧路径（微信可用）
         val pi = clickIntent
         if (pi != null) {
             try {
