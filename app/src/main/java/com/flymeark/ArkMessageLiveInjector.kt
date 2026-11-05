@@ -110,15 +110,23 @@ internal object ArkMessageLiveInjector {
         }
 
         val extras = try { src.extras } catch (_: Throwable) { null } ?: return
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+        val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
             ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
-        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+        val rawText = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
             ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
-        val content = when {
-            !text.isNullOrBlank() -> text
-            !title.isNullOrBlank() -> "收到来自 $title 的消息"
-            else -> return
+        // 正文只用来判断「这条到底是不是一条消息」，不再进胶囊
+        if (rawTitle.isNullOrBlank() && rawText.isNullOrBlank()) return
+
+        // v3.15.33：胶囊只放隐私占位，不放昵称 / 群名 / 正文。
+        // 正文仍在原生通知卡片里，点卡片或点胶囊都能进会话，信息不丢。
+        val appLabel = ArkConstants.messageAppLabel(pkg)
+        val count = try { src.number } catch (_: Throwable) { 0 }
+        val content = if (count > 1) {
+            "有 $count 条新消息 · 点击查看"
+        } else {
+            "有新消息 · 点击查看"
         }
+        val title = appLabel
 
         val smallIcon = try { src.getSmallIcon() } catch (_: Throwable) { null } ?: return
         val largeIcon = messageIcon(src)

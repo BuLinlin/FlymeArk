@@ -2,6 +2,37 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.33 胶囊改隐私占位 + 渲染走同步路径
+
+真机实测：胶囊出现时是**只有图标宽的一条空壳**，点一下才出文字。用户提出改方案：
+默认只显示占位提示，点击后才看具体消息——顺带保护隐私。
+
+**一、胶囊不再承载消息正文**
+
+v3.15.32 的胶囊会把 `EXTRA_TITLE` / `EXTRA_TEXT` 原样塞进 `capsuleContent`，
+日志里连「佩奇VIP通知38群(8条新消息)」和整段京东推广链接都进去了，锁屏 / AOD 等于公开聊天内容。
+
+现在 `capsuleContent` 固定为：
+- 单条：`有新消息 · 点击查看`
+- 多条（`Notification.number > 1`）：`有 N 条新消息 · 点击查看`
+
+`capsuleTitle` 只放应用名（`微信` / `QQ`，[ArkConstants.messageAppLabel]），不放昵称和群名。
+正文仍在原生通知卡片里，点卡片或胶囊都能进会话，信息不丢。发送者头像保留。
+日志也不再打印正文，只打印占位文案。
+
+**二、prefill 改走 animate=false 同步路径**
+
+`setLiveNotificationInfo(info)` 单参重载 → `setText(text, true)` → `startProgressBarAnim()`：
+这条路径**只启动弹簧宽度动画**，文字与 `layoutParams.width` 全靠动画回调写入。
+首次展示时 `mLastTextWidth=0`、view 尚未完成布局，动画没跑起来，
+结果就是「文字在、宽度是图标宽、看着像空壳」——正好是截图的样子。
+
+改为 `setLiveNotificationInfo(info, false)`：算宽度、写 `layoutParams.width`、
+`setText` 全同步完成，不依赖动画。另外把 `mLiveNotificationText` 的 alpha 复位为 1
+（`startScaleXAnim()` 会先压 0 再弹回，被打断就永远停在 0）。
+
+- versionCode 56 / 3.15.33
+
 ## 2026-11-05 · v3.15.32 修「通知布局 inflate 被模块异常打断」
 
 真机日志（SystemUI 重启后 inflate QQ 通知时）：

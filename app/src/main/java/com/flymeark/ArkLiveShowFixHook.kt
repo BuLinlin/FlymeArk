@@ -1,6 +1,7 @@
 package com.flymeark
 
 import android.view.View
+import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -111,8 +112,20 @@ internal object ArkLiveShowFixHook {
         if (newKey != null && newKey == curKey) return
 
         try {
-            // 单参重载 = animate=true，宽度会从 0 弹性展开到文字宽度
-            XposedHelpers.callMethod(view, "setLiveNotificationInfo", info)
+            // v3.15.33：改用 **animate=false 重载**。
+            // 单参重载会走 setText(text, true) → startProgressBarAnim()，那条路径只启动
+            // 弹簧宽度动画，文字与 layoutParams.width 都依赖动画回调；首次显示时
+            // mLastTextWidth=0、view 可能还没完成布局，动画没跑起来 → 文字被裁掉、只剩
+            // 图标宽的一条（真机截图实证）。
+            // animate=false 分支是同步的：直接算宽度、写 layoutParams.width、setText，
+            // 不依赖任何动画回调。
+            XposedHelpers.callMethod(view, "setLiveNotificationInfo", info, false)
+
+            // startScaleXAnim() 会把文字 alpha 压到 0 再弹回 1；如果那一轮被打断，
+            // alpha 会永远停在 0（文字存在但看不见）。这里直接恢复。
+            (XposedHelpers.getObjectField(view, "mLiveNotificationText") as? TextView)
+                ?.let { if (it.alpha != 1f) it.alpha = 1f }
+
             XposedBridge.log(
                 "[${ArkConstants.LOG_TAG}] $TAG prefill: pkg=$pkg key=$newKey " +
                     "text='${text.take(24)}' (oldKey=$curKey)"

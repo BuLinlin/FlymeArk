@@ -80,6 +80,17 @@ object ArkConstants {
     }
 
     /**
+     * 消息类 App 在胶囊上对外展示的名字（v3.15.33）。
+     *
+     * 胶囊改成隐私占位后，标题只放「谁发来的」这一层信息，不放昵称/群名/正文。
+     */
+    fun messageAppLabel(pkg: String?): String = when (pkg) {
+        WECHAT_PKG -> "微信"
+        QQ_PKG -> "QQ"
+        else -> "消息"
+    }
+
+    /**
      * 给定底色选可读的前景字色。
      *
      * QQ 的亮蓝 #00CAFC 相对亮度约 0.49，白字对比度只有 1.9:1（几乎糊成一片），
