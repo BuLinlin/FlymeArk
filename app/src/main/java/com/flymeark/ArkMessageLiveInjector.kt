@@ -120,7 +120,7 @@ internal object ArkMessageLiveInjector {
         // v3.15.33：胶囊只放隐私占位，不放昵称 / 群名 / 正文。
         // 正文仍在原生通知卡片里，点卡片或点胶囊都能进会话，信息不丢。
         val appLabel = ArkConstants.messageAppLabel(pkg)
-        val count = try { src.number } catch (_: Throwable) { 0 }
+        val count = sessionMessageCount(extras, rawText)
         val content = if (count > 1) {
             "有 $count 条新消息 · 点击查看"
         } else {
@@ -202,6 +202,88 @@ internal object ArkMessageLiveInjector {
         } catch (t: Throwable) {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG notify shadow failed: ${t.message}")
         }
+    }
+
+    /**
+     * 统计「当前这个会话 / 这个发消息的人」给我发了多少条。
+     *
+     * **不能用 `Notification.number`** —— 那是整个 App 的未读总数。
+     * 实测微信通知 `number=218`，而当前会话其实只有 4 条（正文前缀 `[4条]`）。
+     * 用错值还会连带引发另一个 bug：条数长期不变 → 占位文案不变 →
+     * `LiveNotificationView.setText` 判定「text is the same」直接 return → 胶囊不刷新（卡住）。
+     *
+     * 按可靠性依次回退：
+     * ① 正文前缀 `[4条]xxx: yyy` —— 微信自己写的会话未读数，最准；
+     * ② MessagingStyle 的 `android.messages` 数组 —— 统计与最新一条同 sender 的条数；
+     * ③ `android.textLines` —— 每行 `名字: 内容`，统计与最后一行同名者的条数；
+     * ④ 都拿不到返回 0，只显示「有新消息」，宁可不报数也不报错数。
+     */
+    private val COUNT_IN_TEXT = Regex("""(\d+)\s*条""")
+
+    private fun sessionMessageCount(extras: Bundle, text: String?): Int {
+        // ① 微信 / TIM 风格
+        if (!text.isNullOrBlank()) {
+            val n = COUNT_IN_TEXT.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            if (n > 1) return n
+        }
+
+        // ② MessagingStyle
+        try {
+            val msgs = extras.getParcelableArray("android.messages")
+            if (!msgs.isNullOrEmpty()) {
+                val senders = ArrayList<String?>(msgs.size)
+                for (item in msgs) {
+                    val b = item as? Bundle
+                    senders.add(senderOf(b))
+                }
+                val last = senders.lastOrNull { !it.isNullOrBlank() }
+                if (last != null) {
+                    val n = senders.count { it == last }
+                    if (n > 1) return n
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        // ③ textLines
+        try {
+            val lines = extras.getCharSequenceArray("android.textLines")
+            if (!lines.isNullOrEmpty()) {
+                val senders = lines.map { lineSenderOf(it.toString()) }
+                val last = senders.lastOrNull { !it.isNullOrBlank() } ?: return 0
+                val n = senders.count { it == last }
+                if (n > 1) return n
+            }
+        } catch (_: Throwable) {
+        }
+
+        return 0
+    }
+
+    /** MessagingStyle 单条消息的 sender（优先 CharSequence `sender`，退回 `sender_person.name`） */
+    private fun senderOf(b: Bundle?): String? {
+        if (b == null) return null
+        b.getCharSequence("sender")?.toString()?.let { if (it.isNotBlank()) return it }
+        val person = try { b.getParcelable<android.os.Parcelable>("sender_person") } catch (_: Throwable) { null }
+            ?: return null
+        return try {
+            XposedHelpers.callMethod(person, "getName") as? String
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** `名字: 内容` 里的名字，兼容中英文冒号 */
+    private fun lineSenderOf(line: String): String? {
+        val en = line.indexOf(':')
+        val cn = line.indexOf('：')
+        val idx = when {
+            en < 0 -> cn
+            cn < 0 -> en
+            else -> minOf(en, cn)
+        }
+        if (idx <= 0) return null
+        return line.substring(0, idx).trim().ifBlank { null }
     }
 
     /**

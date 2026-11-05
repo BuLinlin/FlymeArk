@@ -63,7 +63,81 @@ internal object ArkLiveShowFixHook {
             )
         }
 
+        installUpdateRetry(lpp)
+
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG installing in SystemUI")
+    }
+
+    // ------------------------------------------------------------ 更新被丢弃时补刷
+
+    private var mainHandler: android.os.Handler? = null
+
+    private val retryScheduled = java.util.WeakHashMap<Any, Boolean>()
+    private val retryCount = java.util.WeakHashMap<Any, Int>()
+
+    /**
+     * v3.15.33：`updateStatusBarIcons` 开头有三个提前 return，会**整次丢弃更新**：
+     *
+     * ```java
+     * if (mAnimateType != 0) return;                    // 胶囊动画中
+     * if (mNotificationPanelAnimateStarted) return;     // 面板动画中
+     * if (!mIsGlobalLayout) return;                     // 全局布局未完成
+     * ```
+     *
+     * 连续发消息时，第一条触发淡入动画，后面几条正好落在动画窗口里被丢掉，
+     * 胶囊就停在第一条上不再变化——用户描述的「卡住」。
+     *
+     * 处理：判定「这次一定被丢弃」时，260ms 后补刷一次（走 private
+     * `updateLiveNotification()`）。最多连补 3 次，成功一次就清零，避免打转。
+     */
+    private fun installUpdateRetry(lpp: XC_LoadPackage.LoadPackageParam) {
+        ArkHooks.quiet("$TAG updateStatusBarIcons") {
+            XposedHelpers.findAndHookMethod(
+                CTRL_CLS, lpp.classLoader, "updateStatusBarIcons",
+                Boolean::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val dropped = try {
+                            val ctrl = param.thisObject
+                            (XposedHelpers.getIntField(ctrl, "mAnimateType") != 0) ||
+                                XposedHelpers.getBooleanField(
+                                    ctrl, "mNotificationPanelAnimateStarted"
+                                ) ||
+                                !XposedHelpers.getBooleanField(ctrl, "mIsGlobalLayout")
+                        } catch (_: Throwable) {
+                            false
+                        }
+                        param.setObjectExtra("dropped", dropped)
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val ctrl = param.thisObject
+                        if (param.getObjectExtra("dropped") == true) {
+                            scheduleRetry(ctrl)
+                        } else {
+                            // 成功刷过一次 → 计数清零，下次动画还能继续补
+                            retryCount.remove(ctrl)
+                        }
+                    }
+                }
+            )
+        }
+    }
+
+    private fun scheduleRetry(ctrl: Any) {
+        if (retryScheduled[ctrl] == true) return
+        if ((retryCount[ctrl] ?: 0) >= 3) return
+        retryScheduled[ctrl] = true
+        val h = mainHandler ?: android.os.Handler(android.os.Looper.getMainLooper())
+            .also { mainHandler = it }
+        h.postDelayed({
+            retryScheduled[ctrl] = false
+            retryCount[ctrl] = (retryCount[ctrl] ?: 0) + 1
+            try {
+                XposedHelpers.callMethod(ctrl, "updateLiveNotification")
+            } catch (_: Throwable) {
+            }
+        }, 260)
     }
 
     /**

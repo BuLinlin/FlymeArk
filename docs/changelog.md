@@ -2,6 +2,38 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.34 条数改「按会话统计」+ 连续消息不再卡住
+
+用户反馈两点：**连续发消息胶囊会卡住**、**条数统计错了**（要的是"当前这个人给我发了多少条"）。
+
+真机 `dumpsys notification --noredact` 取证：
+
+| | 微信 | QQ |
+|---|---|---|
+| `number=` | **218**（App 总未读） | 0 |
+| 标题 | `玄圭互联-chihiro`（会话名） | `佩奇VIP通知38群` |
+| 正文 | `[4条]玄圭互联-chihiro: …` | `佩奇⁴: ⏰12点 …` |
+
+`Notification.number` 是**整个 App 的未读数**，跟当前会话无关，之前直接拿它当条数是错的。
+而且条数长期不变 → 占位文案不变 → `LiveNotificationView.setText` 判定
+「text is the same」直接 return → 胶囊停止刷新，这就是「卡住」。
+
+**一、条数按会话统计**（[ArkMessageLiveInjector.sessionMessageCount]）
+
+按可靠性回退：① 正文前缀 `[N条]`（微信自己写的会话未读数，最准）→
+② `android.messages` 数组按最新一条的 sender 统计 → ③ `android.textLines` 按
+`名字: 内容` 统计同名条数 → ④ 都拿不到返回 0，只显示「有新消息」。
+**宁可不报数，也不报错数**（QQ 的通知本身不带条数，就不显示数字）。
+
+**二、连续消息不再卡住**
+
+`updateStatusBarIcons` 开头三个提前 return（`mAnimateType != 0` / 面板动画中 /
+`!mIsGlobalLayout`）会**整次丢弃更新**。第一条消息触发淡入动画，后面几条正好落在动画窗口里
+被丢掉 → 胶囊停在第一条。现在判定「这次必被丢弃」时 260ms 后补刷一次
+（反射调 private `updateLiveNotification()`），最多连补 3 次，成功即清零。
+
+- versionCode 57 / 3.15.34
+
 ## 2026-11-05 · v3.15.33 胶囊改隐私占位 + 渲染走同步路径
 
 真机实测：胶囊出现时是**只有图标宽的一条空壳**，点一下才出文字。用户提出改方案：
