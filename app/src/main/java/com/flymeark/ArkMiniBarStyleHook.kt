@@ -43,8 +43,10 @@ import java.util.Collections
  *
  * - 不 hook `MzBlurUtils.setBackgroundBlurDrawable`、不碰 `args[4]` 的 `0xB2`；
  * - 不全局 hook `View.setBackground`、不包装 `BackgroundBlurDrawable`、不调 `View.setAlpha()`；
- * - 只在**按 id 命中的那一个头部 View** 上设背景，且仅当它当前没有系统自带背景时；
- *   一旦 ROM 已经给它下发了模糊/波纹/不透明底，直接跳过背景，只保留文字色与圆环颜色。
+ * - 只在**按 id 命中的那一个头部 View** 上设背景（v3.15.45 起强制覆盖系统自带背景，
+ *   不判断「是否已有系统背景」）；SystemUI 通知 shade 本身已带模糊，我们的半透明玻璃叠在上面
+ *   即形成毛玻璃，模糊不可用（省电 / 视频隧道 / API<31）时由 `ArkMiniBarGlass` 的 alpha 兜底；
+ *   `REWRITE_SYSTEM_TINT` 仍为 false，不削弱系统本身的 0xB2 基底。
  *
  * ## 克制项
  *
@@ -150,17 +152,15 @@ internal object ArkMiniBarStyleHook {
     }
 
     /**
-     * 只在头部**没有系统原生背景**时铺玻璃；已有背景（模糊底 / ripple / 不透明基底）
-     * 一律不覆盖，退化成「只改文字色 + 圆环颜色」，绝不削弱系统提供的对比度基底。
+     * 强制用我们的玻璃覆盖头部背景（v3.15.45 用户决策）。
+     * 仅当已经是「同深浅的我们自己的玻璃」时跳过重建，避免通知刷新时反复分配；
+     * 否则一律覆盖系统自带背景——SystemUI shade 的模糊会透过这层半透明玻璃形成毛玻璃。
      */
     private fun applyBackground(header: View, night: Boolean): Boolean {
         val current = header.background
-        if (current != null && current !is ArkMiniBarGlass) {
-            // 系统已给头部下发了模糊/波纹/不透明底 → 不覆盖，退化只改文字色 + 圆环颜色
-            return false
-        }
         // 同深浅且已是我们自己的玻璃 → 不重建，避免通知刷新时反复分配
         if (current is ArkMiniBarGlass && current.night == night) return false
+        // v3.15.45：强制覆盖系统自带背景（用户选择显示玻璃条，接受可能削弱系统模糊基底的取舍）
         header.background = ArkMiniBarGlass(night, header.resources.displayMetrics.density)
         return true
     }
@@ -177,13 +177,18 @@ internal object ArkMiniBarStyleHook {
         }
     }
 
-    /** 空心圆只规范颜色：品牌色进度 + 轨道色 + 一级文字色，形状与进度逻辑完全不动 */
+    /**
+     * 空心圆只规范颜色：品牌色进度 + 可见外环 + 一级文字色，形状与进度逻辑完全不动。
+     * 浅色玻璃上设计稿的 TRACK_LIGHT(#D9DEE7) 几乎与背景同色、空心圆轮廓消失，
+     * 改用可读的中性灰 TEXT_SECONDARY，保证轮廓清晰（深色调沿用 TRACK_DARK）。
+     */
     private fun applyCircle(root: View, night: Boolean) {
         if (circleId == 0) return
         val circle = root.findViewById<View>(circleId) ?: return
         if (circle.javaClass.name != CIRCLE_CLS) return
         val brand = if (night) ArkTokens.BRAND_DARK else ArkTokens.BRAND_LIGHT
-        val track = if (night) ArkTokens.TRACK_DARK else ArkTokens.TRACK_LIGHT
+        // 外环在浅色玻璃上需可见：用中性灰而非近白的 TRACK_LIGHT
+        val track = if (night) ArkTokens.TRACK_DARK else ArkTokens.TEXT_SECONDARY_LIGHT
         val text = if (night) ArkTokens.TEXT_PRIMARY_DARK else ArkTokens.TEXT_PRIMARY_LIGHT
         invokeInt(circle, "setProgressColor", brand)
         invokeInt(circle, "setProgressBgColor", track)
@@ -231,7 +236,7 @@ internal object ArkMiniBarStyleHook {
         if (!logged.add(key)) return
         XposedBridge.log(
             "[$TAG] styled: night=$night header=#$headerId title=#$titleId circle=#$circleId" +
-                if (bgApplied) "" else " (bg skipped: existing system background)"
+                if (bgApplied) "" else " (glass unchanged: already ours)"
         )
     }
 

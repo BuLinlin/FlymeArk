@@ -2,6 +2,38 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.45 迷你条强制铺玻璃 + 空心圆可见性（设计包适配，不改架构）
+
+> 设计包 `IslandCapsuleUI` 已交付（zip 在本机）。按其中 `WindowBlurHelper` 的研判落地：
+> **SystemUI 注入场景应复用 ROM 自带 BlurUtils/Scrim 模糊源**，我们的玻璃只是一层半透明
+> 叠层让其透出毛玻璃；不并入设计包的 Compose/View 胶囊代码（那套是独立悬浮窗口，与「不自建
+> 胶囊」铁律冲突，且 minSdk=26 < API31 不能全局依赖窗口模糊，必须 96% 降级）。
+
+### 工程事实（回答设计包第 4 点的三项待确认）
+- minSdk = 26（根 build.gradle `ext.min_sdk`）；Compose = 否（dependencies 仅 Xposed api）；
+  SystemUI 注入 = 是（`ArkEntry.SYSTEMUI_PKG` 已挂 `ArkMiniBarStyleHook`）。
+
+### 改动
+- `ArkMiniBarStyleHook.applyBackground`：移除「已有系统背景即跳过」的保守 guard，改为**强制用
+  `ArkMiniBarGlass` 覆盖**头部背景（仅同深浅已是我们自己的玻璃时跳过重建）。SystemUI shade 的
+  模糊透过这层半透明玻璃即形成毛玻璃；`REWRITE_SYSTEM_TINT` 仍为 false，不削弱系统 0xB2 基底。
+- `ArkMiniBarStyleHook.applyCircle`：空心圆外环在浅色玻璃上原用 `TRACK_LIGHT(#D9DEE7)` 近白、
+  与背景同色几乎不可见；改读 `TEXT_SECONDARY_LIGHT(#4E5766)` 可读中性灰（深色调沿用 `TRACK_DARK`）。
+- `logOnce`：随 guard 移除，跳过分支文案改为 `glass unchanged: already ours`。
+
+### 取舍（用户已知）
+- 覆盖系统背景会移除该头部原有的系统模糊/ripple 基底；毛玻璃观感依赖 SystemUI shade 既有模糊。
+- 设计稿玻璃渐变本身是近白色（#FDFEFF→#EFF3F8 @82%），非真模糊时偏「浅白条」属预期；
+  如需更透的毛玻璃，后续可下调 `ArkMiniBarGlass` alpha（与 96% 降级档互斥，需真机权衡可读性）。
+
+### 验证要点
+- `logcat` 应看到 `[FlymeArk/miniBarStyle] styled: night=...`（**不再**带 `bg skipped`）。
+- 下拉通知栏顶部实况迷你条：淡蓝白渐变玻璃 + 全圆角 + 1dp 高光；「微信/QQ」文字可读；
+  空心圆外环为可见中性灰，不再隐形。
+- 回归：消息胶囊仍系统原生（mShowType∈{5,6} 门控未动）、`[FlymeArk/glass] t.intercept` 不应出现。
+
+- versionCode 68 / 3.15.45
+
 ## 2026-11-05 · v3.15.44 样式对齐 IslandTokens（只迁移视觉 token）
 
 > 本节是**实现约定**，先于代码。用户澄清：「顶部」指实况通知**迷你条**（左边「微信」黑字 +
