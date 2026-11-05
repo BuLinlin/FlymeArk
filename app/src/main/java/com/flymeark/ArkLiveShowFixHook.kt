@@ -1,5 +1,6 @@
 package com.flymeark
 
+import android.util.Log
 import android.view.View
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
@@ -145,6 +146,16 @@ internal object ArkLiveShowFixHook {
      * 只补「view key ≠ info key」的场景——key 相同说明内容早就设过了，再设会打断宽度动画。
      */
     private fun prefill(ctrl: Any) {
+        // 无论这次有没有 prefill，都安排「淡出结束后补写」检查点。
+        // 原因（v3.15.36 反编译实锤）：startDisplayAlphaAnim 是把胶囊区域**淡出**的动画
+        // （mDisplayHidAlpha: alpha 1→0, 180ms），key 不匹配时走的就是它；淡出结束的回调里
+        // 会调 LiveNotificationView.resetState() —— 清空文字、清空 key、宽度归零：
+        //   mNotificationKey = null; mLiveNotificationText.setText(""); width = 0
+        // 之后再显示时系统不写文字 → 空壳。所以 prefill 设的内容必然被抹掉，
+        // 必须在淡出结束后再补一次（用户实测「点击胶囊才显示文字」即点击触发了
+        // key 相同分支的正常 setLiveNotificationInfo）。
+        scheduleReapply(ctrl)
+
         val info = try {
             XposedHelpers.getObjectField(ctrl, "mDisplayNotificationInfo")
         } catch (_: Throwable) {
@@ -206,6 +217,69 @@ internal object ArkLiveShowFixHook {
             )
         } catch (t: Throwable) {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG prefill set failed: ${t.message}")
+        }
+    }
+
+    // ------------------------------------------------------------ 淡出结束后补写
+
+    /** 淡出动画 180ms + 换内容耗时，320ms 是第一检查点，900ms 兜底第二个 */
+    private const val REAPPLY_DELAY_1 = 320L
+    private const val REAPPLY_DELAY_2 = 900L
+
+    private fun scheduleReapply(ctrl: Any) {
+        val view = try {
+            XposedHelpers.getObjectField(ctrl, "mLiveNotificationDisplay") as? View
+        } catch (_: Throwable) {
+            null
+        } ?: return
+        // 用 view 自己的消息队列排 delay：view 未 attach 时会等 attach 后再跑，天然安全
+        view.postDelayed({ reapply(ctrl) }, REAPPLY_DELAY_1)
+        view.postDelayed({ reapply(ctrl) }, REAPPLY_DELAY_2)
+    }
+
+    /**
+     * 淡出结束后的补写检查。只有同时满足这些条件才动手，避免和系统自己的更新打架：
+     * ① 控制器当前要显示的确实是微信/QQ 的实况；
+     * ② 胶囊 view 正在显示（不是 GONE）；
+     * ③ 文字是空的（正常显示时绝不多手）。
+     */
+    private fun reapply(ctrl: Any) {
+        try {
+            val info = XposedHelpers.getObjectField(ctrl, "mDisplayNotificationInfo") ?: return
+            val pkg = XposedHelpers.callMethod(info, "getPackageName") as? String ?: return
+            if (!ArkConstants.isMessageLiveApp(pkg)) return
+
+            val view =
+                XposedHelpers.getObjectField(ctrl, "mLiveNotificationDisplay") as? View ?: return
+            if (view.visibility == View.GONE) return
+
+            val tv =
+                XposedHelpers.getObjectField(view, "mLiveNotificationText") as? TextView
+            val text = tv?.text?.toString()
+            if (!text.isNullOrBlank()) return // 系统已经写好了，不动
+
+            val infoKey = try {
+                XposedHelpers.callMethod(info, "getNotificationKey") as? String
+            } catch (_: Throwable) {
+                null
+            }
+            XposedHelpers.callMethod(view, "setLiveNotificationInfo", info, false)
+            if (tv != null && tv.alpha != 1f) tv.alpha = 1f
+
+            val linW = try {
+                val lin = XposedHelpers.getObjectField(view, "mLinearIconText") as? View
+                lin?.layoutParams?.width
+            } catch (_: Throwable) {
+                null
+            }
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG reapply: pkg=$pkg key=$infoKey " +
+                    "text='${text ?: "null"}' tvW=${tv?.width} tvA=${tv?.alpha} linW=$linW"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG reapply error: ${Log.getStackTraceString(t)}"
+            )
         }
     }
 }

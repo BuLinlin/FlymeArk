@@ -2,6 +2,31 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.36 空壳根因实锤：resetState() 在淡出后抹掉 prefill 内容
+
+用户 v3.15.35 实测：条数已正确（`有 3 条新消息`，与卡片标题一致）、影子不再重复、
+× 掉能清除，但**胶囊仍是空壳、点击后才显示文字**。
+
+反编译补上一环：`startDisplayAlphaAnim` 根本不是淡入，而是把胶囊区域**淡出**
+（`mDisplayHidAlpha`: `mLiveNotificationArea` alpha 1→0，180ms）。key 不匹配
+（新消息替换旧消息）时系统走的就是它；淡出结束的回调里会调
+`LiveNotificationView.resetState()`：
+
+```java
+mNotificationKey = null;
+mLiveNotificationText.setText("");      // prefill 写的内容在这里被抹掉
+mLinearIconText.layoutParams.width = 0; // 宽度归零 → 只剩图标宽的空壳
+```
+
+之后重新显示时系统不写文字 → 空壳。prefill 设得再早也是白写。
+用户「点击后才显示」是因为点击触发了 key 相同分支的
+`setLiveNotificationInfo(info)` 正常写入。
+
+修法：prefill 时在 view 消息队列上排两个检查点（320ms / 900ms），满足
+「当前 info 是微信/QQ + view 在显示 + 文字为空」才重新
+`setLiveNotificationInfo(info, false)` 同步写入，并打视图状态日志
+（text/tvW/tvA/linW）便于后续定位。
+
 ## 2026-11-05 · v3.15.35 条数补 QQ 标题来源 + 修重复影子 + 修影子清不掉
 
 v3.15.34 装上后从模块日志与 `dumpsys notification` 抓到三个确凿问题：
