@@ -1,6 +1,10 @@
 package com.flymeark
 
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.drawable.Icon
 import android.os.Bundle
@@ -10,142 +14,187 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 /**
- * v3.15.18：微信 / QQ 消息实况通知（参考「魅况」）。
+ * v3.15.24：微信 / QQ 消息实况胶囊 —— **双通知拆分架构**。
  *
- * 微信/QQ 是纯消息 App，没有歌词、没有 MediaSession，无法走 QQ音乐/网易云 那条
- * 「歌词胶囊」（ticker 协议）链路。本类参考第三方「魅况」的做法，把它们的
- * **普通消息通知**转成魅族实况胶囊。
+ * ## 为什么要拆
  *
- * ## 逆向结论（SystemUI 侧 LiveNotificationController，真机反编译确认）
+ * 之前是把 live 字段直接注入微信/QQ 的**原通知**，结果那条通知在通知栏被 Flyme 当成
+ * 实况卡渲染。逆向确认：实况卡要显示内容，必须应用自己在通知布局里放
+ * `rl_header_live`(0x010206da) / `iv_extends1_live`(0x0102066e) /
+ * `iv_extends2_live`(0x0102066f) 三个 Flyme 约定插槽；微信/QQ 用的是系统模板，没有插槽，
+ * 于是只能渲染成「空白玻璃底 + 空心圆」。而这条实况卡与状态栏胶囊由同一套
+ * `LiveNotificationController` 产出，无法靠拦 `sbn.isLive()` 只留胶囊——
+ * 那样会连带切断 `addTrackingLiveExpandableView` 的触摸追踪，胶囊直接点不动。
  *
- * Flyme 判断一条通知能否渲染成实况胶囊只看 [shouldShowLiveNotification]：
- *   1. `sbn.isLive()`  —— 读 `notification.extras["notification.live.type"]` 非 0；
- *   2. `sbn.getCapsuleStatus() == 1` —— 读 `extras["notification.live.capsule"]`
- *      子 Bundle 里的 `notification.live.capsuleStatus` 为 1。
+ * 结论：**同一条通知上「原生卡片」与「实况胶囊」互斥**。因此改为两条：
  *
- * 胶囊文本取 `getCapsuleContentExt`：优先 `tickerText`，否则 `capsuleContent` remoteView，
- * 否则 `notification.live.capsule` 子 Bundle 里的 `notification.live.capsuleContent`。
- * 标题取 `notification.live.capsuleTitle`。
+ * | 通知 | 归属 | 样式 |
+ * |---|---|---|
+ * | 原消息通知 | 微信/QQ 自己 | 完全不动 → 系统原生卡片（×、滑动、点击全原生）|
+ * | 实况影子通知 | 本模块额外 post | 走实况链路 → 状态栏胶囊 + AOD |
  *
- * ## 本类做的事
+ * 影子通知由 [ArkLiveShadowFilterHook] 在 SystemUI 的 `ShadeListBuilder.applyFilters`
+ * 里过滤掉，通知栏看不到它；但 `NotifCollection`（胶囊数据源）依然持有它，胶囊正常。
  *
- * 在微信/QQ 进程 hook `NotificationManager.notify`，给每条消息通知注入：
- *  - `extras["notification.live.type"] = 1`
- *  - `extras["notification.live.capsule"]` 子 Bundle：
- *      `capsuleStatus=1`、`capsuleType=3`、`capsuleTitle=<发送者/title>`、
- *      `capsuleContent=<消息正文/text>`（系统自动轮播多行）、
- *      `capsuleIcon=<发送者头像 Icon>`（左侧头像，对应音乐胶囊的封面）、
- *      `capsuleBgColor=<品牌色>`、`capsuleContentColor=<按底色亮度选的白/深字>`。
+ * ## 影子通知字段（反编译「魅况 1.21」确认的完整配方）
  *
- * 多胶囊共存由 Flyme 原生处理（`LiveNotificationController` 的 `mToShow` 列表 +
- * `mFocusPackageName` 排序 + `LiveNotificationView` 上滑切换手势），本类无需介入。
+ * - `is_live=true`、`notification.live.type=10`、`notification.live.status=1`、
+ *   `notification.live.operation=0`
+ * - `notification.live.capsule` 子 Bundle：`capsuleStatus=1`、`capsuleType=3`、
+ *   `capsuleTitle`、`capsuleContent`、`capsuleIcon`（发送者头像，原样 Icon 不重建）、
+ *   `capsuleBgColor`（品牌色）、`capsuleContentColor`（按底色亮度自适应）
  *
- * 只对「消息类」通知注入（有 title/text），跳过进程内常驻前台通知（微信/QQ 的
- * 「后台运行中」通知没有有意义的内容，注入只会产生一条占位胶囊）。
+ * 影子通知用固定 tag/id（每个 App 一条），新消息直接覆盖更新，不会堆积。
  */
 internal object ArkMessageLiveInjector {
 
     private const val TAG = "liveMsg"
 
-    /** extras 里标记「已注入」的键，避免同一条通知重复处理 */
-    private const val KEY_INJECTED = "com.flymeark.msg_live_injected"
+    /** 影子通知标记；SystemUI 侧据此把它从通知栏列表剔除 */
+    const val KEY_SHADOW = "com.flymeark.live_shadow"
+
+    const val SHADOW_TAG = "flymeark_live_msg"
+    const val SHADOW_CHANNEL = "flymeark_live_msg_ch"
+
+    /** 每个 App 一条影子通知，id 固定 */
+    const val SHADOW_ID = 0x4B000001
+
+    fun isShadowNotification(n: Notification): Boolean = try {
+        n.extras?.getBoolean(KEY_SHADOW) == true
+    } catch (_: Throwable) {
+        false
+    }
 
     private fun isMessageNotification(n: Notification): Boolean {
-        // 有标题 + 正文的才算消息通知；纯 icon/常驻前台通知跳过
         val extras = try { n.extras } catch (_: Throwable) { null } ?: return false
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)
-        if (title == null && text == null) return false
-        // 已注入过的不重复处理
-        if (extras.containsKey(KEY_INJECTED)) return false
-        return true
+        return title != null || text != null
     }
 
-    private fun injectLiveFields(n: Notification, pkg: String) {
+    private fun appContext(): Context? = try {
+        XposedHelpers.callStaticMethod(
+            Class.forName("android.app.AndroidAppHelper"), "currentApplication"
+        ) as? Context
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 发布/更新影子实况通知（不影响原通知） */
+    private fun postShadow(pkg: String, src: Notification) {
+        val ctx = appContext() ?: run {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG no app context, skip shadow")
+            return
+        }
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return
+
+        val extras = try { src.extras } catch (_: Throwable) { null } ?: return
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+            ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+            ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
+        val content = when {
+            !text.isNullOrBlank() -> text
+            !title.isNullOrBlank() -> "收到来自 $title 的消息"
+            else -> return
+        }
+
+        val smallIcon = try { src.getSmallIcon() } catch (_: Throwable) { null } ?: return
+        val largeIcon = messageIcon(src)
+        val bg = ArkConstants.brandColorOf(pkg)
+
+        // 低优先级渠道：不响铃、不振动、不出横幅（-2 = IMPORTANCE_LOW 以下也无所谓）
         try {
-            val extras = n.extras
+            val ch = NotificationChannel(
+                SHADOW_CHANNEL, "消息实况胶囊", NotificationManager.IMPORTANCE_LOW
+            )
+            ch.setSound(null, null)
+            ch.enableVibration(false)
+            ch.setShowBadge(false)
+            nm.createNotificationChannel(ch)
+        } catch (t: Throwable) {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG channel failed: ${t.message}")
+        }
 
-            // ===== 完全按「魅况 1.21」的实况通知协议（反编译 NotificationForwardService 确认）=====
-            // 之前只注入 live.type=1 + capsuleStatus 导致：胶囊能出但只有图标、文字不显示。
-            // 魅况 的完整字段组合（一个都不能少）：
-            //   extras: is_live=true / live.operation=0 / live.type=10 / live.status=1
-            //   capsule: capsuleStatus=1 / capsuleType=3 / capsuleContent / capsuleIcon
-            //            capsuleBgColor(品牌色) / capsuleContentColor(按底色选白/深字)
-
-            // 1) 顶层 live 字段
-            extras.putBoolean("is_live", true)
-            extras.putInt("notification.live.operation", 0)
-            extras.putInt("notification.live.type", 10)
-            extras.putInt("notification.live.status", 1)
-
-            // 2) 正文：优先 text，其次 bigText
-            val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
-                ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
-            // 标题（发送者）
-            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
-                ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
-
-            // 3) capsule 子 Bundle
-            val capsule = Bundle()
-            capsule.putInt("notification.live.capsuleStatus", 1)
-            capsule.putInt("notification.live.capsuleType", 3)
-            val content = when {
-                !text.isNullOrBlank() -> text
-                !title.isNullOrBlank() -> "收到来自 $title 的消息"
-                else -> return
+        val shadow: Notification = try {
+            val b = Notification.Builder(ctx, SHADOW_CHANNEL)
+                .setSmallIcon(smallIcon)
+                .setContentTitle(title ?: pkg)
+                .setContentText(content)
+                .setOnlyAlertOnce(true)
+                .setShowWhen(false)
+                .setAutoCancel(false)
+                .setOngoing(false)
+            if (largeIcon != null) b.setLargeIcon(largeIcon)
+            try {
+                val ci: PendingIntent? = src.contentIntent
+                if (ci != null) b.setContentIntent(ci)
+            } catch (_: Throwable) {
             }
-            capsule.putString("notification.live.capsuleContent", content)
-            if (title != null) capsule.putString("notification.live.capsuleTitle", title)
+            b.build()
+        } catch (t: Throwable) {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG build shadow failed: ${t.message}")
+            return
+        }
 
-            // 4) 底色：固定品牌色（v3.15.19）
-            //    上一版按「头像平均色 × 0.7」算底色，一旦头像取不到位图就落到
-            //    0xFF333333 兜底 → 用户看到「纯黑底」。改用固定品牌色后不再依赖
-            //    位图能否取到，颜色也稳定可预期。
-            val bg = ArkConstants.brandColorOf(pkg)
-            capsule.putInt("notification.live.capsuleBgColor", bg)
-            // 字色按底色亮度自适应：QQ 亮蓝底用深色字，微信绿/网易云红用白字
-            capsule.putInt("notification.live.capsuleContentColor", ArkConstants.readableTextOn(bg))
+        val se = shadow.extras
+        // 影子标记（SystemUI 据此过滤；本 hook 据此避免自我递归）
+        se.putBoolean(KEY_SHADOW, true)
 
-            // 5) 左侧头像：**必须原样放通知里的 Icon，不能重建**
-            //    v3.15.18 曾把头像缩到 28dp 后 Icon.createWithBitmap 重建，结果该
-            //    Icon 跨进程 parcel 到 SystemUI 时读回 null → 用户看到「头像消失」。
-            //    原样放 android.largeIcon 里的 Icon 是验证过能正常显示的路径。
-            val icon = messageIcon(n)
-            if (icon != null) {
-                capsule.putParcelable("notification.live.capsuleIcon", icon)
-            }
+        // 顶层 live 字段
+        se.putBoolean("is_live", true)
+        se.putInt("notification.live.operation", 0)
+        se.putInt("notification.live.type", 10)
+        se.putInt("notification.live.status", 1)
+        // 不参与"钉住"逻辑，避免额外横幅
+        se.putBoolean("notification.live.pinned", false)
 
-            extras.putBundle("notification.live.capsule", capsule)
+        // 胶囊字段
+        val capsule = Bundle()
+        capsule.putInt("notification.live.capsuleStatus", 1)
+        capsule.putInt("notification.live.capsuleType", 3)
+        capsule.putString("notification.live.capsuleContent", content)
+        if (title != null) capsule.putString("notification.live.capsuleTitle", title)
+        capsule.putInt("notification.live.capsuleBgColor", bg)
+        capsule.putInt(
+            "notification.live.capsuleContentColor", ArkConstants.readableTextOn(bg)
+        )
+        if (largeIcon != null) {
+            capsule.putParcelable("notification.live.capsuleIcon", largeIcon)
+        }
+        se.putBundle("notification.live.capsule", capsule)
 
-            // 6) 标记已注入，防重复
-            extras.putBoolean(KEY_INJECTED, true)
-
+        try {
+            nm.notify(SHADOW_TAG, SHADOW_ID, shadow)
             XposedBridge.log(
-                "[${ArkConstants.LOG_TAG}] $TAG fields: pkg=$pkg bg=0x${Integer.toHexString(bg)} " +
-                    "icon=${if (icon != null) "yes" else "no"} title='$title' content='$content'"
+                "[${ArkConstants.LOG_TAG}] $TAG shadow posted: pkg=$pkg bg=0x${Integer.toHexString(bg)} " +
+                    "icon=${if (largeIcon != null) "yes" else "no"} title='$title' content='$content'"
             )
         } catch (t: Throwable) {
-            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG inject failed: ${t.message}")
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG notify shadow failed: ${t.message}")
+        }
+    }
+
+    /** 取消影子通知（原通知被清掉时同步） */
+    fun cancelShadow(ctx: Context) {
+        try {
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.cancel(SHADOW_TAG, SHADOW_ID)
+        } catch (_: Throwable) {
         }
     }
 
     /**
-     * 取消息发送者头像。优先取 extras 里现成的 `android.largeIcon`（已经是 Icon 类型，
-     * 微信/QQ 消息通知把发送者头像放这里，跨进程 parcel 不会丢）；其次 `getLargeIcon()`
-     * 拿 Bitmap 构造；最后兜底 `getSmallIcon()`。
-     *
-     * 注意：不要用 `Icon.createWithBitmap` 重新构造——实测该 Icon 跨进程 parcel 到
-     * SystemUI 后 `getCapsuleIcon()` 读回为 null（Bitmap 类型序列化丢失），导致胶囊
-     * 左侧回退成 APP 图标。直接用通知里现成的 `android.largeIcon`（Icon）最稳。
+     * 取消息发送者头像。优先 extras 里现成的 `android.largeIcon`（Icon 类型，跨进程不丢），
+     * 不要用 `Icon.createWithBitmap` 重建——实测重建的 Icon parcel 到 SystemUI 后读回 null。
      */
     private fun messageIcon(n: Notification): Icon? {
-        // 1) extras 里现成的 android.largeIcon（Icon 类型，最稳）
         try {
             val fromExtras = n.extras?.getParcelable<Icon>("android.largeIcon")
             if (fromExtras != null) return fromExtras
         } catch (_: Throwable) {
         }
-        // 2) EXTRA_LARGE_ICON_BIG 里的 Bitmap
         try {
             val extraLarge = n.extras?.getParcelable<Bitmap>(Notification.EXTRA_LARGE_ICON_BIG)
             if (extraLarge != null && !extraLarge.isRecycled) {
@@ -153,16 +202,7 @@ internal object ArkMessageLiveInjector {
             }
         } catch (_: Throwable) {
         }
-        // 3) getLargeIcon() 拿 Bitmap 构造
-        val large = try { n.getLargeIcon() } catch (_: Throwable) { null }
-        if (large is Bitmap && !large.isRecycled) {
-            try {
-                return Icon.createWithBitmap(large)
-            } catch (_: Throwable) {
-            }
-        }
-        // 4) 兜底 smallIcon
-        return try { n.getSmallIcon() } catch (_: Throwable) { null }
+        return null
     }
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
@@ -171,15 +211,28 @@ internal object ArkMessageLiveInjector {
 
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG installing for $pkg")
 
-        val hook = object : XC_MethodHook() {
+        val notifyHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
                     val n = param.args.filterIsInstance<Notification>().firstOrNull() ?: return
+                    // 影子通知自身的发布：放行，不再生成影子
+                    if (isShadowNotification(n)) return
                     if (!isMessageNotification(n)) return
-                    injectLiveFields(n, pkg)
-                    XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG injected live fields for $pkg")
+                    // 原通知**不做任何修改**，只在旁边补一条实况影子通知
+                    postShadow(pkg, n)
                 } catch (t: Throwable) {
                     XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")
+                }
+            }
+        }
+
+        // 原通知被 App 自己取消时，同步撤掉影子（避免胶囊残留）
+        val cancelHook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    val ctx = appContext() ?: return
+                    cancelShadow(ctx)
+                } catch (_: Throwable) {
                 }
             }
         }
@@ -188,14 +241,27 @@ internal object ArkMessageLiveInjector {
             val nmClass = XposedHelpers.findClass("android.app.NotificationManager", lpp.classLoader)
             ArkHooks.quiet("$TAG notify(int,Notification)") {
                 XposedHelpers.findAndHookMethod(
-                    nmClass, "notify", Int::class.javaPrimitiveType, Notification::class.java, hook
+                    nmClass, "notify", Int::class.javaPrimitiveType, Notification::class.java, notifyHook
                 )
             }
             ArkHooks.quiet("$TAG notify(String,int,Notification)") {
                 XposedHelpers.findAndHookMethod(
                     nmClass, "notify",
-                    String::class.java, Int::class.javaPrimitiveType, Notification::class.java, hook
+                    String::class.java, Int::class.javaPrimitiveType, Notification::class.java, notifyHook
                 )
+            }
+            ArkHooks.quiet("$TAG cancel(id)") {
+                XposedHelpers.findAndHookMethod(
+                    nmClass, "cancel", Int::class.javaPrimitiveType, cancelHook
+                )
+            }
+            ArkHooks.quiet("$TAG cancel(tag,id)") {
+                XposedHelpers.findAndHookMethod(
+                    nmClass, "cancel", String::class.java, Int::class.javaPrimitiveType, cancelHook
+                )
+            }
+            ArkHooks.quiet("$TAG cancelAll") {
+                XposedHelpers.findAndHookMethod(nmClass, "cancelAll", cancelHook)
             }
         }
     }

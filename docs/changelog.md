@@ -2,6 +2,27 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.24 双通知拆分：通知栏原生卡片 + 独立实况胶囊
+
+**架构改动**：微信/QQ 的消息胶囊不再靠"篡改原通知"实现，改为两条通知分工。
+
+| 通知 | 归属 | 表现 |
+|---|---|---|
+| 原消息通知 | 微信/QQ 自己 | **完全不注入**，通知栏就是系统原生卡片（标题/正文/时间/×、原生滑动删除、点击进聊天）|
+| 实况影子通知 | 模块额外 post（per-App 固定 tag/id）| 走实况链路，只负责状态栏胶囊 + AOD；用固定 id 覆盖更新，不堆积 |
+
+- `ArkMessageLiveInjector` 重写：hook `NotificationManager.notify` 后**不再改原 Notification**，
+  而是用 `Notification.Builder(ctx, "flymeark_live_msg_ch")` 构造一条影子通知（IMPORTANCE_LOW、
+  静音、不振动、`live.pinned=false` 避免额外横幅），注入魅况配方的 live 字段后单独 notify。
+  影子 extras 打 `com.flymeark.live_shadow=true` 标记。
+- `ArkLiveShadowHook`（新增，SystemUI）：
+  1. hook `ShadeListBuilder.applyFilters()` → 影子条目返回 true，**只从通知栏显示列表剔除**，
+     `NotifCollection` 仍持有 → 胶囊正常。刻意不动 `sbn.isLive()`：会切断
+     `addTrackingLiveExpandableView` 的触摸追踪导致胶囊点不动（v3.15.22 已踩坑）。
+  2. hook `NotificationListener.onNotificationRemoved` → 微信/QQ 普通通知被移除（×/滑动/App 消费）
+     时，通过 `IStatusBarService.onNotificationClear` 同步清掉影子，胶囊随之消失。
+- 清掉旧版本遗留问题：原通知不再带 live 字段，所以「空白玻璃卡 + 空心圆 + 无法一键清除」全部消失。
+
 ## 2026-11-05 · v3.15.23 撤销 sbn.isLive 拦截（修复胶囊点击失效）
 
 - **撤销 v3.15.22 的 `StatusBarNotification.isLive()` 调用栈分流 hook**。该方案虽让通知栏渲染链读到 false，
