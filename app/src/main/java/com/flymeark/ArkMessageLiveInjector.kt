@@ -32,9 +32,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
  * 在微信/QQ 进程 hook `NotificationManager.notify`，给每条消息通知注入：
  *  - `extras["notification.live.type"] = 1`
  *  - `extras["notification.live.capsule"]` 子 Bundle：
- *      `capsuleStatus=1`、`capsuleTitle=<发送者/title>`、
+ *      `capsuleStatus=1`、`capsuleType=3`、`capsuleTitle=<发送者/title>`、
  *      `capsuleContent=<消息正文/text>`（系统自动轮播多行）、
- *      `capsuleIcon=<发送者头像 Icon>`（左侧头像，对应音乐胶囊的封面）。
+ *      `capsuleIcon=<发送者头像 Icon>`（左侧头像，对应音乐胶囊的封面）、
+ *      `capsuleBgColor=<品牌色>`、`capsuleContentColor=<按底色亮度选的白/深字>`。
  *
  * 多胶囊共存由 Flyme 原生处理（`LiveNotificationController` 的 `mToShow` 列表 +
  * `mFocusPackageName` 排序 + `LiveNotificationView` 上滑切换手势），本类无需介入。
@@ -60,41 +61,69 @@ internal object ArkMessageLiveInjector {
         return true
     }
 
-    private fun injectLiveFields(n: Notification) {
+    private fun injectLiveFields(n: Notification, pkg: String) {
         try {
             val extras = n.extras
-            // 1) live.type = 1 → isLive() 为真
-            extras.putInt("notification.live.type", 1)
 
-            // 2) capsule 子 Bundle
-            val capsule = Bundle()
-            capsule.putInt("notification.live.capsuleStatus", 1)
-            // 标题优先用 title，其次用 subText，再次空
-            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
-                ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
-            if (title != null) capsule.putString("notification.live.capsuleTitle", title)
-            // 正文（系统会自动轮播多行）
+            // ===== 完全按「魅况 1.21」的实况通知协议（反编译 NotificationForwardService 确认）=====
+            // 之前只注入 live.type=1 + capsuleStatus 导致：胶囊能出但只有图标、文字不显示。
+            // 魅况 的完整字段组合（一个都不能少）：
+            //   extras: is_live=true / live.operation=0 / live.type=10 / live.status=1
+            //   capsule: capsuleStatus=1 / capsuleType=3 / capsuleContent / capsuleIcon
+            //            capsuleBgColor(品牌色) / capsuleContentColor(按底色选白/深字)
+
+            // 1) 顶层 live 字段
+            extras.putBoolean("is_live", true)
+            extras.putInt("notification.live.operation", 0)
+            extras.putInt("notification.live.type", 10)
+            extras.putInt("notification.live.status", 1)
+
+            // 2) 正文：优先 text，其次 bigText
             val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
                 ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
-            if (text != null) capsule.putString("notification.live.capsuleContent", text)
+            // 标题（发送者）
+            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+                ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
 
-            // 3) 左侧头像：胶囊左侧图标 = 发消息人头像（对应音乐胶囊的封面）。
-            //    Flyme 取 `capsuleIcon`（Icon 类型）渲染到 mLiveNotificationIcon。
-            //    来源：优先 largeIcon（微信/QQ 消息通知把发送者头像放这里），
-            //    兜底 smallIcon。
+            // 3) capsule 子 Bundle
+            val capsule = Bundle()
+            capsule.putInt("notification.live.capsuleStatus", 1)
+            capsule.putInt("notification.live.capsuleType", 3)
+            val content = when {
+                !text.isNullOrBlank() -> text
+                !title.isNullOrBlank() -> "收到来自 $title 的消息"
+                else -> return
+            }
+            capsule.putString("notification.live.capsuleContent", content)
+            if (title != null) capsule.putString("notification.live.capsuleTitle", title)
+
+            // 4) 底色：固定品牌色（v3.15.19）
+            //    上一版按「头像平均色 × 0.7」算底色，一旦头像取不到位图就落到
+            //    0xFF333333 兜底 → 用户看到「纯黑底」。改用固定品牌色后不再依赖
+            //    位图能否取到，颜色也稳定可预期。
+            val bg = ArkConstants.brandColorOf(pkg)
+            capsule.putInt("notification.live.capsuleBgColor", bg)
+            // 字色按底色亮度自适应：QQ 亮蓝底用深色字，微信绿/网易云红用白字
+            capsule.putInt("notification.live.capsuleContentColor", ArkConstants.readableTextOn(bg))
+
+            // 5) 左侧头像：**必须原样放通知里的 Icon，不能重建**
+            //    v3.15.18 曾把头像缩到 28dp 后 Icon.createWithBitmap 重建，结果该
+            //    Icon 跨进程 parcel 到 SystemUI 时读回 null → 用户看到「头像消失」。
+            //    原样放 android.largeIcon 里的 Icon 是验证过能正常显示的路径。
             val icon = messageIcon(n)
             if (icon != null) {
-                try {
-                    capsule.putParcelable("notification.live.capsuleIcon", icon)
-                } catch (t: Throwable) {
-                    XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG put icon failed: ${t.message}")
-                }
+                capsule.putParcelable("notification.live.capsuleIcon", icon)
             }
 
             extras.putBundle("notification.live.capsule", capsule)
 
-            // 4) 标记已注入，防重复
+            // 6) 标记已注入，防重复
             extras.putBoolean(KEY_INJECTED, true)
+
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG fields: pkg=$pkg bg=0x${Integer.toHexString(bg)} " +
+                    "icon=${if (icon != null) "yes" else "no"} title='$title' content='$content'"
+            )
         } catch (t: Throwable) {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG inject failed: ${t.message}")
         }
@@ -147,7 +176,7 @@ internal object ArkMessageLiveInjector {
                 try {
                     val n = param.args.filterIsInstance<Notification>().firstOrNull() ?: return
                     if (!isMessageNotification(n)) return
-                    injectLiveFields(n)
+                    injectLiveFields(n, pkg)
                     XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG injected live fields for $pkg")
                 } catch (t: Throwable) {
                     XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG hook error: ${t.message}")

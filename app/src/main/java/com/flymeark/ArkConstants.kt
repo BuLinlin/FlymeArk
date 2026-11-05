@@ -48,6 +48,62 @@ object ArkConstants {
     /** 是否为本模块支持的消息实况 App 包名（微信/QQ） */
     fun isMessageLiveApp(pkg: String?): Boolean = pkg != null && pkg in MESSAGE_LIVE_PKGS
 
+    // ------------------------------------------------------------------
+    // 胶囊品牌色（v3.15.19，用户指定标准）
+    //
+    // 不再从内容里算平均色 —— 头像取不到位图时算出来是近黑，胶囊直接变「黑底」。
+    // 固定用各家品牌色，稳定、可预期，也和系统下拉栏里 App 的视觉语言一致。
+    // ------------------------------------------------------------------
+
+    /** 微信｜绿 #07C160 */
+    const val BRAND_WECHAT = 0xFF07C160.toInt()
+
+    /** QQ｜亮蓝 #00CAFC（新版 Q 语言主题色 qdesign） */
+    const val BRAND_QQ = 0xFF00CAFC.toInt()
+
+    /** QQ 音乐｜绿 #31C27C */
+    const val BRAND_QQMUSIC = 0xFF31C27C.toInt()
+
+    /** 网易云音乐｜红 #C20C0C */
+    const val BRAND_NETEASE = 0xFFC20C0C.toInt()
+
+    /** 兜底底色（未知 App） */
+    const val BRAND_FALLBACK = 0xFF333333.toInt()
+
+    /** 按包名取胶囊底色 */
+    fun brandColorOf(pkg: String?): Int = when (pkg) {
+        WECHAT_PKG -> BRAND_WECHAT
+        QQ_PKG -> BRAND_QQ
+        MEDIA_APP_PKG -> BRAND_QQMUSIC
+        NETEASE_MUSIC_PKG -> BRAND_NETEASE
+        else -> BRAND_FALLBACK
+    }
+
+    /**
+     * 给定底色选可读的前景字色。
+     *
+     * QQ 的亮蓝 #00CAFC 相对亮度约 0.49，白字对比度只有 1.9:1（几乎糊成一片），
+     * 必须换深色字；微信绿 #07C160（0.39）与网易云红 #C20C0C（0.12）用白字正好，
+     * 也符合各家 App 自己的品牌用法。阈值 0.42 落在两者之间。
+     */
+    fun readableTextOn(bgColor: Int): Int = if (luminance(bgColor) > 0.42f) {
+        0xFF0A2A33.toInt()   // 深色字（QQ 亮蓝底）
+    } else {
+        -1                   // 白色字（微信绿 / 网易云红 / 兜底深色）
+    }
+
+    /** WCAG 相对亮度（0..1），用于判断底色深浅 */
+    private fun luminance(color: Int): Float {
+        fun channel(c: Int): Float {
+            val s = c / 255f
+            return if (s <= 0.03928f) s / 12.92f else Math.pow(((s + 0.055f) / 1.055f).toDouble(), 2.4).toFloat()
+        }
+        val r = channel((color shr 16) and 0xFF)
+        val g = channel((color shr 8) and 0xFF)
+        val b = channel(color and 0xFF)
+        return 0.2126f * r + 0.7152f * g + 0.0722f * b
+    }
+
     /** 设置进程包名（把 QQ音乐登记进「实况通知」设置页） */
     const val SETTINGS_PKG = "com.android.settings"
 

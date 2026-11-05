@@ -1,5 +1,6 @@
 package com.flymeark
 
+import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -35,6 +36,15 @@ internal object ArkMessageLiveTextHook {
     private const val INFO_CLS =
         "com.android.systemui.shared.livenotification.LiveNotificationInfo"
 
+    /**
+     * showType 1→0 补丁开关。
+     *
+     * v3.15.18 后期按「魅况」协议（live.type=10 / status=1 / operation=0 / capsuleType=3）
+     * 重写注入后先关闭本补丁，避免与魅况协议的 showType 语义冲突（capsuleType=3 需要
+     * 系统自分配 showType 才能正确渲染进度条语义的胶囊）。确认新协议效果后再决定是否启用。
+     */
+    private const val ENABLE_SHOWTYPE_PATCH = false
+
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
         if (lpp.packageName != ArkConstants.SYSTEMUI_PKG) return
 
@@ -44,6 +54,7 @@ internal object ArkMessageLiveTextHook {
                 Int::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!ENABLE_SHOWTYPE_PATCH) return
                         try {
                             val pkg = XposedHelpers.getObjectField(
                                 param.thisObject, "packageName"
@@ -63,5 +74,59 @@ internal object ArkMessageLiveTextHook {
             )
         }
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG installing in SystemUI")
+
+        // ===== 渲染探针：setLiveNotificationInfo 后延迟读 View 真实状态 =====
+        // 背景：数据层全对（showText 有值、颜色 0xFF333333、showType=0），但胶囊文字
+        // 不可见。静态分析无法定位（text/color/width/alpha 链路看似都通），加运行时
+        // 探针直接读 TextView 的 text/alpha/visibility/width，一次看清哪个属性不对。
+        ArkHooks.quiet("$TAG probe") {
+            val viewCls = XposedHelpers.findClass(
+                "com.flyme.statusbar.livenotification.LiveNotificationView", lpp.classLoader
+            )
+            XposedHelpers.findAndHookMethod(
+                viewCls, "setLiveNotificationInfo",
+                XposedHelpers.findClass(INFO_CLS, lpp.classLoader),
+                Boolean::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val view = param.thisObject as? android.view.View ?: return
+                            val info = param.args[0]
+                            val pkg = XposedHelpers.getObjectField(info, "packageName") as? String
+                            if (pkg != null && !ArkConstants.isMessageLiveApp(pkg)) return
+                            val showType = XposedHelpers.callMethod(info, "getShowType")
+                            val showText = XposedHelpers.callMethod(info, "getShowText")
+                            view.postDelayed({
+                                try {
+                                    val tv = XposedHelpers.getObjectField(
+                                        view, "mLiveNotificationText"
+                                    ) as? TextView
+                                    val linear = XposedHelpers.getObjectField(
+                                        view, "mLinearIconText"
+                                    ) as? android.view.View
+                                    val prog = XposedHelpers.getObjectField(
+                                        view, "mLiveProgressBar"
+                                    ) as? android.view.View
+                                    fun v(x: android.view.View?): String =
+                                        if (x == null) "null" else
+                                            "w=${x.width} h=${x.height} vis=${x.visibility} alpha=${x.alpha}"
+                                    XposedBridge.log(
+                                        "[${ArkConstants.LOG_TAG}] $TAG probe: type=$showType " +
+                                            "infoText='${showText}' viewW=${view.width} vis=${view.visibility} " +
+                                            "tv[v='${tv?.text}' color=0x${Integer.toHexString(tv?.currentTextColor ?: 0)} " +
+                                            "alpha=${tv?.alpha} vis=${tv?.visibility} w=${tv?.width} ${v(tv)}] " +
+                                            "linear[${v(linear)}] prog[${v(prog)}]"
+                                    )
+                                } catch (t: Throwable) {
+                                    XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG probe-inner: ${t.message}")
+                                }
+                            }, 600)
+                        } catch (t: Throwable) {
+                            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG probe error: ${t.message}")
+                        }
+                    }
+                }
+            )
+        }
     }
 }
