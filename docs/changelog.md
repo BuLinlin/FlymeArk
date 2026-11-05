@@ -2,6 +2,17 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.40 修「点胶囊没反应」：面板布局缺宽度声明，Activity 启动即崩
+
+- **根因（logcat 实锤）**：`activity_message_panel.xml` 里 `msg_title` / `msg_time` 只写了
+  `style=@style/ArkPanelTitle/Subtitle`，样式不含 `layout_width`，inflate 抛
+  `You must supply a layout_width attribute` → 面板每次启动即 FATAL，屏幕上什么都看不到，
+  表现为「胶囊点不动」。补上显式 `layout_width/layout_height`（音乐面板同款写法）。
+- 头像补充来源：`Notification.largeIcon` 之外，优先读 extras 的 `android.largeIcon`
+  （微信/QQ 发送者头像实际存放位置，之前一直 avatar=false）。
+- 头像位图裁圆形（clipToOutline + 圆形 outline）；品牌色圆点改用 oval GradientDrawable
+  （布局里无背景时不再退化成方色块）。
+
 ## 2026-11-05 · v3.15.39 消息胶囊点击 → 展开大卡（ArkMessagePanelActivity）
 
 v3.15.38 用户实测通过（胶囊一出现即带占位文字）。消息胶囊的最后一环：

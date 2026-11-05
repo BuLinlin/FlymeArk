@@ -7,6 +7,7 @@ import android.content.res.Configuration
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -15,6 +16,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.TextView
@@ -130,8 +132,10 @@ class ArkMessagePanelActivity : Activity() {
         timeView.visibility = if (postAt <= 0L) View.GONE else View.VISIBLE
 
         brandColor = i.getIntExtra(ArkConstants.EXTRA_MSG_BRAND, brandColor)
-        (dotView.background as? GradientDrawable)?.setColor(brandColor)
-            ?: run { dotView.setBackgroundColor(brandColor) }
+        dotView.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(brandColor)
+        }
 
         // 头像：圆形裁剪 + 品牌色底（Icon 解码失败时至少有色块不空洞）
         val avatar: Bitmap? =
@@ -145,7 +149,16 @@ class ArkMessagePanelActivity : Activity() {
             shape = GradientDrawable.OVAL
             setColor(brandColor)
         }
-        if (avatar != null) avatarView.setImageBitmap(avatar)
+        if (avatar != null) {
+            avatarView.setImageBitmap(avatar)
+            // 方形位图裁成圆形：圆形 outline + clipToOutline
+            avatarView.clipToOutline = true
+            avatarView.outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setOval(0, 0, view.width, view.height)
+                }
+            }
+        }
 
         // 右上角应用图标
         val pkg = i.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)

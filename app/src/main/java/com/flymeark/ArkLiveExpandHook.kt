@@ -1824,10 +1824,18 @@ internal object ArkLiveExpandHook {
         val text = (extras?.getCharSequence(Notification.EXTRA_TEXT)
             ?: extras?.getCharSequence(Notification.EXTRA_BIG_TEXT))?.toString()?.trim()
 
-        // largeIcon 的静态类型在不同 framework 下有 Bitmap / Icon 两种，运行时按实际类型取
+        // largeIcon 的静态类型在不同 framework 下有 Bitmap / Icon 两种，运行时按实际类型取；
+        // 微信/QQ 的发送者头像通常放在 extras 的 android.largeIcon（Icon 类型）里
         val largeIconObj = try { XposedHelpers.getObjectField(n, "largeIcon") } catch (_: Throwable) { null }
+        val extrasLargeIcon = try {
+            @Suppress("DEPRECATION")
+            extras?.getParcelable<android.os.Parcelable>("android.largeIcon")
+        } catch (_: Throwable) {
+            null
+        }
         val avatar = (largeIconObj as? Bitmap)
             ?: avatarBitmapOf(ctx, largeIconObj as? android.graphics.drawable.Icon)
+            ?: avatarBitmapOf(ctx, extrasLargeIcon as? android.graphics.drawable.Icon)
         val postAt = try { XposedHelpers.callMethod(sbn, "getPostTime") as? Long ?: 0L } catch (_: Throwable) { 0L }
         val contentIntent = n?.contentIntent
 
