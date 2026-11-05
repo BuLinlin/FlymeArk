@@ -2,6 +2,33 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.32 修「通知布局 inflate 被模块异常打断」
+
+真机日志（SystemUI 重启后 inflate QQ 通知时）：
+
+```
+E/LSPosedFramework: XposedHelpers$ClassNotFoundError:
+  com.android.server.notification.NotificationManagerService
+  at com.flymeark.ArkLiveAllowHook.install(ArkLiveAllowHook.kt:43)
+  at com.flymeark.ArkEntry.handleLoadPackage(ArkEntry.kt:27)
+  at android.view.LayoutInflater.createView
+  at android.widget.RemoteViews.inflateView
+```
+
+**包名 `android` / `system` 不可靠**：SystemUI 异步 inflate RemoteViews 时，
+LSPosed 的 `createOrUpdateClassLoaderLocked` 钩子会再触发一次 `handleLoadPackage`，
+上报包名 `android`，于是进了 system_server 分支，在 SystemUI 里找
+`NotificationManagerService` → ClassNotFound → 异常沿 inflate 逃逸 →
+**整条通知布局 inflate 失败**（这正是历史上「消息不显示」的成因之一）。
+
+修复三层：
+1. [ArkEntry] 的 `handleLoadPackage` 整体 try/catch，任何异常都不再穿透到 LayoutInflater；
+2. system_server 分支增加 `ActivityThread.currentProcessName()` 校验，
+   只有进程名真是 `android`/`system`/`system_server` 才安装；
+3. [ArkLiveAllowHook] 的 `findClass` 单独 try，找不到就记日志返回。
+
+- versionCode 55 / 3.15.32
+
 ## 2026-11-05 · v3.15.31 胶囊「先空白、后补字」修复
 
 用户反馈：**每条消息的胶囊都会延迟，延迟期间内容是空白**。

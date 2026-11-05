@@ -40,9 +40,20 @@ internal object ArkLiveAllowHook {
         // （父类是 `INotificationManager$Stub`，即 Binder 服务端实现）。直接 hook 外层类会
         // 报 NoSuchMethodError。这里遍历所有 `NotificationManagerService$N` 内部类，找到
         // 真正声明该方法签名的那个再 hook，避免 `$12` 编号随 ROM 版本变化而失效。
-        val nmCls = XposedHelpers.findClass(
-            "com.android.server.notification.NotificationManagerService", lpp.classLoader
-        )
+        // v3.15.31：即使进程判断失手（例如被 RemoteViews inflate 误触发到 SystemUI），
+        // 也不能让 ClassNotFound 逃逸 —— 它会让 LayoutInflater.createView 抛异常，
+        // 整条通知布局 inflate 失败。这里兜住并只记一条日志。
+        val nmCls = try {
+            XposedHelpers.findClass(
+                "com.android.server.notification.NotificationManagerService", lpp.classLoader
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log(
+                "[${ArkConstants.LOG_TAG}] $TAG: NotificationManagerService not found " +
+                    "in ${lpp.packageName}, skip (${t.javaClass.simpleName})"
+            )
+            return
+        }
 
         val callback = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
