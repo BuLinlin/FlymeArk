@@ -244,15 +244,63 @@ SystemUI 的通知管线  ←── FlymeArk 在这里拦一下
   想要路名，只能往高德进程里注入去读 TBT 状态（方案 B 的事）。
 - Flyme 的实况管线对 `type=10` 可能还有额外校验（比如要求 app 在某个白名单里），需要真机验证一次。
 
-### 方案 B：注入高德进程，自己构造并发送通知
+### 3.1 如果将来要走方案 B：注入点已经找到了
 
-需要：把 `com.autonavi.minimap` 加进 LSPosed 作用域 → 找 TBT 状态回调（`com.autonavi.jni.eyrie.amap.tbt.NaviManager` /
-`com.autonavi.bundle.routecommon.api.INaviStatus` / `bnv` 引擎的 `NaviPointInfo`）→ 自己拼 `notification.live.*` 发出去。
+`com.autonavi.bundle.routecommon.inter.IRouteNaviInfoController`（classes5）是现成的观察者接口：
 
-问题：**收益为零**。通知模型里就 title/content/iconResId 三个字段，
-就算拿到路名，最终也还是要塞进同一个 `content` 字符串。除非我们完全绕开高德的 `NotifyServiceImpl`、自己做 RemoteViews 展开卡。
+```java
+public interface IRouteNaviInfoController {
+    boolean addNaviInfoListener(INaviInfoListener l);
+    boolean removeNaviInfoListener(INaviInfoListener l);
+    void notifyNaviInfo(@NonNull ej5 info);
+    void setNotifyStateListener(INotifyStateListener l);
+    boolean getNotifyState();
 
-→ 不划算。除非后面要做"路名 / 红绿灯读秒 / 车道级"这类高德通知里没有的信息，才值得上。
+    interface INaviInfoListener { void onNaviInfoChanged(@NonNull ej5 info); }
+    interface INotifyStateListener { void onNotifyStateChanged(boolean z); }
+}
+```
+
+载荷 `ej5`（`defpackage.ej5`，`toString()` 自报 `RouteNaviInfo`）：
+
+```java
+public final class ej5 {
+    public final String f13969a;  // bizType
+    public final String b;        // title
+    public final String c;        // content
+    public final int    d;        // status
+    public final int    e;        // icon（转向箭头 drawable res）
+    // toString: "RouteNaviInfo{bizType='..', title='..', content='..', status=.., icon=..}"
+}
+```
+
+hook `notifyNaviInfo(ej5)` 或 `INaviInfoListener.onNaviInfoChanged` 就能拿到导航页上那一套实时信息。
+旁边还有 `com.autonavi.bundle.routecommon.util.RouteNaviInfoConstant`（内含 `ManeuverIconID` / `STARTEND` / `SUBWAY_ICON_INDEXS`
+三个嵌套接口，常量被 jadx 内联成空接口，转向码枚举需要另行 dump）。
+
+> **★ 一个重要推论**：`RouteNaviInfo` 的 `title` / `content` / `icon` 三个字段，
+> 正好就是 `IRouteNotification`、也就是最终进通知的那三个字段。
+> 换句话说——**通知里的 title/content 就是导航页顶部的导航信息本身**。
+> 如果高德的 `title` 其实是转向指令（"右转"）、`content` 是路名/距离，
+> 那我们**不用注入任何进程**就已经和百度拿到同等信息了。
+>
+> 这一点静态分析确认不了（取决于运行期赋值），**必须靠真机日志看 `EXTRA_TITLE` / `EXTRA_TEXT` 的实际值**。
+> v3.15.51 的三段日志就是为此埋的——这是整个方案最关键的一个待验证假设。
+
+
+
+### 方案 B：注入高德进程，读实时导航信息
+
+需要：把 `com.autonavi.minimap` 加进 LSPosed 作用域 → hook 上面 §3.1 的 `IRouteNaviInfoController.notifyNaviInfo(ej5)`
+（或 TBT 层的 `com.autonavi.jni.eyrie.amap.tbt.NaviManager`、`com.autonavi.jni.ae.guide.model.NaviPointInfo`）
+→ 自己拼 `notification.live.*` 发出去，或把富字段回传给 SystemUI 侧。
+
+**它到底值不值得做，取决于 §3.1 那个假设：**
+- 若真机日志显示高德的 `title` 就已经是转向指令、`content` 是路名/距离 → **方案 A 完全够用，方案 B 收益为零**；
+- 若 `title` 只是「导航中」、`content` 只是「剩余 X 公里 Y 分钟」→ 方案 A 只能到这一步，
+  想要百度那种「右转 / 进入学院路」就**只能**上方案 B。
+
+→ **不要现在决定。等 v3.15.51 的真机日志。** 这是唯一能定性的证据。
 
 ### 方案 C：`AMapImmerseNaviService` 嵌真地图
 
@@ -300,6 +348,128 @@ val isAmapNavi = sbn.packageName == "com.autonavi.minimap" &&
 2. `capsuleIcon` 传 `Icon.createWithBitmap` 是否被接受（百度传的是 `Parcelable Icon`，来源可能是资源 id）。
 3. 高德导航通知是**另一个 AMap 进程**（`NotifyServiceImpl` 是 Service）发的，id 是否会随进程重启变化。
 4. 高德在导航结束、切后台、锁屏时是否会改发非 ongoing 通知（影响实况何时消失）。
+
+---
+
+## 4.5 协议权威定义（`framework.jar`，比反推智能服务更可靠）
+
+`apk-work/systemui/framework-jadx/sources/` 是魅族改造过的 framework，实况协议的常量和读取逻辑都在这儿。
+
+### ★ 唯一的实况判定条件
+
+`android/service/notification/StatusBarNotification.java`：
+
+```java
+public boolean isLive() {
+    return notification.extras.getInt("notification.live.type", 0) != 0;
+}
+```
+
+**就这一行。** 没有任何白名单校验、没有"必须是委托发布者"的校验、没有 `allowLive` 校验。
+`type != 0` 即视为实况通知。**这是整个方案能成立的根本依据。**
+
+### capsule 的读取方式（`getCapsuleBundle()` + 逐字段 getter）
+
+```java
+private Bundle getCapsuleBundle() {
+    return notification.extras.getBundle("notification.live.capsule");   // ← 确认是嵌套 Bundle
+}
+public String getCapsuleContent() {
+    Bundle b = getCapsuleBundle();
+    return b == null ? null : b.getString("notification.live.capsuleContent");  // ← 子 Bundle 内 key 仍带全前缀
+}
+```
+
+框架侧的完整 getter 清单（对应 key 完全一致）：
+
+| getter | key | 类型 | 取不到时的默认 |
+|---|---|---|---|
+| `getCapsuleContent()` | `notification.live.capsuleContent` | String | null |
+| `getCapsuleTitle()` | `notification.live.capsuleTitle` | String | null |
+| `getCapsuleIcon()` | `notification.live.capsuleIcon` | Parcelable **Icon** | null |
+| `getCapsuleIconLottie()` | `notification.live.capsuleIcon.lottie` | String | "" |
+| `getCapsuleStatus()` | `notification.live.capsuleStatus` | int | -1 |
+| `getCapsuleType()` | `notification.live.capsuleType` | int | -1 |
+| `getCapsuleBgColor()` | `notification.live.capsuleBgColor` | int | -1 |
+| `getCapsuleContentColor()` | `notification.live.capsuleContentColor` | int | -1 |
+| `getCapsuleTime()` | `notification.live.capsuleTime` | long | `elapsedRealtime()` |
+| `getCapsuleCountDown()` | `notification.live.capsuleCountDown` | boolean | false |
+| `getCapsuleFormat()` | `notification.live.capsuleFormat` | String | null |
+| `getCapsulePause()` | `notification.live.capsulePause` | boolean | false |
+| `getCapsulePauseTime()` | `notification.live.capsulePauseTime` | String | "0" |
+| `getCapsuleRemind()` | `notification.live.capsuleRemind` | boolean | false |
+| `getCapsuleClickLaunchPendingIntent()` | `notification.live.capsule.click_launch_pending_intent` | boolean | false |
+| `getCapsuleContentRemoteView()` | `notification.live.capsule.content.remote.view` | **RemoteViews** | null |
+
+→ 后三个（`capsuleCountDown` / `capsuleTime` / `capsuleFormat`）之前不知道，**对导航很有用**：
+`CountDown + capsuleTime` 可以直接让系统跑一个倒计时，适合「预计 18:42 到达」这类表达。
+
+### framework 定义的 type 常量
+
+只有 4 个：`TYPE_BASE=1`、`TYPE_PROGRESS=3`、`TYPE_EMPHASIZE=4`、`TYPE_SYMMETRY=5`。
+**`10` 不在其中**——说明 `10` 是应用自定义类型（百度用的就是 10），框架只校验 `!= 0`，
+具体卡片样式由 SystemUI 的 `com.flyme.statusbar.livenotification` 按数值再分发。
+
+### 其他可用字段（顶层 extras，非 capsule 内）
+
+`notification.live.bgColorOverlay` / `contentOverlay` / `titleOverlay` / `contentColor` / `titleColor`
+`notification.live.can.delete`
+`notification.live.feature.*`（`titleText` / `contentText` / `firstTitleText` / `firstContentText` / `extendImage` / `chronometer*`）
+`notification.live.circle.*`（进度环：`currentprogress` / `previousprogress` / `parentprogress.color` / `closeIcon` / `setprogress.need.animation`）
+`notification.live.custom.remoteview.nopadding`
+`notification.live.app.pkg.delegated` / `...forsettings` / `app.delegatedpac.nopined`
+
+---
+
+## 4.6 界面参考：系统里百度那张导航卡的真实规格
+
+用户要求照系统里百度那张卡做。那张卡**不在 baidu.apk 里**，而是智能服务自己画的——
+`com.meizu.suggestion.notification.baidumap.a#s(Context, GuideInfo, Bitmap)`：
+
+```java
+RemoteViews rv = new RemoteViews(context.getPackageName(), R.layout.live_notification_guide_info);
+// GuideInfo.guideInfo 形如 "右转#进入学院路"，按 '#' 拆成两段
+rv.setTextViewText(R.id.tv_title, 第一段);      // "右转"
+rv.setTextViewText(R.id.tv_content, 第二段);    // "进入学院路"，为空则 setVisibility(GONE)
+rv.setImageViewBitmap(R.id.iv_guide, bitmap);   // 转向箭头
+// 特例：guideInfo 含 "卫星信号弱" → 换成 R.drawable.baidu_map_guide_satellite
+```
+
+布局 `res/layout/live_notification_guide_info.xml` 实测结构（aapt2 导出）：
+
+```
+RelativeLayout  (match_parent × wrap_content)
+└─ RelativeLayout  padding = 16dp
+   ├─ ImageView  iv_guide   44×44dp   layout_centerVertical=true
+   └─ LinearLayout  垂直  match × wrap  centerVertical
+      │              layout_marginStart = 8dp   layout_toEndOf = iv_guide
+      ├─ TextView tv_title     20sp  #FFEEEEEE  sans-serif-medium
+      │                        singleLine  ellipsize=marquee  gravity=center_horizontal
+      └─ TextView tv_content   14sp  #B3EEEEEE (70% 白)  gravity=center_horizontal
+```
+
+配色取自同包资源：卡片底 `baidu_map_walk_bike_notify_bg = #B21A1A1A`（70% 深色玻璃），
+标题 `#FFEEEEEE`，正文 `#B3EEEEEE`，胶囊文字色 `baidu_map_walk_bike_capture`。
+
+**结构其实极简**：一枚 44dp 转向箭头 + 两行居中文本（20sp 指令 / 14sp 路名），没有面板、没有分割线、没有按钮。
+比我们现在的消息卡/音乐卡简单得多。
+
+### ⚠ 一个必须说清的数据落差
+
+百度那张卡的三个信息位是：**转向图标 + 转向指令（"右转"） + 路名（"进入学院路"）**。
+
+高德通知里能拿到的只有：**转向图标 + `"导航中"` + 剩余里程/时间**。
+
+也就是说——版式可以 1:1 照抄，但**内容结构对不上**：高德没有「转向指令」和「路名」这两个字段。
+照抄版式的结果会是「arrow + 导航中 + 剩余 3.2 公里 12 分钟」，
+虽然仍然成立、甚至信息量不比百度少，但**不是**百度那张卡的样子。
+
+要真的做出百度那种「右转 / 进入学院路」，只有两条路：
+1. 注入高德进程读 TBT 状态（方案 B，见 §3）——高德 `libamaptbt.so` 引擎里有转向码和路名，但要找到稳定的回调点；
+2. 解析高德展开通知里的 RemoteViews（高德导航通知没设自定义 RemoteViews，所以没有可解析的文本）。
+
+→ 建议：**第一版先按「arrow + 导航中 + 剩余里程/时间」出**，版式照抄百度（44dp 图标 + 20sp/14sp 居中文本），
+等真机日志确认高德 `content` 到底长什么样，再决定要不要为了两个字段去注入高德进程。
 
 ---
 

@@ -153,12 +153,14 @@ internal object ArkLiveShadowHook {
             val entry = XposedHelpers.getObjectField(row, "mEntry") ?: return false
             val sbn = XposedHelpers.callMethod(entry, "getSbn") ?: return false
             val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return false
-            if (!ArkConstants.isMessageLiveApp(pkg)) return false
-            // 优先用 tag 判定（跨进程最稳）：影子通知固定 tag = flymeark_live_msg。
+            if (!ArkConstants.isLiveShadowApp(pkg)) return false
+            // 优先用 tag 判定（跨进程最稳）：影子通知 tag 固定，
+            // 消息 = flymeark_live_msg，导航 = flymeark_live_nav（v3.15.51）。
             // 实测 SystemUI 进程里反射调 Notification.getExtras() 会抛
             // NoSuchMethodError（Flyme 改动），extras 判定完全不可用 —— v3.15.27 探针证实。
             val tag = XposedHelpers.callMethod(sbn, "getTag") as? String
             if (tag == ArkMessageLiveInjector.SHADOW_TAG) return true
+            if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) return true
             val n = XposedHelpers.callMethod(sbn, "getNotification") ?: return false
             val extras = XposedHelpers.callMethod(n, "getExtras") as? Bundle ?: return false
             extras.getBoolean(ArkMessageLiveInjector.KEY_SHADOW, false)
@@ -175,7 +177,7 @@ internal object ArkLiveShadowHook {
                 try {
                     val sbn = param.args.getOrNull(0) ?: return
                     val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return
-                    if (!ArkConstants.isMessageLiveApp(pkg)) return
+                    if (!ArkConstants.isLiveShadowApp(pkg)) return
                     // 用 tag 判定是不是影子自己（SystemUI 里 Notification.getExtras 会抛异常，
                     // v3.15.27 探针证实：整段 try 被吞 → 清除逻辑从来没执行过，胶囊永驻）
                     val tag = try {
@@ -184,6 +186,7 @@ internal object ArkLiveShadowHook {
                         null
                     }
                     if (tag == ArkMessageLiveInjector.SHADOW_TAG) return
+                    if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) return
                     clearShadowNotification(param.thisObject, pkg)
                 } catch (t: Throwable) {
                     XposedBridge.log(
@@ -216,9 +219,13 @@ internal object ArkLiveShadowHook {
      * SystemUI 的 `NotificationListener extends NotificationListenerService`，
      * 本身就有监听器权限，取消一条别人发的通知是这个类的本职能力，不需要拼 uid / 反射 binder。
      * key 也优先从 `getActiveNotifications()` 里直接取真实值，不自己拼。
+     *
+     * v3.15.51：影子分两种（消息 / 导航），tag 与 id 都不一样，按包名先定出是哪一种。
      */
     private fun clearShadowNotification(listener: Any, pkg: String) {
-        val key = activeShadowKey(listener, pkg) ?: buildShadowKey(listener, pkg)
+        val tag = shadowTagOf(pkg)
+        val id = shadowIdOf(pkg)
+        val key = activeShadowKey(listener, pkg, tag) ?: buildShadowKey(listener, pkg, tag, id)
         if (key == null) {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG shadow key unresolved for $pkg")
             return
@@ -235,14 +242,29 @@ internal object ArkLiveShadowHook {
         clearViaStatusBarService(listener, pkg, key)
     }
 
+    /** 某个包对应哪一种影子通知（消息 / 导航） */
+    private fun shadowTagOf(pkg: String): String =
+        if (ArkConstants.isNavLiveApp(pkg)) {
+            ArkNavLiveInjector.NAV_SHADOW_TAG
+        } else {
+            ArkMessageLiveInjector.SHADOW_TAG
+        }
+
+    private fun shadowIdOf(pkg: String): Int =
+        if (ArkConstants.isNavLiveApp(pkg)) {
+            ArkNavLiveInjector.NAV_SHADOW_ID
+        } else {
+            ArkMessageLiveInjector.SHADOW_ID
+        }
+
     /** 从 listener 当前持有的活动通知里找出影子的真实 key（最可靠，不依赖 key 格式） */
-    private fun activeShadowKey(listener: Any, pkg: String): String? = try {
+    private fun activeShadowKey(listener: Any, pkg: String, shadowTag: String): String? = try {
         val arr = XposedHelpers.callMethod(listener, "getActiveNotifications") as? Array<*>
         arr?.firstNotNullOfOrNull { item ->
             if (item == null) return@firstNotNullOfOrNull null
             val p = XposedHelpers.callMethod(item, "getPackageName") as? String
             val tag = XposedHelpers.callMethod(item, "getTag") as? String
-            if (p == pkg && tag == ArkMessageLiveInjector.SHADOW_TAG) {
+            if (p == pkg && tag == shadowTag) {
                 XposedHelpers.callMethod(item, "getKey") as? String
             } else {
                 null
@@ -256,11 +278,15 @@ internal object ArkLiveShadowHook {
     }
 
     /** 手工拼 key（兜底）：`0|pkg|id|tag|uid` */
-    private fun buildShadowKey(listener: Any, pkg: String): String? = try {
+    private fun buildShadowKey(
+        listener: Any,
+        pkg: String,
+        shadowTag: String,
+        shadowId: Int
+    ): String? = try {
         val ctx = listenerContext(listener) ?: return null
         val uid = ctx.packageManager.getApplicationInfo(pkg, 0).uid
-        "0|$pkg|${ArkMessageLiveInjector.SHADOW_ID}|" +
-            "${ArkMessageLiveInjector.SHADOW_TAG}|$uid"
+        "0|$pkg|$shadowId|$shadowTag|$uid"
     } catch (t: Throwable) {
         XposedBridge.log(
             "[${ArkConstants.LOG_TAG}] $TAG build key failed: ${Log.getStackTraceString(t)}"

@@ -2,6 +2,72 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-05 · v3.15.51 高德地图导航实况胶囊（影子通知通道）
+
+> 新增 `ArkNavLiveInjector`，把高德的**常驻导航通知**补成一条实况影子通知。
+> 依据见 `docs/live-nav-research.md`（高德 8 个 dex 里 `notification.live` 命中 0 次，
+> 它自己不发实况；也没有百度那个 `com.baidu.BaiduMap/...ExtGuideService`）。
+
+### 为什么复用影子通知，而不是 SystemUI 侧注入
+
+`ArkMessageLiveInjector`（微信/QQ）已跑通「原通知不动 + 旁边发一条实况影子」，
+高德只差识别条件和两个 capsule 字段，直接复用同一套通道，SystemUI 侧零新增架构。
+
+### 新增 `ArkNavLiveInjector.kt`（高德进程内）
+
+| 项 | 值 |
+|---|---|
+| 作用包 | `com.autonavi.minimap` |
+| hook 点 | `android.app.NotificationManager.notify(int,Notification)` + `notify(String,int,Notification)` |
+| 识别 | ① `extras["com.autonavi.minimap.navigating"] == true`（首选）② id ∈ {99910001, 99910002, 99910003} ③ `category == "navigation"` |
+| 影子标记 | `KEY_SHADOW` + tag `flymeark_live_nav` + id `0x4B000002` |
+| 顶层 live | `is_live=true`、`notification.live.type=10`、`notification.live.operation=0`、`notification.live.event="NAVIGATION"`、`notification.live.pinned=false` |
+| capsule | `capsuleStatus=1`、`capsuleType=1`、`capsuleContent="title · text"`（text 空则只放 title）、`capsuleIcon=Icon.createWithBitmap(largeIconBitmap)`、`capsuleBgColor=ArkTokens.BRAND_LIGHT`、`capsuleContentColor=readableTextOn(bg)` |
+| 素材 | title/text 取 `EXTRA_TITLE`/`EXTRA_TEXT`（退化 `EXTRA_SUB_TEXT`/`EXTRA_BIG_TEXT`）；图标取 `EXTRA_LARGE_ICON_BIG`(Bitmap) → `EXTRA_LARGE_ICON`(Icon) → `getLargeIcon()` |
+| 缺料策略 | title 空 / 图标 null / smallIcon null → **不发影子**，只打 `navInject: skip reason=...` |
+
+### 三处与消息卡的刻意差异
+
+1. `capsuleType` 用 **1**（百度导航就是 1），不是消息卡的 3；
+2. `capsuleIcon` 从 Bitmap 重建 —— 高德 `setLargeIcon(Bitmap)`，没有现成 Icon 可复用；
+3. **不设** `notification.live.app.pkg.delegated*`（那是「智能服务代发百度」才需要的委托标记，
+   我们是高德自己发），也**不设** `notification.live.status`（百度那版没有这个 key，
+   `grep notification.live.status` 在 framework / SystemUI 里零命中，按「不加协议里没有的 key」略过）。
+
+### 配套改动
+
+- `ArkConstants`：新增 `NAV_LIVE_PKG`、`isNavLiveApp()`、`isLiveShadowApp()`（消息+导航）、
+  `liveKindLabel()`（消息/导航/音乐三分类，供设置页副标题）。
+- `ArkLiveShadowHook`（SystemUI）：三处判定从 `isMessageLiveApp` 放宽到 `isLiveShadowApp`；
+  影子 tag 同时认 `flymeark_live_msg` / `flymeark_live_nav`；销毁同步按包名解析对应的
+  tag/id 再拼 key（`shadowTagOf` / `shadowIdOf`）。**微信/QQ 路径行为不变**。
+- `ArkEntry`：`ArkMessageLiveInjector.install()` 之后追加 `ArkNavLiveInjector.install()`。
+- `res/values/arrays.xml`：`xposed_scope` 加 `com.autonavi.minimap`。
+- `ArkLiveSettingsHook.TARGETS`：加 `com.autonavi.minimap → 高德地图`；
+  副标题改走 `liveKindLabel()`。
+
+### 日志（验收靠这个）
+
+```
+[FlymeArk] navInject: installing for com.autonavi.minimap
+[FlymeArk] navInject: hit pkg=com.autonavi.minimap id=99910001 nav=true category=navigation via=extras
+[FlymeArk] navInject: src title='导航中' text='剩余 3.2 公里 12 分钟' largeIcon=bmp reason=extras id=99910001
+[FlymeArk] navInject: shadow posted tag=flymeark_live_nav capsuleType=1 content='导航中 · 剩余 3.2 公里 12 分钟' bg=0xff2f6bff
+[FlymeArk] navInject: skip reason=no_large_icon
+```
+
+### 已知边界（本轮未上机验证，等用户实测）
+
+- 高德 `title`/`text` 的**真实取值**未确认（静态分析只能确认它会 set 这两个字段）；
+  若 `text` 里已含「剩余…」，胶囊文案会是「导航中 · 剩余 3.2 公里 12 分钟」这种复合串。
+- 转向箭头 Bitmap 是否真的落在 `android.largeIcon.big` 未验证；三种取法都留了兜底。
+- 需在 LSPosed 里**手动勾选** `com.autonavi.minimap` 作用域，否则注入器不加载。
+- 展开卡未做（设计稿未定），本版走系统默认展开样式。
+- 导航结束时靠 SystemUI 的 `onNotificationRemoved` 清影子；若清除失败，影子行是隐藏的，
+  不会在通知栏露出来，但胶囊可能残留到下次高德刷新通知。
+
+版本 `versionCode 74 / 3.15.51`。
+
 ## 2026-11-05 · v3.15.50 消息卡：删标题/正文分割线 + 时间加胶囊底
 
 > 只改消息大卡 `ArkMessagePanelActivity`（本模块自己的 Activity）。

@@ -85,6 +85,8 @@ class ArkEntry : IXposedHookLoadPackage {
         ArkLiveInjector.install(lpp)
         // 微信 / QQ：注入消息实况字段，把消息通知渲染成实况胶囊（v3.15.18）
         ArkMessageLiveInjector.install(lpp)
+        // 高德地图：把常驻导航通知补一条实况影子通知，渲染成导航胶囊（v3.15.51）
+        ArkNavLiveInjector.install(lpp)
     }
 
     /** 当前进程是否真的是 system_server（而不是被 RemoteViews inflate 误触发的 SystemUI） */

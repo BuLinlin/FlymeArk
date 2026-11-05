@@ -17,6 +17,8 @@
         <item>com.tencent.mm</item>
         <!-- 消息实况：QQ（把消息通知渲染成实况胶囊，v3.15.18） -->
         <item>com.tencent.mobileqq</item>
+        <!-- 导航实况：高德地图（把常驻导航通知补成实况胶囊，v3.15.51） -->
+        <item>com.autonavi.minimap</item>
         <!-- SystemUI：歌词胶囊放行 + 封面 + 点击展开 + 媒体键代派 -->
         <item>com.android.systemui</item>
         <!-- 设置：把 QQ音乐 / 网易云 / 微信 / QQ 登记进「实况通知」开关列表 -->

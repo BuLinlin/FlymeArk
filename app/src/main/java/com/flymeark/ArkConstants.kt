@@ -49,6 +49,35 @@ object ArkConstants {
     fun isMessageLiveApp(pkg: String?): Boolean = pkg != null && pkg in MESSAGE_LIVE_PKGS
 
     // ------------------------------------------------------------------
+    // 高德地图导航实况通知（v3.15.51）
+    //
+    // 高德**不发**实况通知（8 个 dex 里 `notification.live` 命中 0 次），它只发一条常驻
+    // 导航通知（extras["com.autonavi.minimap.navigating"]=true，id 99910001/2/3）。
+    // 由 [ArkNavLiveInjector] 在旁边补一条实况影子通知，架构与微信/QQ 完全相同。
+    // 详见 docs/live-nav-research.md。
+    // ------------------------------------------------------------------
+
+    const val NAV_LIVE_PKG = "com.autonavi.minimap"
+
+    /** 是否为导航实况 App 包名（高德地图） */
+    fun isNavLiveApp(pkg: String?): Boolean = pkg == NAV_LIVE_PKG
+
+    /**
+     * 是否为「走影子通知通道」的 App（消息 + 导航）。
+     *
+     * SystemUI 侧的 [ArkLiveShadowHook] 用它统一判断：只要这个包会产出影子通知，
+     * 就要参与「行隐藏」和「原通知消失时同步撤销」。
+     */
+    fun isLiveShadowApp(pkg: String?): Boolean = isMessageLiveApp(pkg) || isNavLiveApp(pkg)
+
+    /** 设置页「实况通知」列表里每条 App 的副标题，按业务类型分类 */
+    fun liveKindLabel(pkg: String?): String = when {
+        isMessageLiveApp(pkg) -> "消息实况通知"
+        isNavLiveApp(pkg) -> "导航实况通知"
+        else -> "音乐播放实况通知"
+    }
+
+    // ------------------------------------------------------------------
     // 胶囊品牌色（v3.15.19，用户指定标准）
     //
     // 不再从内容里算平均色 —— 头像取不到位图时算出来是近黑，胶囊直接变「黑底」。

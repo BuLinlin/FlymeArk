@@ -29,12 +29,14 @@ internal object ArkLiveSettingsHook {
 
     private const val TAG = "liveSettings"
 
-    /** v3.15：登记进设置页的媒体 App（包名 → 显示名）。v3.15.18 起加微信/QQ 消息实况 */
+    /** v3.15：登记进设置页的媒体 App（包名 → 显示名）。
+     *  v3.15.18 起加微信/QQ 消息实况，v3.15.51 起加高德地图导航实况 */
     private val TARGETS = linkedMapOf(
         "com.tencent.qqmusic" to "QQ音乐",
         "com.netease.cloudmusic" to "网易云音乐",
         "com.tencent.mm" to "微信",
-        "com.tencent.mobileqq" to "QQ"
+        "com.tencent.mobileqq" to "QQ",
+        "com.autonavi.minimap" to "高德地图"
     )
 
     private const val CLS_FRAGMENT =
@@ -112,8 +114,9 @@ internal object ArkLiveSettingsHook {
                 // 点击 setNotificationLiveAllowForPackage），避开美团/百度地图等厂商特判。
                 XposedHelpers.setObjectField(cfg, "delegatedPackageName", null)
                 XposedHelpers.setObjectField(cfg, "title", title)
+                // 副标题按业务类型分类：消息 / 导航 / 音乐
                 XposedHelpers.setObjectField(cfg, "description",
-                    if (ArkConstants.isMessageLiveApp(pkg)) "消息实况通知" else "音乐播放实况通知")
+                    ArkConstants.liveKindLabel(pkg))
                 XposedHelpers.setBooleanField(cfg, "isService", false)  // false → app_category
                 XposedHelpers.setIntField(cfg, "uid", uid)
                 XposedHelpers.setIntField(cfg, "delegatedUid", uid)
