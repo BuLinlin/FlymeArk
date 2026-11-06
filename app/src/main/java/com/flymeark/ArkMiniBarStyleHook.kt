@@ -1,6 +1,7 @@
 package com.flymeark
 
 import android.app.Notification
+import android.app.NotificationManager
 import android.content.Context
 import android.content.res.Configuration
 import android.content.res.Resources
@@ -27,6 +28,7 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Method
+import java.lang.ref.WeakReference
 import java.util.Collections
 
 /**
@@ -143,6 +145,9 @@ internal object ArkMiniBarStyleHook {
      */
     private val KEY_NAV_NOBG = "flymeark.mini.navnobg".hashCode()
 
+    /** v3.15.78：这条 header 已经挂了自驱轮询（一个 header 只挂一条） */
+    private val KEY_POLL = "flymeark.mini.poll".hashCode()
+
     /**
      * 上一次**成功解析**的导航载荷（v3.15.69）。
      *
@@ -166,13 +171,9 @@ internal object ArkMiniBarStyleHook {
     /** 导航子树 dump 剩余次数（v3.15.75：写入**之后**再 dump，对照写入有没有被系统覆盖） */
     private var navDumpAfterLeft = NAV_DUMP_AFTER
 
-    /** 自证日志剩余次数（v3.15.75：一次导航就能看到两条通知各自的 id / tag / displayed） */
-    private var navApplyLeft = NAV_APPLY_LOGS
-
-    /** dump / 自证日志的次数上限 */
+    /** dump 的次数上限（navApply 自证日志 v3.15.78 起改按「载荷变化 + 心跳」打，不再限次） */
     private const val NAV_DUMP_BEFORE = 2
     private const val NAV_DUMP_AFTER = 2
-    private const val NAV_APPLY_LOGS = 5
 
     /** 导航批量命中时 header 子树的遍历深度上限（dump 实测最深处只有 2 层，5 足够） */
     private const val NAV_WALK_DEPTH = 5
@@ -193,6 +194,19 @@ internal object ArkMiniBarStyleHook {
 
     /** 高德源通知 extras 已 dump 过（v3.15.77 一次性诊断，只打一次） */
     private var liveDumpDone = false
+
+    /** v3.15.78：自驱轮询间隔。播报间隔通常 >3s，1s 一跳足够且不会打爆 IPC */
+    private const val NAV_POLL_INTERVAL_MS = 1000L
+
+    /** v3.15.78：navApply 日志心跳间隔（载荷不变时每 60s 补一条，保证时间线不断） */
+    private const val NAV_APPLY_HEARTBEAT_MS = 60_000L
+
+    /** 设计稿迷你条高度（`handoff-minibar.html` 基准 64dp） */
+    private const val NAV_BAR_HEIGHT_DP = 64f
+
+    /** 上一条 navApply 日志的载荷指纹 / 时间（v3.15.78 去掉次数上限，改按变化打） */
+    private var lastApplySig = ""
+    private var lastApplyLoggedAt = 0L
 
     @Volatile
     private var idsReady = false
@@ -387,7 +401,19 @@ internal object ArkMiniBarStyleHook {
         row: View?,
     ) {
         val parent = header as? ViewGroup ?: return
-        val parsed = navPayloadOf(row)
+        // v3.15.78 数据源优先级：活动通知里的影子（最新，不等 UI 回调）→ 本行 extras → lastGoodNav。
+        // 真机实证：注入器侧 navTts 每几秒在重投，SystemUI 侧 4 分钟里只有一条 navApply ——
+        // 影子重投之后不再有 UI 回调，UI 只能自己去取，否则永久冻在第一帧。
+        val rowPayload = navPayloadOf(row)
+        val fresh = freshShadowPayload(header.context)
+        // 只有「影子存在 + 真的带 NAV_KEY_* + 不是占位帧」才算可用数据源
+        val freshUsable = if (fresh != null && fresh.present && !isPlaceholder(fresh)) fresh else null
+        val parsed = freshUsable ?: rowPayload
+        val src = when {
+            freshUsable != null -> "fresh"
+            rowPayload.present -> "row"
+            else -> "lastgood"
+        }
         // v3.15.72：把 header 整棵子树 dump 出来（前 2 次，写入前）。
         // 导航条此前是「哑」的，只能靠用户截图猜；这条一次性把「系统到底用哪个
         // TextView 画那行字 / 有没有第二个标题控件」固化下来。
@@ -395,7 +421,7 @@ internal object ArkMiniBarStyleHook {
             navDumpLeft--
             XposedBridge.log(
                 "[$TAG] navDump(${NAV_DUMP_BEFORE - navDumpLeft}/$NAV_DUMP_BEFORE): " +
-                    "fromShadow=${parsed.present} " +
+                    "src=$src rowShadow=${rowPayload.present} freshFound=${fresh != null} " +
                     "instr='${parsed.instr.take(24)}' remain=${parsed.remainMs} " +
                     "total=${parsed.totalMs} turn=${parsed.turn} yawed=${parsed.yawed}\n" +
                     dumpSubtree(header)
@@ -405,7 +431,11 @@ internal object ArkMiniBarStyleHook {
         // 清掉 lastGood 并把 overlay 藏起来 —— 避免结束后迷你条残留上一帧指令。
         // 注意保留 tag 里的 overlay 引用（只 GONE 不 removeView），下次导航直接复用，
         // 否则会往 header 里叠第二个 overlay。
-        if (parsed.present && parsed.instr.isBlank() && parsed.totalMs == 0L && parsed.remainMs < 0L) {
+        // v3.15.78：以**影子最新状态**（活动通知里那条）为准，它才是会话真相。
+        val collapse = if (fresh != null && fresh.present) fresh else rowPayload
+        if (collapse.present && collapse.instr.isBlank() &&
+            collapse.totalMs == 0L && collapse.remainMs < 0L
+        ) {
             lastGoodNav = null
             (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.GONE
             return
@@ -419,7 +449,8 @@ internal object ArkMiniBarStyleHook {
         // （没改造成功 → 没挂 preDraw → 永远没有第二次机会）。
         // 真正的身份判据：Flyme 把高德 `category=navigation` 那条原生渲染成实况导航条
         //（dumpsys 实证），而路况 / 限行等不是 navigation —— 用它挡住误伤。
-        val usable = parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L
+        val usable = !isPlaceholder(parsed) &&
+            (parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L)
         val notif: Notification? = try {
             XposedHelpers.callMethod(sbnOf(row), "getNotification") as? Notification
         } catch (_: Throwable) {
@@ -431,16 +462,16 @@ internal object ArkMiniBarStyleHook {
         // 是白色），说明 Flyme 实况窗自己渲染了结构化转向信息，而那些数据很可能
         // 就躺在源通知 extras 里（我们目前是 hook 语音播报 + 正则猜同一件事）。
         // 只读不写：这条日志决定下一版是「删掉语音解析链直接读通知」还是维持现状。
-        if (!parsed.present && isNavCategory && !liveDumpDone) {
+        if (!rowPayload.present && isNavCategory && !liveDumpDone) {
             liveDumpDone = true
             dumpNavSrcExtras(notif)
         }
         // 身份已知（category 读得到）按 category 判；读不到回退 displayed（旧行为兜底）
-        val isOurs = parsed.present ||
+        val isOurs = rowPayload.present ||
             (notif != null && isNavCategory) ||
             (notif == null && displayed)
         if (!isOurs) {
-            logNavApply(parsed, displayed, header, row, density)
+            logNavApply(parsed, displayed, header, row, density, src)
             return
         }
         // v3.15.77 改动一：身份确认后立即标记「导航行不要胶囊底」——
@@ -454,13 +485,17 @@ internal object ArkMiniBarStyleHook {
         // 这一帧没数据下一帧 preDraw 自己会补（writeNavTitle / hideNavChrome
         // 幂等 + 带比较，重复调用无副作用）。overlay 不存在时 preDraw 里判空跳过。
         armPredraw(header)
+        // v3.15.78 A：自驱轮询 —— 影子重投后不再有 UI 回调，迷你条必须自己去取最新载荷
+        armNavPoller(header)
         // 无数据不画空壳：parsed 读不到且没有历史好载荷 → 保持系统原样
         if (!usable && lastGoodNav == null) {
-            logNavApply(parsed, displayed, header, row, density)
+            logNavApply(parsed, displayed, header, row, density, src)
             return
         }
         (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.VISIBLE
-        val p = if (parsed.present && usable) {
+        // v3.15.78：只要本帧载荷可用（fresh / 本行都算）就更新 lastGoodNav；
+        // 占位帧（"高德地图 · 正在导航"）usable=false，永远不会污染它。
+        val p = if (usable) {
             lastGoodNav = parsed
             parsed
         } else {
@@ -494,11 +529,11 @@ internal object ArkMiniBarStyleHook {
         // 必须由 centerNavTitle 收口成「与进度轨左端对齐」的 60dp，否则首帧会跳一下。
         // 顺序与 preDraw 里保持一致（write → chrome → center）。
         centerNavTitle(header)
-        // v3.15.75（方案 A）：系统每次 RemoteViews re-apply 都会把标题刷回「高德地图」、
-        // 字号刷回 20sp、圆环刷回 VISIBLE。挂 preDraw 每帧兜底校正，谁也盖不掉。
-        armPredraw(header)
+        // v3.15.78 问题 1：压掉系统模板给的上下留白（设计稿迷你条高 64dp）。
+        // 转向块 / 进度轨都按 height/2 算，压高度后自动跟着居中，不用改 onDraw。
+        compressNavHeight(header, density)
 
-        logNavApply(parsed, displayed, header, row, density)
+        logNavApply(parsed, displayed, header, row, density, src)
         // v3.15.75：写入**之后**再 dump 一次（前 2 次），对照写入有没有被系统覆盖
         if (navDumpAfterLeft > 0) {
             navDumpAfterLeft--
@@ -530,6 +565,18 @@ internal object ArkMiniBarStyleHook {
         val n = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
             ?: return NavMiniPayload()
         val ex = n.extras ?: return NavMiniPayload()
+        payloadOfExtras(ex)
+    } catch (_: Throwable) {
+        NavMiniPayload()
+    }
+
+    /**
+     * 从影子通知的 extras 拼出 [NavMiniPayload]（v3.15.78 从 [navPayloadOf] 抽出来复用）。
+     *
+     * `present` 判据是「NAV_KEY_INSTR 这个键到底在不在」（v3.15.71 修正）：高德原生那条
+     * extras 里没有这套键，读出来是空串，但语义是「这不是我们的导航影子」。
+     */
+    private fun payloadOfExtras(ex: Bundle): NavMiniPayload = try {
         NavMiniPayload(
             instr = ex.getString(ArkConstants.NAV_KEY_INSTR).orEmpty(),
             turn = ex.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT),
@@ -538,15 +585,49 @@ internal object ArkMiniBarStyleHook {
             timeText = ex.getString(ArkConstants.NAV_KEY_TIME).orEmpty(),
             timeUnit = ex.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty(),
             yawed = ex.getBoolean(ArkConstants.NAV_KEY_YAWED, false),
-            // v3.15.71 修正：v3.15.70 这里无条件写 true，导致高德**原生**那条通知
-            // （extras 里没有 NAV_KEY_*）也被当成了我们的影子，于是在上面画出一个
-            // 空壳：默认直行箭头 + 空进度轨 + 没有时间值，标题还是系统的「高德地图」。
-            // 正确判据是「这个键到底在不在」，而不是「读出来是不是空串」。
             present = ex.containsKey(ArkConstants.NAV_KEY_INSTR),
         )
     } catch (_: Throwable) {
         NavMiniPayload()
     }
+
+    /**
+     * v3.15.78：直接从 SystemUI 的活动通知里读影子的**最新** extras。
+     *
+     * 为什么必须这样：真机日志证明注入器的 `navTts` 每几秒在重投影子，而 SystemUI 侧
+     * 4 分钟内只收到一条 `navApply` —— 影子重投不会触发任何 UI 回调，只等回调就等于
+     * 永久冻在第一帧。`getActiveNotifications()` 比 UI 回调新鲜得多。
+     *
+     * **降级策略**（拿不到就问下一层，绝不让迷你条变哑）：
+     * 1. 权限 / IPC 异常 / 返回空 → 返回 null，调用方自然回落到「本行 extras」→「lastGoodNav」；
+     * 2. 影子存在但 extras 没键（`present=false`）→ 同样算拿不到，回落；
+     * 3. 影子是占位帧（"高德地图 · 正在导航"）→ 调用方用 [isPlaceholder] 判掉，回落。
+     */
+    private fun freshShadowPayload(context: Context): NavMiniPayload? = try {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        nm?.activeNotifications
+            ?.firstOrNull { it.tag == ArkNavLiveInjector.NAV_SHADOW_TAG }
+            ?.notification
+            ?.extras
+            ?.let { payloadOfExtras(it) }
+            ?.takeIf { it.present }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * 占位帧判定（v3.15.78）。
+     *
+     * 导航刚启动、还没收到第一句播报时，注入器投的 content 是 `"$title · $text"`
+     * 也就是「高德地图 · 正在导航」。它不是指令，**不许**写进 [lastGoodNav]、
+     * 也不许覆盖标题 —— 否则一旦 UI 冻结就永久停在起始帧（用户实测的「最严重」问题）。
+     *
+     * 判据用**载荷自带的 `turn` 码**（注入器侧 `turnCodeOf` 的产物，跨进程一致），
+     * 而不是在 SystemUI 侧重跑一遍文本解析：没有转向语义 + 没有全程 + 没有锚点
+     * = 占位帧。真实直行指令（`沿当前道路继续行驶`）此时 `totalMs > 0`，不会被误判。
+     */
+    private fun isPlaceholder(p: NavMiniPayload): Boolean =
+        p.turn == ArkConstants.NAV_TURN_STRAIGHT && p.totalMs <= 0L && p.remainMs < 0L
 
     /**
      * 诊断用：把 header 子树里每个 View 的类名 / id 名 / 文案 / 字号 / 可见性 / 位置拼出来
@@ -763,6 +844,8 @@ internal object ArkMiniBarStyleHook {
                         writeNavTitle(header, o.instrText, o.densityPx)
                         hideNavChrome(header)
                         centerNavTitle(header)
+                        // v3.15.78：系统 rebind 会把高度也刷回去，每帧校正一次（幂等 + 带比较）
+                        compressNavHeight(header, o.densityPx)
                     }
                 } catch (_: Throwable) {
                     // 绘制前回调绝不允许抛异常，否则整条通知绘制链路会被打断
@@ -770,6 +853,83 @@ internal object ArkMiniBarStyleHook {
                 return true
             }
         })
+    }
+
+    /**
+     * 自驱轮询（v3.15.78 核心）：导航期间每秒自己去读一次影子的最新载荷。
+     *
+     * 为什么不能只等回调：真机日志里注入器每几秒就在重投影子（`navTts`），
+     * 但 SystemUI 侧 4 分钟只收到一条 `navApply` —— 影子重投不触发任何 UI 回调，
+     * 于是标题、剩余时间、ETA 全部冻在起始帧。
+     *
+     * 约束：
+     * - **一个 header 只挂一条**（[KEY_POLL] tag 去重）；
+     * - 用 [WeakReference] 持有 header，detach / 被回收就**不再续命**（退出条件写在 run 开头）；
+     * - 不引入任何系统时钟依赖（本文件保持零时钟，QA 会 grep 这个 token），靠 `postDelayed` 自带调度；
+     * - `getActiveNotifications()` 是 IPC，只在 1s 这个粒度上跑，**绝不放进 preDraw**；
+     * - 任何异常都不续命，交给下一次 `applyNavStructure` 重新挂（避免异常风暴）。
+     */
+    private fun armNavPoller(header: View) {
+        if (header.getTag(KEY_POLL) != null) return
+        header.setTag(KEY_POLL, true)
+        val ref = WeakReference(header)
+        val tick = object : Runnable {
+            override fun run() {
+                val h = ref.get()
+                // 退出条件：header 被回收 / 已 detach → 不再 postDelayed（防泄漏）
+                if (h == null || !h.isAttachedToWindow) return
+                try {
+                    val o = h.getTag(KEY_NAV) as? ArkMiniNavView
+                    // overlay 还没建出来 / 已经收起 → 本帧不写，但继续等（数据可能后到）
+                    val fresh = freshShadowPayload(h.context)
+                    if (fresh != null && !isPlaceholder(fresh)) {
+                        lastGoodNav = fresh
+                        if (o != null && o.visibility == View.VISIBLE) {
+                            if (o.changedFrom(fresh)) {
+                                o.setData(
+                                    fresh.instr, fresh.turn, fresh.remainMs, fresh.totalMs,
+                                    fresh.timeText, fresh.timeUnit,
+                                    isNight(h.context), fresh.yawed
+                                )
+                                writeNavTitle(h, fresh.instr, o.densityPx)
+                                centerNavTitle(h)
+                            }
+                        }
+                    }
+                    h.postDelayed(this, NAV_POLL_INTERVAL_MS)
+                } catch (_: Throwable) {
+                    // 异常即停，不再续命
+                }
+            }
+        }
+        header.postDelayed(tick, NAV_POLL_INTERVAL_MS)
+    }
+
+    /**
+     * 压掉系统模板给的上下留白（v3.15.78 问题 1）。
+     *
+     * 设计稿迷你条高 64dp，系统 `rl_header_live` 比它高得多，内容只占中间一条。
+     * 这里把 header 内边距清零、`minimumHeight` 归零、`layoutParams.height` 收到
+     * [NAV_BAR_HEIGHT_DP]。转向块 / 进度轨 / 时间值全部按 `height/2` 算，
+     * 压完自动跟着居中，**不用改 `ArkMiniNavView.onDraw`**。
+     *
+     * 幂等 + 带比较：系统 rebind 会恢复原高度，每帧（preDraw 之外这里也调）校正都安全。
+     * 选 64dp 而不是 72dp 的依据：13sp 文字（约 18dp 行高）居中占 ±9dp，
+     * 进度轨在 `cy + 13dp ± 1dp` 即 32±14dp 内 → 内容垂直跨度约 12dp~52dp，64dp 足够不裁。
+     */
+    private fun compressNavHeight(header: View, density: Float) {
+        if (header.minimumHeight != 0) header.minimumHeight = 0
+        if (header.paddingTop != 0 || header.paddingBottom != 0 ||
+            header.paddingLeft != 0 || header.paddingRight != 0
+        ) {
+            header.setPadding(0, 0, 0, 0)
+        }
+        val targetH = (NAV_BAR_HEIGHT_DP * density).toInt()
+        val lp = header.layoutParams ?: return
+        if (lp.height != targetH) {
+            lp.height = targetH
+            header.layoutParams = lp
+        }
     }
 
     /** row 子树里 `rl_header_live` 的实例数（contracted / expanded / headsUp 各一份） */
@@ -788,15 +948,18 @@ internal object ArkMiniBarStyleHook {
     }
 
     /**
-     * 自证日志（v3.15.75/76）：一条日志同时看到「这条 row 的 sbn id / tag、是不是影子、
+     * 自证日志（v3.15.75→78）：一条日志同时看到「这条 row 的 sbn id / tag、是不是影子、
      * notification category、header 是否显示、直接子 View 可见性清单、标题命中几个、
-     * 圆环命中几个、写入后的文案与字号」。
+     * 圆环命中几个、写入后的文案与字号、本帧数据源」。
      *
-     * `children=[...]` 是本版最关键的自证：配合 displayed / sbnId 能一次判定
+     * `children=[...]` 是最关键的自证：配合 displayed / sbnId 能一次判定
      * ① 屏幕上是哪条（tag=flymeark_live_nav 且 displayed 的就是影子条）；
      * ② 系统/我们有没有把 overlay 挂上（children 里应出现我们的 ArkMiniNavView，无 id 记作 `no-id`）；
      * ③ 蓝渐变块归属（若某个可见的非文字 View 存在，即 Flyme 外层/原生模板画的）。
-     * 只打前 [NAV_APPLY_LOGS] 次。
+     *
+     * v3.15.78：**取消 5 次上限**（那正是上一轮只能瞎猜的原因）。改成
+     * 「载荷指纹变了就打 + 每 [NAV_APPLY_HEARTBEAT_MS] 补一条心跳」——
+     * 一次导航下来日志里有完整时间线：影子何时更新、UI 何时跟上、何时掉队。
      */
     private fun logNavApply(
         parsed: NavMiniPayload,
@@ -804,9 +967,14 @@ internal object ArkMiniBarStyleHook {
         header: View,
         row: View?,
         density: Float,
+        src: String,
     ) {
-        if (navApplyLeft <= 0) return
-        navApplyLeft--
+        val sig = "$src|${parsed.present}|${parsed.instr}|${parsed.remainMs}|" +
+            "${parsed.totalMs}|${parsed.turn}|${parsed.yawed}|$displayed"
+        val now = System.currentTimeMillis()
+        if (sig == lastApplySig && now - lastApplyLoggedAt < NAV_APPLY_HEARTBEAT_MS) return
+        lastApplySig = sig
+        lastApplyLoggedAt = now
         val sbn = sbnOf(row)
         val id: Int? = try {
             XposedHelpers.callMethod(sbn, "getId") as? Int
@@ -842,10 +1010,12 @@ internal object ArkMiniBarStyleHook {
         val first = titles.firstOrNull()
         val sizeSp = first?.textSize?.let { if (density > 0f) it / density else 0f }
         XposedBridge.log(
-            "[$TAG] navApply: shadow=${parsed.present} displayed=$displayed " +
+            "[$TAG] navApply: src=$src shadow=${parsed.present} displayed=$displayed " +
                 "cat=${notif?.category} sbnId=$id tag=$tag hdrs=${countHeaders(header)} " +
                 "titles=${titles.size} circles=${navCircleViews(header).size} " +
-                "after='${first?.text}' size=$sizeSp children=[$children]"
+                "after='${first?.text}' size=$sizeSp " +
+                "remain=${parsed.remainMs} total=${parsed.totalMs} h=${header.height} " +
+                "children=[$children]"
         )
     }
 
@@ -902,6 +1072,20 @@ internal object ArkMiniBarStyleHook {
 
         /** 本 view 的 density（px = dp × 它），preDraw 兜底重写换算 13sp 用 */
         val densityPx: Float get() = density
+
+        /**
+         * 载荷是否和当前绘制状态不同（v3.15.78 自驱轮询用）。
+         * 只比「会改变画面」的字段；时间文案按 [setData] 同一套口径折算后比较。
+         */
+        fun changedFrom(p: NavMiniPayload): Boolean {
+            val fallback = if (p.timeText.isBlank()) "" else "${p.timeText} ${p.timeUnit}".trim()
+            return instrText != p.instr ||
+                turn != p.turn ||
+                remainMs != p.remainMs ||
+                totalMs != p.totalMs ||
+                yawed != p.yawed ||
+                timeFallback != fallback
+        }
 
         /**
          * 本趟**剩余**毫秒（v3.15.67 锚点式）。
