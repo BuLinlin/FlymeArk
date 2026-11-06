@@ -1284,7 +1284,13 @@ internal object ArkNavLiveInjector {
             // 一律作废。必须在 stashLastTrip 之后清 —— 否则刚刚搬进来的旧值又活过来了。
             if (dropFallback) clearTripFallback("mode changed on new session")
             resetNavPayload()
+            // v3.15.82：把「导航前在路线页 / 方式页看到的界面数字」搬进本趟会话。
+            // 位置必须在 [resetNavPayload] **之后**（否则刚搬进来就被清），并且
+            // 必须在 [navStartedAt] 赋值之后（搬进来的 [tripTotalMs] 要当分母，
+            // 分母配上错误的起点会让剩余一开始就是负的）。
+            // 骑行 / 步行那趟高德不播「全程X公里」，这条是三个数据格唯一的来源。
             navStartedAt = now
+            promoteUiPreTrip()
             // v3.15.81：兜底只在新会话开头 15 秒内可信（详见 [fallbackValid]）
             fallbackValidUntil = if (dropFallback) 0L else now + FALLBACK_TTL_MS
             // v3.15.81：本趟的「换过方式」闸门跟着新会话重置（dropFallback 就是本帧的判定结论）
@@ -2390,6 +2396,15 @@ internal object ArkNavLiveInjector {
             lastTextTickAt = 0L
             textTickSinceMs = 0L
         }
+        // v3.15.82：界面文案解析器的「每趟一次」取证标记跟着复位。
+        // ⚠ 刻意**不碰** [uiPreDistValue] / [uiPreTimeMs] / [uiPreAt] / [uiPreMode]：
+        // 那是「导航开始**之前**」在路线页看到的数字，正是这一趟要搬进来的素材
+        // （[promoteUiPreTrip] 紧跟在 [resetNavPayload] 之后被调用，搬完自己会清）。
+        uiCandDumped = false
+        textBufTotalsHit = false
+        lastUiTripSig = ""
+        lastUiRepostAt = 0L
+        synchronized(uiTripLock) { uiCandLog.clear() }
         // v3.15.65：目的地候选池是「本趟导航」的结论，跨趟保留会串味（上一趟的终点被当成这一趟的，
         // 错的目的地比没有更糟）→ 必须清。
         // ⚠ 但 [textBuf] **不许**跟着清：那是「最近看到的文案时间线」，要横跨这次复位才能覆盖
@@ -3142,8 +3157,13 @@ internal object ArkNavLiveInjector {
     /** 一条文案命中：什么时候看到的（elapsedRealtime）、文本是什么 */
     private data class TextHit(val atMs: Long, val text: String)
 
-    /** 环形缓冲容量：只要最近 30 条，够覆盖「搜索 → 选点 → 开始导航」这段输入过程 */
-    private const val TEXT_BUF_MAX = 30
+    /**
+     * 环形缓冲容量：只要最近 60 条，够覆盖「搜索 → 选点 → 开始导航」这段输入过程。
+     *
+     * v3.15.82 从 30 提到 60：骑行 / 步行那趟在出发页会连着刷十几条路口级文案
+     * （`直行 69米` `直行 25米` …），30 条容量会把「搜索阶段捞到的目的地」整批挤出去。
+     */
+    private const val TEXT_BUF_MAX = 60
 
     /** 倒出时整行上限（超了截断，防一条日志把 logcat 刷爆） */
     private const val TEXT_BUF_LINE_MAX = 900
@@ -3278,6 +3298,525 @@ internal object ArkNavLiveInjector {
         return commonPrefix ?: pool.last()
     }
 
+    // ------------------------------------------------------------ v3.15.82：界面文案解析器
+    //
+    // 病根：切骑行 / 步行后 [clearTripFallback] 把上一趟的兜底清掉了 —— 那是 v3.15.81 的正解，
+    // 但高德在骑行 / 步行模式下**从不播**「全程X公里，大约需要Y分钟」：真机 16:38 那趟骑行
+    // 整段只有 `直行 69米` 这类路口级播报，[parseTotals] 无米下锅，三个数据格就一直是 `--`。
+    //
+    // 打法：给已有的 `NAV TEXT BUF` 文本流加一个解析器，从**高德界面自己的文案**里抠这三个数
+    // （导航页顶栏那三格就是 `剩余 X 分钟` / `Y 公里` / `HH:mm 到达`）。
+    //
+    // ## 为什么必须挂在 [sanitizeDest] 之前
+    //
+    // [DEST_NOISE] 里明确写着 `公里` / `千米` / `分钟` / `小时` / `剩余` / `全程` / `预计`
+    // —— 那张表是给「像不像地名」筛的。而我们要抓的串**全都**含这些词，
+    // 挂在三刀之后等于永远看不到：真机 40 分钟日志里 `NAV TEXT BUF` 出现过 0 次
+    // `公里 / 分钟 / 小时`，只有 4 次 `到达`（`到达  杭州东站` 这种路口名），原因就在这里。
+    // 所以解析器插在 [rememberText] 的**最前面**，走自己的预筛，不碰原有三刀。
+    //
+    // ## 四条不许破坏的既有语义
+    //
+    // ① [parseTotals] 与 `DIST_RE` / `TIME_RE` / `ETA_RE` / `TRAIL_MIN_RE` **一行不改**
+    //    （红线）：播报仍是第一优先级，界面文案只是「播报没有时」的第二来源 ——
+    //    [parseUiTrip] 只在**自己**解析成功时写字段，绝不会把播报刚写进去的值清掉。
+    // ② [totalTimeValue]（展示口径）与 [tripTotalMs]（进度条分母口径）继续分家
+    //    （v3.15.65 的教训）：界面上那句「剩余 35 分钟」在已经有分母时只能动锚点，
+    //    绝不能当新分母，否则进度球倒着跑。写入条件见 [parseUiTrip] 里的 ①②③。
+    // ③ 导航结束（[STATE_ENDING]）之后**不许写**：否则告别语之后的高德界面文案
+    //    会把胶囊复活成一条假的「还剩 35 分钟」。
+    // ④ [textBuf] 的语义不变（「像地名的短文本时间线」）：这份解析器**不往缓冲里塞东西**，
+    //    只在旁边记一份独立的取证环 [uiCandLog]，免得污染目的地抽取。
+
+    /** 界面文案整串上限：超过这个长度不可能是三格数字里的一个 */
+    private const val UI_TEXT_MAX = 24
+
+    /** `9.3 公里` / `800米` / `1.2km` / `剩余9.3公里` / `全程 12 公里`（整串锚定，绝不匹配句中的片段） */
+    private val UI_DIST_RE = Regex(
+        "^\\s*(剩余|全程|总里程|共|约)?\\s*($AR_NUM_CLASS)\\s*(公里|千米|km|KM|Km|米)\\s*$"
+    )
+
+    /** `35 分钟` / `2 小时 23 分` / `2小时23分钟` / `剩余 35分钟`（整串锚定） */
+    private val UI_TIME_RE = Regex(
+        "^\\s*(剩余|还需|大约|约|全程|预计)?\\s*($AR_NUM_CLASS)\\s*(小时|分钟|分)" +
+            "(?:\\s*($AR_NUM_CLASS)\\s*(分钟|分))?\\s*$"
+    )
+
+    /** `14:32 到达` / `预计 14:32 到达` / `预计下午两点十分到达`（整串锚定，`到达  杭州东站` 不匹配） */
+    private val UI_ETA_RE = Regex("^\\s*(?:预计)?\\s*(.{1,20}?)\\s*到达\\s*$")
+
+    /**
+     * 裸 `NN米` 的距离下限（无「剩余 / 全程」前缀时）。
+     *
+     * 为什么要有这条闸：高德的路口级文案就是 `69米` / `25米` 这种裸数字 + `米`，
+     * 一旦被当成「总里程」，用户骑 10 公里会看到「总里程 69 米」。而真正的行程总量
+     * 在界面上几乎总是以「公里」为单位显示（≥1km 才折成公里），所以
+     * **无前缀的米制距离一律要求 ≥ [UI_METER_MIN_AS_TOTAL] 才认**。
+     */
+    private const val UI_METER_MIN_AS_TOTAL = 1000.0
+
+    /** [uiCandLog] 容量（取证环，与 [textBuf] 无关） */
+    private const val UI_CAND_MAX = 12
+
+    /** 取证环攒到几条就倒一次日志（一次性，由 [uiCandDumped] 保证） */
+    private const val UI_CAND_DUMP_AT = 6
+
+    /** 因界面文案而重投影子的最小间隔：`setText` 一秒可能来几十条，不能被它拖着刷通知 */
+    private const val UI_REPOST_MIN_MS = 1_000L
+
+    /** 导航前看到的界面数字的有效期：超过它就是「上一趟 / 上一次浏览」的残留，不能搬进新会话 */
+    private const val UI_PRE_TTL_MS = 180_000L
+
+    /** [uiCandLog] / [uiPreMode] 的锁（`setText` 回调线程与主线程各写一半会读到脏值） */
+    private val uiTripLock = Any()
+
+    /** 预筛放行的条数（统计用；并发下允许丢数，只用于日志读数） */
+    private var uiScanText = 0L
+
+    /** 过了「有数字 + 有单位记号」这道预筛的条数（统计用） */
+    private var uiScanCand = 0L
+
+    /** 解析器真正改写过载荷的次数（统计用） */
+    private var uiTripHits = 0L
+
+    /** 「含单位词但没解析成三格」的原始文案（诊断用，最多 [UI_CAND_MAX] 条，去重） */
+    private val uiCandLog = ArrayDeque<String>()
+
+    /** [uiCandLog] 是否已经倒过（每趟导航一次，重置点在 [resetNavPayload]） */
+    private var uiCandDumped = false
+
+    /** `NAV TEXT TOTALS HIT` 是否已经倒过（每趟一次；见 [dumpTextBuf]） */
+    private var textBufTotalsHit = false
+
+    /** 上一次 `uiTrip:` 日志的载荷指纹（只在变化时打） */
+    private var lastUiTripSig = ""
+
+    /** 上一次因界面文案重投影子的时刻（节流用） */
+    private var lastUiRepostAt = 0L
+
+    // ---- 导航**之前**看到的最后一组界面数字（路线页 / 方式页） ----
+    //
+    // 真机实证：`NAV TEXT BUF` 里 `驾车，已选中` / `步行，已选中` / `骑行，已选中` 必然出现，
+    // 而路线页那一排「9.3 公里 / 35 分钟」也走 `setText`（只是被 [DEST_NOISE] 滤掉了）。
+    // 导航页本身是 GL 画布、几乎没有 TextView，等进了导航再抓大概率抓不到 ——
+    // 所以**在浏览阶段就记住**，等 [beginSession] 复位之后搬进来。
+    //
+    // 只有「方式对得上」才搬（[uiPreMode] 来自 `X，已选中`，与 [travelMode] 同源比较）：
+    // 用户在驾车页看到 37 分钟、切到步行页没刷新数字就点开始，这条闸就是防止
+    // v3.15.81 那个 bug（37 分钟串到步行趟里）在这条新路径上重演。
+
+    /** 导航前最后一次解析到的界面数字属于哪种交通方式（`drive` / `walk` / `bike` …；空 = 未知） */
+    private var uiPreMode = ""
+
+    /**
+     * `uiPreDist*` / `uiPreTime*` 这组数字**被写下来的那一刻**界面选中的方式。
+     *
+     * 为什么不直接用 [uiPreMode] 比较：用户在驾车页看到「37 分钟」，随后点了「步行」页签
+     * ——[uiPreMode] 立刻变成 `walk`，但如果步行页那几格没有重新 `setText`，
+     * 数字还是驾车的 37 分钟。拿 `uiPreMode` 去比就会把 37 分钟放进步行趟里，
+     * 正是 v3.15.81 那个 bug 在新路径上重演。所以方式必须**跟着数字一起快照**。
+     */
+    private var uiPreNumMode = ""
+
+    /** 导航前看到的里程 / 耗时（`uiPreAt = 0` 表示没有） */
+    private var uiPreDistValue = ""
+    private var uiPreDistUnit = "公里"
+    private var uiPreTimeValue = ""
+    private var uiPreTimeUnit = "分钟"
+    private var uiPreTimeMs = 0L
+
+    /** 上面这组值的时刻（`elapsedRealtime`），配合 [UI_PRE_TTL_MS] 判过期 */
+    private var uiPreAt = 0L
+
+    /**
+     * 三格数字的**预筛**：一次字符扫描同时判断「有没有数字」和「有没有单位 / 时刻记号」。
+     *
+     * 两样都有才可能是三格里的一格（`9.3 公里` / `2 小时 23 分` / `14:32 到达`），否则直接返回。
+     * 这道闸的存在意义：[rememberText] 是高德主线程每秒几百次的高频路径，
+     * 绝大多数 `setText` 是按钮文案，不能进正则。
+     *
+     * 刻意**零分配**（不 `toString()`），与原有三刀同风格。
+     */
+    private fun uiTripPrefilter(s: CharSequence): Boolean {
+        val n = s.length
+        if (n < 2 || n > UI_TEXT_MAX) return false
+        var digits = 0
+        var mark = 0
+        for (i in 0 until n) {
+            when (s[i]) {
+                in '0'..'9' -> digits++
+                '公', '千', '米', '分', '小', '时', '到', '达' -> mark++
+                'k', 'K', 'm', 'M' -> mark++
+                '.', ':', '：' -> mark++
+                else -> {
+                }
+            }
+        }
+        return digits > 0 && mark > 0
+    }
+
+    /**
+     * 记录界面上的「出行方式选中态」（v3.15.82）。
+     *
+     * 真机日志里这四条是确定出现的：`驾车，已选中` / `步行，已选中` / `骑行，已选中` /
+     * `电动车，已选中`。它比播报更早、更准地说明「用户在路线页选的是哪种方式」，
+     * 用来给 [uiPreMode] 打标 —— 只有方式对得上，才允许把路线页的数字搬进导航会话。
+     */
+    private fun noteUiModeWord(s: CharSequence) {
+        try {
+            val n = s.length
+            if (n < 3 || n > 12) return          // `步行，已选中` 是 6 字，留足余量
+            var hasSelChar = false
+            for (i in 0 until n) {
+                if (s[i] == '选') {
+                    hasSelChar = true
+                    break
+                }
+            }
+            if (!hasSelChar) return
+            val text = s.toString()
+            if (!text.contains("选中")) return
+            val mode = detectTravelMode(text) ?: return
+            synchronized(uiTripLock) { uiPreMode = mode }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 从一条界面文案里解析三格数字（v3.15.82）。
+     *
+     * ## 三条时间写入条件（这条最容易搞错，写清楚）
+     *
+     * 界面上的「35 分钟」到底是**全程**还是**剩余**，光看文案分不出来 —— 只能看
+     * 「本趟定过分母没有」：
+     *  1. **[tripTotalMs] <= 0**（本趟还没有分母，播报也从没给过）：这个时长只能是全程
+     *     → 写 [tripTotalMs] + [totalMs]，进度从此有分母；
+     *  2. **[tripTotalMs] > 0**（分母已定）：这个时长是**剩余**
+     *     → **只**动锚点（[anchorRemainMs] / [anchorAt] / [remainMs]），绝不改分母；
+     *  3. **两种分支都写 [totalTimeValue] / [totalTimeUnit]**：它只是「没有锚点时」的
+     *     展示兜底（[remainTimePair] 在 `remainMs >= 0` 时压根不看它），所以写了没有副作用，
+     *     而 remainMs 一旦因为别的原因回到哨兵，它就是最后一根救命稻草。
+     *
+     * 这正是「一个时长同时当 total 和 remain」的精确边界：**分母只写一次，展示值每次都写**。
+     *
+     * @param s 界面文案（来自 `TextView.setText` / `View.setContentDescription`）
+     */
+    private fun parseUiTrip(s: CharSequence) {
+        try {
+            val raw = s.toString().trim()
+            if (raw.isEmpty() || raw.length > UI_TEXT_MAX) return
+            uiScanCand++
+            val now = SystemClock.elapsedRealtime()
+
+            // ---- 距离 ----
+            var distHit = false
+            var distValue = ""
+            var distUnit = ""
+            UI_DIST_RE.find(raw)?.let { m ->
+                val v = uiNum(m.groupValues[2])
+                if (v != null && v > 0.0) {
+                    var unit = m.groupValues[3]
+                    if (unit == "千米" || unit.equals("km", ignoreCase = true)) unit = "公里"
+                    // 裸 `NN米` 多半是路口距离（`69米`），当总里程会把用户吓一跳 ——
+                    // 无前缀时要求 ≥ [UI_METER_MIN_AS_TOTAL]。带「剩余 / 全程」前缀则放行。
+                    val prefixed = m.groupValues[1].isNotEmpty()
+                    val plausibleAsTotal = unit != "米" || prefixed || v >= UI_METER_MIN_AS_TOTAL
+                    if (plausibleAsTotal) {
+                        distHit = true
+                        distValue = ArkNavParse.fmtNum(v)
+                        distUnit = unit
+                    }
+                }
+            }
+
+            // ---- 耗时 ----
+            var timeHit = false
+            var timeMs = 0L
+            var timeValue = ""
+            var timeUnit = ""
+            UI_TIME_RE.find(raw)?.let { m ->
+                val v = uiNum(m.groupValues[2])
+                if (v != null && v > 0.0) {
+                    if (m.groupValues[3] == "小时") {
+                        // `2 小时 23 分`：尾巴上那个「23 分」必须吃进毫秒，否则 2h23m 被当成 2h
+                        val extra = uiNum(m.groupValues[4]) ?: 0.0
+                        timeMs = ((v * 60.0 + extra) * 60_000.0).toLong()
+                        timeValue = ArkNavParse.fmtNum(v)
+                        timeUnit = "小时"
+                    } else {
+                        timeMs = (v * 60_000.0).toLong()
+                        timeValue = ArkNavParse.fmtNum(v)
+                        timeUnit = "分钟"
+                    }
+                    if (timeMs > 0L) timeHit = true
+                }
+            }
+
+            // ---- 实时到达 ----
+            var etaHit = false
+            var etaValue = ""
+            UI_ETA_RE.find(raw)?.let { m ->
+                ArkNavParse.parseClock(m.groupValues[1])?.let {
+                    etaHit = true
+                    etaValue = it
+                }
+            }
+
+            // 一个都没解析出来 → 记进取证环（这些串被 [DEST_NOISE] 挡在 [textBuf] 外面，
+            // 这是唯一能看到它们原貌的地方），然后返回。
+            if (!distHit && !timeHit && !etaHit) {
+                val looksNumeric = raw.contains("公里") || raw.contains("米") ||
+                    raw.contains("小时") || raw.contains("分钟") || raw.contains("到达")
+                if (looksNumeric) {
+                    var candSize = 0
+                    synchronized(uiTripLock) {
+                        if (uiCandLog.size < UI_CAND_MAX && !uiCandLog.contains(raw)) {
+                            uiCandLog.addLast(raw)
+                        }
+                        candSize = uiCandLog.size
+                    }
+                    if (candSize >= UI_CAND_DUMP_AT) dumpUiCand()
+                }
+                return
+            }
+
+            // 导航已经结束 → 一个字节都不许写（否则会把胶囊复活成一条假载荷）
+            if (navState == STATE_ENDING) return
+
+            var changed = false
+
+            if (distHit && (distValue != totalDistValue || distUnit != totalDistUnit)) {
+                totalDistValue = distValue
+                totalDistUnit = distUnit
+                changed = true
+            }
+
+            if (timeHit) {
+                // ① 展示口径：两种分支都写（见本函数 KDoc 的第 3 条）
+                if (timeValue != totalTimeValue || timeUnit != totalTimeUnit) {
+                    totalTimeValue = timeValue
+                    totalTimeUnit = timeUnit
+                    changed = true
+                }
+                // ② 分母口径：**只有本趟还没定过分母时**才写，且只写一次
+                if (tripTotalMs <= 0L) {
+                    tripTotalMs = timeMs
+                    totalMs = timeMs
+                    changed = true
+                }
+                // ③ 剩余口径：两种分支都把锚点挪到「此刻」，[refreshAnchor] 从这里往下减
+                anchorRemainMs = timeMs
+                anchorAt = now
+                remainMs = timeMs
+            }
+
+            if (etaHit && etaValue != etaText) {
+                etaText = etaValue
+                // 界面上的到达时刻就是高德自己的判断，兜底的「此刻 + 剩余」不许盖掉它
+                etaExplicit = true
+                changed = true
+            }
+
+            // 导航前（IDLE / 浏览路线页）看到的数字先存着，等 [beginSession] 复位后按方式搬进来。
+            // 只在有值时覆盖：浏览页刷新时常常只刷其中一格。
+            if (navState != STATE_ACTIVE) {
+                if (distHit || timeHit) {
+                    synchronized(uiTripLock) {
+                        if (distHit) {
+                            uiPreDistValue = distValue
+                            uiPreDistUnit = distUnit
+                        }
+                        if (timeHit) {
+                            uiPreTimeValue = timeValue
+                            uiPreTimeUnit = timeUnit
+                            uiPreTimeMs = timeMs
+                        }
+                        // 方式**跟着数字一起**快照（见 [uiPreNumMode] 的注释）
+                        uiPreNumMode = uiPreMode
+                        uiPreAt = now
+                    }
+                }
+            }
+
+            if (!changed) return
+            uiTripHits++
+            logUiTrip(raw)
+            republishFromUiTrip(now)
+        } catch (_: Throwable) {
+            // 宿主进程的高频路径：解析器自己绝不能抛
+        }
+    }
+
+    /** 阿拉伯数字串 → Double（界面文案里只可能是阿拉伯数字；空串 / 解析失败返回 null） */
+    private fun uiNum(s: String): Double? {
+        if (s.isBlank()) return null
+        return try {
+            val v = ArkNavParse.parseCnNumber(s)
+            if (v == null || v.isNaN() || v.isInfinite()) null else v
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 只在**载荷真的变了**时打一行 `uiTrip:`（`setText` 频率太高，不能每帧打）。
+     *
+     * 一行看全三格：`dist` / `time` / `tripTotal`（分母）/ `remain` / `eta`，
+     * 外加来源文案 —— 有它才能判断「这些数字是从哪条界面文案里抠出来的」。
+     */
+    private fun logUiTrip(raw: String) {
+        try {
+            val sig = listOf(
+                totalDistValue, totalDistUnit, totalTimeValue, totalTimeUnit,
+                tripTotalMs.toString(), remainMs.toString(), etaText
+            ).joinToString("\u0001")
+            if (sig == lastUiTripSig) return
+            lastUiTripSig = sig
+            val dist = if (totalDistValue.isEmpty()) "--" else "$totalDistValue$totalDistUnit"
+            val time = if (totalTimeValue.isEmpty()) "--" else "$totalTimeValue$totalTimeUnit"
+            log(
+                "uiTrip: from='$raw' dist=$dist time=$time " +
+                    "tripTotal=${tripTotalMs}ms remain=${remainMs}ms " +
+                    "eta=${etaText.ifEmpty { "--" }} " +
+                    "hit=$uiTripHits setText=$uiScanText cand=$uiScanCand"
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 界面文案改写了载荷之后，把影子重投一次（带 [UI_REPOST_MIN_MS] 节流）。
+     *
+     * 为什么必须重投：面板只认通知 payload，字段改了不重投，用户看到的还是 `--`。
+     * 为什么敢直接复用 [lastNaviText]：它就是这个胶囊当前的正文，`updateShadowContent`
+     * 内部按载荷指纹去重 —— 数值没变时它自己就 return 了，所以这里**只做节流，不做判重**。
+     *
+     * 三道不投：
+     *  1. 不在导航中（`navActive == false`）→ 投出去就是自愈复活，绝对不行；
+     *  2. 还没拿到过导航正文（[lastNaviText] 为空）→ 没有素材；
+     *  3. 距上一次不到 [UI_REPOST_MIN_MS]。
+     */
+    private fun republishFromUiTrip(now: Long) {
+        try {
+            if (!navActive) return
+            if (navState != STATE_ACTIVE) return
+            val content = lastNaviText
+            if (content.isEmpty()) return
+            if (lastUiRepostAt != 0L && now - lastUiRepostAt < UI_REPOST_MIN_MS) return
+            lastUiRepostAt = now
+            updateShadowContent(content)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 一次性倒出「含单位词但没解析成三格」的原始文案（v3.15.82 诊断）。
+     *
+     * 这是**唯一**能看到高德界面这些文案原貌的窗口：它们全被 [DEST_NOISE] 挡在
+     * [textBuf] 之外，`NAV TEXT BUF` 里永远看不到。有了这一行就能判断到底是
+     * 「正则没覆盖」还是「高德压根没把数字写成 TextView」（两种情况的下一步动作完全不同）。
+     */
+    private fun dumpUiCand() {
+        if (uiCandDumped) return
+        val snap: List<String> = try {
+            synchronized(uiTripLock) { uiCandLog.toList() }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        if (snap.isEmpty()) return
+        uiCandDumped = true
+        log("NAV UI CAND: n=${snap.size} | " + snap.joinToString(" | "))
+    }
+
+    /**
+     * 把「导航前看到的界面数字」搬进本趟会话（v3.15.82，由 [beginSession] 在复位之后调用）。
+     *
+     * 三道闸，缺一不可：
+     *  1. **有值且没过期**（[uiPreAt] + [UI_PRE_TTL_MS]）—— 上一趟 / 上一次浏览的残留不许搬；
+     *  2. **方式对得上**：[uiPreNumMode]（数字写下那一刻的方式）为空时放行，非空就必须等于
+     *     [travelMode]。用户在驾车页看到 37 分钟、点「步行」页签但那一格没重绘就点开始
+     *     —— 这条闸挡的正是 v3.15.81 那个 bug 在新路径上重演；
+     *  3. **本趟还没有值**：只填 `--`，绝不覆盖播报已经给的值。
+     *
+     * 刻意**不搬 ETA**：导航前的到达时刻是「当时算的」，搬进来会让 [etaExplicit] 变 true，
+     * 之后兜底再也不许更新 —— 宁可让兜底按 `此刻 + 剩余` 每帧重算。
+     */
+    private fun promoteUiPreTrip() {
+        try {
+            // 先在锁里拍一张快照再判断：这组字段是 `setText` 回调线程写的、
+            // 本函数在通知回调线程读的，裸读会拿到「数字换了、方式还没换」的半截状态。
+            var preAt = 0L
+            var preMode = ""
+            var dValue = ""
+            var dUnit = ""
+            var tValue = ""
+            var tUnit = ""
+            var tMs = 0L
+            synchronized(uiTripLock) {
+                preAt = uiPreAt
+                preMode = uiPreNumMode
+                dValue = uiPreDistValue
+                dUnit = uiPreDistUnit
+                tValue = uiPreTimeValue
+                tUnit = uiPreTimeUnit
+                tMs = uiPreTimeMs
+            }
+            if (preAt <= 0L) return
+            if (SystemClock.elapsedRealtime() - preAt > UI_PRE_TTL_MS) {
+                clearUiPreTrip()
+                return
+            }
+            // 方式是**数字写下那一刻**的快照（[uiPreNumMode]）而不是「此刻界面选中的」：
+            // 用户点了「步行」页签但那一格没重绘时，数字还是驾车的 37 分钟 —— 拿
+            // [uiPreMode] 比会把 37 分钟放进步行趟里（v3.15.81 那个 bug 的翻版）。
+            if (preMode.isNotEmpty() && travelMode.isNotEmpty() && preMode != travelMode) {
+                log("uiPre skipped (numbers from mode $preMode != $travelMode)")
+                clearUiPreTrip()          // 别的交通方式的量级，留着只会被下一次误用
+                return
+            }
+            var promoted = false
+            if (totalDistValue.isEmpty() && dValue.isNotEmpty()) {
+                totalDistValue = dValue
+                totalDistUnit = dUnit
+                promoted = true
+            }
+            if (totalTimeValue.isEmpty() && tValue.isNotEmpty()) {
+                totalTimeValue = tValue
+                totalTimeUnit = tUnit
+                promoted = true
+            }
+            if (tripTotalMs <= 0L && tMs > 0L) {
+                tripTotalMs = tMs
+                totalMs = tMs
+                promoted = true
+            }
+            log(
+                "uiPre promote: promoted=$promoted mode='${preMode.ifEmpty { "?" }}' " +
+                    "age=${(SystemClock.elapsedRealtime() - preAt) / 1000}s"
+            )
+            if (promoted) {
+                logUiTrip("pre-trip ui (mode=${preMode.ifEmpty { "?" }})")
+            }
+            // 一次会话只消费一次：搬过之后立刻清，避免「上一趟浏览的数字」串到再下一趟
+            clearUiPreTrip()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 清掉「导航前的界面数字」（新会话已消费 / 过期 / 换交通方式时都要清） */
+    private fun clearUiPreTrip() {
+        synchronized(uiTripLock) {
+            uiPreDistValue = ""
+            uiPreDistUnit = "公里"
+            uiPreTimeValue = ""
+            uiPreTimeUnit = "分钟"
+            uiPreTimeMs = 0L
+            uiPreAt = 0L
+            uiPreMode = ""
+            uiPreNumMode = ""
+        }
+    }
+
     /**
      * 记住一条「像地名」的文本。
      *
@@ -3295,6 +3834,15 @@ internal object ArkNavLiveInjector {
     private fun rememberText(s: CharSequence?) {
         try {
             if (s == null) return
+            // ---- v3.15.82：三格数字解析器必须跑在三刀**之前** ----
+            //
+            // `9.3 公里` / `2 小时 23 分` 都会在第三刀被 [sanitizeDest] 判成噪声
+            // （[DEST_NOISE] 里就写着 `公里` / `千米` / `分钟` / `小时`），
+            // 挂在三刀之后等于永远看不到 —— 这就是 v3.15.81 之前三格一直 `--` 的直接原因。
+            // 两道预筛都不做 `toString()`，对高频路径的开销可以忽略。
+            uiScanText++
+            if (uiTripPrefilter(s)) parseUiTrip(s)
+            noteUiModeWord(s)
             val n = s.length
             if (n < 2 || n > 16) return                  // 第一刀：最便宜，砍掉绝大多数
             var hasCjk = false
@@ -3385,11 +3933,40 @@ internal object ArkNavLiveInjector {
             } catch (_: Throwable) {
                 emptyList()
             }
+            val now = SystemClock.elapsedRealtime()
+            // v3.15.82：一次性把「像三格数字」的缓冲条目单独打一行（需求方点名要的取证）。
+            //
+            // 现状是这条**几乎恒为 `n=0`**：[DEST_NOISE] 里就有 `公里` / `分钟` / `小时`，
+            // 含这些词的串根本进不了 [textBuf]（见本文件 §界面文案解析器）。留着它，
+            // 是为了让「网里到底有没有数字」在日志里有**确定答案**而不是靠推理 ——
+            // `n=0` 本身就是一个结论：三格数字不在 TextView 通道里。
+            if (!textBufTotalsHit) {
+                textBufTotalsHit = true
+                val hits = snapshot.filter { h ->
+                    h.text.contains("公里") || h.text.contains("小时") ||
+                        h.text.contains("分钟") || h.text.contains("到达")
+                }
+                if (hits.isEmpty()) {
+                    log("NAV TEXT TOTALS HIT: n=0")
+                } else {
+                    log(
+                        "NAV TEXT TOTALS HIT: n=${hits.size} | " +
+                            hits.joinToString(" | ") {
+                                "[${relSecText(it.atMs, now)}s] ${it.text}"
+                            }
+                    )
+                }
+            }
+            // 界面原文取证环：含单位词但没解析成三格的那些串（唯一能看到它们原貌的窗口）
+            dumpUiCand()
+            // v3.15.82：解析器的「网还活着吗」读数。`setText=0` = 网压根没挂上；
+            // `cand=0` 而 `setText` 很大 = 高德的界面文案里根本没有「数字 + 单位」这种串
+            // （= 导航页是 GL 画布，这条路走到头了）；`hit>0` 才是真的抓到了。
+            log("NAV UI SCAN: setText=$uiScanText cand=$uiScanCand hit=$uiTripHits")
             if (snapshot.isEmpty()) {
                 log("NAV TEXT BUF: n=0")
                 return
             }
-            val now = SystemClock.elapsedRealtime()
             val sb = StringBuilder()
             for (h in snapshot) {
                 if (sb.isNotEmpty()) sb.append(" | ")
