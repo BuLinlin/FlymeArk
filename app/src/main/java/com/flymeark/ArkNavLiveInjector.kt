@@ -10,6 +10,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.drawable.Icon
 import android.os.Bundle
+import android.os.IBinder
 import android.os.SystemClock
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -1091,6 +1092,18 @@ internal object ArkNavLiveInjector {
     /** 子 Bundle 内部 key 之间的分隔符（`k={子k1=v1, 子k2=v2}`） */
     private const val EXTRAS_SEP_NESTED = ", "
 
+    /** 单个数组最多展开的元素数（多出的只报数量，`…(+N)`） */
+    private const val EXTRAS_ARRAY_MAX_ELEMS = 24
+
+    /**
+     * 嵌套层的拼装长度闸。
+     *
+     * 顶层用 [EXTRAS_FLAT_MAX_LEN] + 200（留出被上层截断前的余量），嵌套子 Bundle 用这个值。
+     * 目的是**边拼边停**，而不是先把一个巨大的串拼出来再 `take`（超大数组 / 超多 key 时
+     * 那一步本身就有开销，而这里跑在高德进程）。
+     */
+    private const val EXTRAS_NESTED_MAX_LEN = 800
+
     /**
      * 递归展开一个 Bundle 的全部 key/值，拼成一行可 grep 的字符串。
      *
@@ -1112,14 +1125,27 @@ internal object ArkNavLiveInjector {
      */
     @Suppress("DEPRECATION") // Bundle.get(String) 是全量 dump 唯一能用的泛型取法
     private fun flattenExtras(extras: Bundle, depth: Int, maxDepth: Int): String =
-        flattenExtras(extras, depth, maxDepth, EXTRAS_SEP_TOP)
+        flattenExtras(extras, depth, maxDepth, EXTRAS_SEP_TOP, EXTRAS_FLAT_MAX_LEN + 200)
 
-    /** [flattenExtras] 的实现体：`sep` 用于区分顶层 `" ; "` 与嵌套 `", "` */
+    /**
+     * [flattenExtras] 的实现体。
+     *
+     * @param sep    顶层 `" ; "` / 嵌套 `", "`（两种分隔符便于人读）
+     * @param maxLen 拼装长度闸：`sb.length` 超过它就 break，不再继续遍历 key
+     */
     @Suppress("DEPRECATION")
-    private fun flattenExtras(extras: Bundle, depth: Int, maxDepth: Int, sep: String): String {
+    private fun flattenExtras(
+        extras: Bundle,
+        depth: Int,
+        maxDepth: Int,
+        sep: String,
+        maxLen: Int,
+    ): String {
         val sb = StringBuilder()
         try {
             for (k in extras.keySet()) {
+                // 长度闸：先判再拼，超大 Bundle 不会先把整串拼出来
+                if (sb.length > maxLen) break
                 if (sb.isNotEmpty()) sb.append(sep)
                 sb.append(k).append('=')
                 val v = try {
@@ -1142,6 +1168,9 @@ internal object ArkNavLiveInjector {
      *  - `Number` / `Boolean` → `toString()`；
      *  - 其余 → `javaClass.simpleName`（Bitmap / PendingIntent / Icon 之类看类型就够）。
      *
+     * 数组只展开前 [EXTRAS_ARRAY_MAX_ELEMS] = 24 个元素，其余用 `…(+N)` 报数量 ——
+     * 高德有些 extras 是几百项的数组，全展开没有信息增量、只会把日志顶爆。
+     *
      * 数组内部同样推进一层深度 —— `Object[]` 里塞 Bundle（甚至自引用）也不会无限递归。
      */
     private fun flattenValue(v: Any?, depth: Int, maxDepth: Int): String = try {
@@ -1150,13 +1179,18 @@ internal object ArkNavLiveInjector {
             v is Bundle -> if (depth >= maxDepth) {
                 "Bundle{depth-limit}"
             } else {
-                "{" + flattenExtras(v, depth + 1, maxDepth, EXTRAS_SEP_NESTED) + "}"
+                "{" + flattenExtras(v, depth + 1, maxDepth, EXTRAS_SEP_NESTED, EXTRAS_NESTED_MAX_LEN) + "}"
             }
             v is Array<*> -> if (depth >= maxDepth) {
                 "Array{${v.size}}"
             } else {
-                v.joinToString("|") {
+                val shown = v.take(EXTRAS_ARRAY_MAX_ELEMS).joinToString("|") {
                     flattenValue(it, depth + 1, maxDepth).take(EXTRAS_VALUE_MAX_LEN)
+                }
+                if (v.size > EXTRAS_ARRAY_MAX_ELEMS) {
+                    "$shown…(+${v.size - EXTRAS_ARRAY_MAX_ELEMS})"
+                } else {
+                    shown
                 }
             }
             v is CharSequence -> v.toString().take(EXTRAS_VALUE_MAX_LEN)
@@ -1271,14 +1305,20 @@ internal object ArkNavLiveInjector {
             sanitizeDest(src.tickerText?.toString().orEmpty())?.let { return it }
         } catch (_: Throwable) {
         }
-        // ③ 常见的「补充文案」字段
+        // ③ 常见的「补充文案」字段（取值语义与 v3.15.62 完全一致，只是每次都兜住异常：
+        //    这几个 key 若带自定义 Parcelable，get 会抛 BadParcelableException，一抛就会把
+        //    整帧 postShadow 打断 —— 本帧胶囊不发，用户看到的是「胶囊卡住不动」）
         for (k in listOf(
             Notification.EXTRA_SUB_TEXT,
             Notification.EXTRA_INFO_TEXT,
             Notification.EXTRA_SUMMARY_TEXT,
             Notification.EXTRA_TEXT_LINES,
         )) {
-            val v = extras.get(k)
+            val v = try {
+                extras.get(k)
+            } catch (_: Throwable) {
+                null
+            }
             val s = when (v) {
                 is CharSequence -> v.toString()
                 is Array<*> -> v.firstOrNull()?.toString()
@@ -1682,18 +1722,57 @@ internal object ArkNavLiveInjector {
     //  2. 必须有**总 dump 次数上限**（[SVC_INTENT_MAX_DUMP]），高德后台 Service 启动很频繁；
     //  3. 过滤（cap / action / extras / 去重）全部排在 [flattenExtras] **之前**，
     //     不能对每个 SDK Service 启动都做字符串拼接。
+    //
+    // v3.15.63 修订（QA R1/R2，这两条会直接让本轮取证白跑）：
+    //
+    //  R1 **双额度**：老版「action/extras 都为空才丢」，但高德进程里大量 Service 是
+    //     「有 action、无 extras」（push / 统计 / SDK 各一路），每来一个就吃掉 1/8 主额度并打一行
+    //     `extras: <none>` —— 8 条额度很可能在导航 Service 起来**之前**就被 `<none>` 占满。
+    //     现在 8 次主额度**只给带 extras 的 Intent**；无 extras 的另给一条**弱额度**
+    //     （[SVC_INTENT_NOEXTRA_BUDGET] = 2），且只放 action 像导航的（[NAV_SVC_ACTION_RE]），
+    //     用完静默不打 `cap reached`。「这个 Service 起过、但参数不在 Intent 里」本身是有价值的结论，
+    //     所以留 2 条弱线索，但绝不挤占主额度。
+    //     两套额度各用**独立的去重集**（[svcIntentSeen] / [svcIntentWeakSeen]）：弱额度的一行
+    //     `<none>` 不能把「同一个 svc:action 后来带着 extras 再来一次」这条有价值的日志去重掉。
+    //
+    //  R2 **服务名映射**：`ServiceArgsData` / `BindServiceData` 按 AOSP 只有 `token` / `intent` /
+    //     `flags` / `startId`，**不含 Service 实例**，所以 `svc=` 恒为 `?`，去重键退化成 `?:action`，
+    //     日志也丢掉服务名这个最关键的定位信息。现在 hook `handleCreateService`（before），把
+    //     `token(IBinder) → 服务全类名` 记进 [svcNameCache]（容量 [SVC_NAME_CACHE_MAX]，LRU 式淘汰），
+    //     Service 派发时用 `data` 里的 token 反查。
 
-    /** 已 dump 过的 `serviceClassName:action` 组合（去重） */
+    /** 已 dump 过的 `serviceClassName:action` 组合（主额度去重） */
     private val svcIntentSeen = HashSet<String>(8)
 
-    /** 已 dump 次数 */
+    /** 已 dump 过的 `serviceClassName:action` 组合（弱额度去重，与主额度隔离） */
+    private val svcIntentWeakSeen = HashSet<String>(4)
+
+    /** 已 dump 次数（主额度：带 extras 的 Intent） */
     private var svcIntentDumps = 0
 
-    /** Service Intent dump 总次数上限 */
+    /** Service Intent dump 主额度上限（只给带 extras 的 Intent） */
     private const val SVC_INTENT_MAX_DUMP = 8
 
-    /** 「cap reached」提示是否已打过（只打一次） */
+    /** 已 dump 次数（弱额度：无 extras 但 action 像导航） */
+    private var svcIntentNoExtraDumps = 0
+
+    /** 弱额度上限 */
+    private const val SVC_INTENT_NOEXTRA_BUDGET = 2
+
+    /** action 像导航 Service 的关键词（弱额度只放这些；不区分大小写） */
+    private val NAV_SVC_ACTION_RE = Regex("(?i)(nav|navi|route|guide|tbt|drive|simulat)")
+
+    /** 「cap reached」提示是否已打过（只打一次，只针对主额度） */
     private var svcIntentCapLogged = false
+
+    /** 额度 / 去重集的统一锁（Service 派发可能跨线程，计数器用同一把锁才自洽） */
+    private val svcIntentLock = Any()
+
+    /** `Service` token（IBinder）→ 服务全类名。由 [hookServiceCreates] 填充，容量有界 */
+    private val svcNameCache = LinkedHashMap<IBinder, String>(32)
+
+    /** 映射表容量上限（超出淘汰最早插入的一条） */
+    private const val SVC_NAME_CACHE_MAX = 32
 
     /**
      * 注册 Service 启动 Intent 的取证探针。
@@ -1734,11 +1813,140 @@ internal object ArkNavLiveInjector {
     }
 
     /**
+     * 注册 `handleCreateService` 的 **before** hook：只记录 `token → 服务名`，不改宿主行为。
+     *
+     * **before hook 里绝不调 `param.setResult`** —— 那会直接跳过原方法，Service 就起不来了。
+     * 这里只读字段、写本地映射表，宿主完全无感。
+     */
+    private fun hookServiceCreates() {
+        try {
+            val atCls = Class.forName("android.app.ActivityThread")
+            XposedBridge.hookAllMethods(
+                atCls, "handleCreateService",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        rememberServiceName(param)
+                    }
+                }
+            )
+            probeRaw("svc intent: hooked ActivityThread.handleCreateService (token→name)")
+        } catch (t: Throwable) {
+            probeRaw("svc intent: hook handleCreateService failed (${t.javaClass.simpleName})")
+        }
+    }
+
+    /**
+     * 把一次 Service 创建的 `token → 全类名` 记进 [svcNameCache]。
+     *
+     * `CreateServiceData` 的结构（AOSP）：`token: IBinder` / `info: LoadedApk$ServiceData` /
+     * `compatInfo`。服务名在 `info.name`（String，全类名）。字段名不硬编码查找逻辑：
+     * token 用「第一个 `instanceof IBinder` 的字段」，名字则从 `info` 里读 `name`。
+     */
+    private fun rememberServiceName(param: XC_MethodHook.MethodHookParam) {
+        try {
+            val args = param.args
+            if (args == null || args.size != 1) return
+            val data = args[0] ?: return
+            val token = firstFieldOfType(data, IBinder::class.java) as? IBinder ?: return
+            val name = serviceClassNameOf(data) ?: return
+            synchronized(svcNameCache) {
+                if (!svcNameCache.containsKey(token) && svcNameCache.size >= SVC_NAME_CACHE_MAX) {
+                    // 淘汰最早插入的一条（LinkedHashMap 的迭代顺序 = 插入顺序）
+                    svcNameCache.keys.firstOrNull()?.let { svcNameCache.remove(it) }
+                }
+                svcNameCache[token] = name
+            }
+        } catch (_: Throwable) {
+            // 宿主进程：映射表读不出来就当没有，绝不外抛
+        }
+    }
+
+    /**
+     * 从 `CreateServiceData` 里取服务全类名：先找 `Service` 实例字段，再从 `info` 里读 `name`。
+     *
+     * @return 全类名（含 `.`）；取不到返回 null
+     */
+    private fun serviceClassNameOf(data: Any): String? {
+        try {
+            firstFieldOfType(data, Service::class.java)?.let { svc ->
+                svc.javaClass.name?.let { if (it.isNotBlank()) return it }
+            }
+        } catch (_: Throwable) {
+        }
+        try {
+            var c: Class<*>? = data.javaClass
+            var guard = 0
+            while (c != null && guard++ < 8) {
+                for (f in c.declaredFields) {
+                    try {
+                        if (Modifier.isStatic(f.modifiers)) continue
+                        f.isAccessible = true
+                        val v = f.get(data) ?: continue
+                        // `info`（LoadedApk$ServiceData）里的 name 字段就是服务全类名
+                        readNameField(v)?.let { if (it.contains('.')) return it }
+                    } catch (_: Throwable) {
+                    }
+                }
+                c = c.superclass
+            }
+        } catch (_: Throwable) {
+        }
+        return null
+    }
+
+    /** 读一个对象上 `name: String` 字段的值（`LoadedApk$ServiceData.name` 是 AOSP 固定字段） */
+    private fun readNameField(obj: Any): String? {
+        try {
+            var c: Class<*>? = obj.javaClass
+            var guard = 0
+            while (c != null && guard++ < 8) {
+                for (f in c.declaredFields) {
+                    try {
+                        if (Modifier.isStatic(f.modifiers)) continue
+                        if (f.type != String::class.java || f.name != "name") continue
+                        f.isAccessible = true
+                        val v = f.get(obj) as? String
+                        if (v != null && v.isNotBlank()) return v
+                    } catch (_: Throwable) {
+                    }
+                }
+                c = c.superclass
+            }
+        } catch (_: Throwable) {
+        }
+        return null
+    }
+
+    /**
+     * 服务名解析（v3.15.63 / R2）：① `Service` 实例字段 → ② `token` 查 [svcNameCache] → ③ `"?"`。
+     */
+    private fun serviceNameOf(data: Any): String {
+        try {
+            firstFieldOfType(data, Service::class.java)?.let { svc ->
+                svc.javaClass.name?.let { if (it.isNotBlank()) return it }
+            }
+        } catch (_: Throwable) {
+        }
+        try {
+            val token = firstFieldOfType(data, IBinder::class.java) as? IBinder
+            if (token != null) {
+                synchronized(svcNameCache) {
+                    svcNameCache[token]?.let { return it }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return "?"
+    }
+
+    /**
      * 从一次 Service 派发里取出启动 Intent，dump 其 extras。
      *
-     * 字段名不硬编码（各 ROM 的 `ServiceArgsData` / `BindServiceData` 字段名不同）：
-     * 用 [firstFieldOfType] 找**第一个 `instanceof Intent` 的字段**；Service 名同理找
-     * 第一个 `instanceof Service` 的字段，取不到写 `?`。
+     * 额度分流（v3.15.63 / R1）：
+     *  - `extras != null` → 主额度（[SVC_INTENT_MAX_DUMP] = 8），日志行末 `| extras: <内容>`；
+     *  - `extras == null` → 只有 action 命中 [NAV_SVC_ACTION_RE] 才走弱额度
+     *    （[SVC_INTENT_NOEXTRA_BUDGET] = 2），行末 `| extras: <none> (noextra n/2)`；
+     *    其余（有 action 无 extras 的 push / 统计 / SDK Service）**直接丢，不消耗任何额度、不打日志**。
      *
      * 全部失败路径都静默 —— 宿主是高德，探针绝不能让它崩。
      */
@@ -1748,8 +1956,8 @@ internal object ArkNavLiveInjector {
             if (args == null || args.size != 1) return
             val data = args[0] ?: return
 
-            // 闸门①：总次数上限。**放在最前面** —— 达到上限后连反射都不做
-            if (!svcIntentHasBudget()) return
+            // 闸门⓪：两套额度都空了就立刻返回（连反射都不做）
+            if (!svcIntentAnyBudgetLeft()) return
 
             val intent = firstFieldOfType(data, Intent::class.java) as? Intent ?: return
             val action = try {
@@ -1762,26 +1970,32 @@ internal object ArkNavLiveInjector {
             } catch (_: Throwable) {
                 null
             }
-            // 闸门②：既无 action 又无 extras 的 Service 启动与本问题无关，直接丢
-            if (action == null && extras == null) return
 
-            val svcName = try {
-                firstFieldOfType(data, Service::class.java)?.javaClass?.name ?: "?"
-            } catch (_: Throwable) {
-                "?"
+            // 闸门②：无 extras 且 action 不像导航 → 直接丢（不消耗任何额度、不打日志、不解析服务名）
+            if (extras == null && (action == null || !NAV_SVC_ACTION_RE.containsMatchIn(action))) return
+
+            // 服务名只解析一次（反射 + 查表），日志与去重键共用
+            val svcName = serviceNameOf(data)
+
+            // 闸门③：无 extras 的导航类只走弱额度
+            if (extras == null) {
+                if (!svcIntentClaimWeak("$svcName:$action")) return
+                val seq = synchronized(svcIntentLock) { svcIntentNoExtraDumps }
+                log(
+                    "NAV SVC INTENT DUMP: svc=${svcName.substringAfterLast('.')} " +
+                        "action=$action | extras: <none> (noextra $seq/$SVC_INTENT_NOEXTRA_BUDGET)"
+                )
+                return
             }
-            // 闸门③：同一 `服务名:action` 只 dump 一次
+
+            // 闸门④：主额度 + 同一 `服务名:action` 只 dump 一次
             if (!svcIntentClaim("$svcName:$action")) return
 
-            val flat = if (extras == null) {
-                "<none>"
-            } else {
-                flattenExtras(extras, 0, EXTRAS_MAX_DEPTH).let {
-                    if (it.length > SVC_INTENT_EXTRAS_MAX_LEN) {
-                        it.take(SVC_INTENT_EXTRAS_MAX_LEN) + "…"
-                    } else {
-                        it
-                    }
+            val flat = flattenExtras(extras, 0, EXTRAS_MAX_DEPTH).let {
+                if (it.length > SVC_INTENT_EXTRAS_MAX_LEN) {
+                    it.take(SVC_INTENT_EXTRAS_MAX_LEN) + "…"
+                } else {
+                    it
                 }
             }
             log(
@@ -1793,8 +2007,13 @@ internal object ArkNavLiveInjector {
         }
     }
 
-    /** 还有 dump 额度吗；额度用尽时打一次 `cap reached` 提示后返回 false */
-    private fun svcIntentHasBudget(): Boolean = synchronized(svcIntentSeen) {
+    /** 两套额度是否都还有剩（都没有就完全跳过后续反射） */
+    private fun svcIntentAnyBudgetLeft(): Boolean = synchronized(svcIntentLock) {
+        svcIntentDumps < SVC_INTENT_MAX_DUMP || svcIntentNoExtraDumps < SVC_INTENT_NOEXTRA_BUDGET
+    }
+
+    /** 主额度还有吗；用尽时打一次 `cap reached` 提示后返回 false */
+    private fun svcIntentHasBudget(): Boolean = synchronized(svcIntentLock) {
         if (svcIntentDumps < SVC_INTENT_MAX_DUMP) return@synchronized true
         if (!svcIntentCapLogged) {
             svcIntentCapLogged = true
@@ -1803,11 +2022,26 @@ internal object ArkNavLiveInjector {
         false
     }
 
-    /** 认领一个 `serviceClassName:action` 组合；已认领过或额度用尽返回 false */
-    private fun svcIntentClaim(key: String): Boolean = synchronized(svcIntentSeen) {
-        if (svcIntentDumps >= SVC_INTENT_MAX_DUMP) return@synchronized false
-        if (!svcIntentSeen.add(key)) return@synchronized false
-        svcIntentDumps++
+    /** 认领一个 `serviceClassName:action` 组合（主额度）；已认领过或主额度用尽返回 false */
+    private fun svcIntentClaim(key: String): Boolean {
+        if (!svcIntentHasBudget()) return false
+        return synchronized(svcIntentLock) {
+            if (svcIntentDumps >= SVC_INTENT_MAX_DUMP) return@synchronized false
+            if (!svcIntentSeen.add(key)) return@synchronized false
+            svcIntentDumps++
+            true
+        }
+    }
+
+    /**
+     * 认领一个 `serviceClassName:action` 组合（弱额度）：已认领过或弱额度用尽返回 false。
+     *
+     * 弱额度用尽**静默**（不打 `cap reached`）—— 那是给主额度用的提示，弱线索没拿到不值得刷一行日志。
+     */
+    private fun svcIntentClaimWeak(key: String): Boolean = synchronized(svcIntentLock) {
+        if (svcIntentNoExtraDumps >= SVC_INTENT_NOEXTRA_BUDGET) return@synchronized false
+        if (!svcIntentWeakSeen.add(key)) return@synchronized false
+        svcIntentNoExtraDumps++
         true
     }
 
@@ -1923,6 +2157,9 @@ internal object ArkNavLiveInjector {
         // POI 名）。与 startForeground hook 装在同一处：两者都指向「高德怎么起导航」这条链路。
         // 内部已全程 try/catch，失败不影响上面的功能 hook。
         hookServiceIntents()
+        // 同批：`handleCreateService` 只记录 token→服务名（before hook，绝不 setResult），
+        // 让 dump 日志里的 `svc=` 不再恒为 `?`。
+        hookServiceCreates()
 
         // 不在 App 侧 hook cancel：高德 cancel 的通知不一定是导航那条，一律清影子会让胶囊
         // 在高德刷新通知的间隙里闪没。销毁同步统一放 SystemUI 的 onNotificationRemoved。
@@ -1962,9 +2199,18 @@ internal object ArkNavLiveInjector {
         }
     }
 
-    /** 一次性状态日志（安装结果 / 找不到 / hook 失败） */
+    /**
+     * 一次性状态日志（安装结果 / 找不到 / hook 失败）。
+     *
+     * 自己再包一层 try/catch：它经常被**当作 catch 分支里的日志**调用，若 `XposedBridge.log`
+     * 本身出了状况，异常会从 catch 里继续往上抛，把 `install()` 整个打断 ——
+     * 结果就是「一条探针日志把导航功能带走」。
+     */
     private fun probeRaw(msg: String) {
-        XposedBridge.log("[${ArkConstants.LOG_TAG}] probe $msg")
+        try {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] probe $msg")
+        } catch (_: Throwable) {
+        }
     }
 
     /**

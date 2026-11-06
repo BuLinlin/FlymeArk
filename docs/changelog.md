@@ -33,12 +33,29 @@ v3.15.62 埋的 `NAV EXTRAS DUMP` 有三个盲区，本版逐个补齐。
 新增 `hookServiceIntents()`，在 `android.app.ActivityThread` 上挂 `handleServiceArgs` /
 `handleBindService` 两个 after hook（隐藏类用 `Class.forName` 取，不 import）。从
 `ServiceArgsData` / `BindServiceData` 里**反射找第一个 `instanceof Intent` 的字段**（不硬编码
-字段名，各 ROM 不一致），按 `服务名:action` 去重，**总 dump 上限 8 次**，达到上限后打一次
-`NAV SVC INTENT DUMP: cap reached (8)` 就不再打。日志格式：
+字段名，各 ROM 不一致），按 `服务名:action` 去重。日志格式：
 
 ```
 NAV SVC INTENT DUMP: svc=<simpleName> action=<action> | extras: <flatten 深度2，截 800>
 ```
+
+首轮自测后按 QA 复查修订了三处（否则这轮取证会白跑）：
+
+- **双额度**：老口径是「action 和 extras 都为空才丢」，但高德进程里大量 Service 是
+  「有 action、无 extras」（push / 统计 / SDK 各一路），每来一个就吃掉 1/8 额度并打一行
+  `extras: <none>` —— 8 条很可能在导航 Service 起来**之前**就被占满。现在 **8 条主额度只给
+  带 extras 的 Intent**；无 extras 的另给 **2 条弱额度**，且只放 action 像导航的
+  （`nav/navi/route/guide/tbt/drive/simulat`），用完静默。两套额度用**独立的去重集**，
+  弱线索那一行 `<none>` 不会把「同一个 `svc:action` 之后带着 extras 再来一次」去重掉。
+  弱行标记：`| extras: <none> (noextra 1/2)`。
+- **服务名映射**：`ServiceArgsData` / `BindServiceData` 按 AOSP 只有 `token` / `intent` /
+  `flags` / `startId`，**不含 Service 实例**，所以 `svc=` 原本恒为 `?`（去重键也退化成
+  `?:action`）。新增 `hookServiceCreates()`：`handleCreateService` 的 **before** hook 里只读
+  字段、记 `token(IBinder) → 服务全类名`（服务名取 `info.name`，退化为 `Service` 实例类名），
+  存进容量 32 的 `LinkedHashMap`（超了淘汰最早一条），Service 派发时用 token 反查。
+  **before hook 里绝不调 `param.setResult`** —— 那会跳过原方法，Service 就起不来了。
+- **日志体积**：数组只展开前 24 个元素（多出的 `…(+N)`），嵌套层拼装带长度闸（边拼边停，
+  不再先拼巨大串再截）。
 
 全程 `try/catch` 包死，任何一行失败都静默 —— 宿主是高德，探针抛异常会被用户当成「高德崩了」。
 
@@ -54,6 +71,15 @@ NAV DEST HIT: ...           ← 命中了哪条 key（有就说明已经抓到�
 
 三条都没有地名，才需要走 `docs/live-nav-research.md` 的下一层路径。
 部署方式不变：`am force-stop com.android.systemui`，不要整机重启。
+
+### 5. 顺手补的两处异常收口
+
+- `guessDest()` 三级兜底里的 `EXTRA_SUB_TEXT / INFO_TEXT / SUMMARY_TEXT / TEXT_LINES`
+  取值补 `try/catch`：这几个 key 若带自定义 Parcelable，`get` 会抛
+  `BadParcelableException`，一抛就把整帧 `postShadow` 打断 —— 用户看到的是「胶囊卡住不动」。
+  取值语义与三级顺序**一字未改**。
+- `probeRaw()` 自己再包一层 `try/catch`：它常被当作 catch 分支里的日志调用，
+  若 `XposedBridge.log` 出状况会从 catch 里继续上抛、把 `install()` 整个打断。
 
 版本 `versionCode 86 / 3.15.63`。
 
