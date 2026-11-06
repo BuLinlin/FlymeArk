@@ -19,6 +19,7 @@ import android.os.Bundle
 import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.widget.RelativeLayout
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
@@ -132,6 +133,8 @@ internal object ArkMiniBarStyleHook {
     private val KEY_SHIFTED = "flymeark.mini.shifted".hashCode()
     private val KEY_CENTERED = "flymeark.mini.centered".hashCode()
     private val KEY_NAV = "flymeark.mini.nav".hashCode()
+    /** preDraw 兜底监听已挂（v3.15.75），一个 header 只挂一次 */
+    private val KEY_PREDRAW = "flymeark.mini.predraw".hashCode()
 
     /**
      * 上一次**成功解析**的导航载荷（v3.15.69）。
@@ -150,8 +153,22 @@ internal object ArkMiniBarStyleHook {
     /** 「这不是我们的导航影子」只提示一次，避免高德其它实况刷新时刷屏 */
     private var navGhostLogged = false
 
-    /** 导航子树 dump 剩余次数（启动后前 3 次，用于定位系统标题控件） */
-    private var navDumpLeft = 3
+    /** 导航子树 dump 剩余次数（写入前，用于定位系统标题控件） */
+    private var navDumpLeft = NAV_DUMP_BEFORE
+
+    /** 导航子树 dump 剩余次数（v3.15.75：写入**之后**再 dump，对照写入有没有被系统覆盖） */
+    private var navDumpAfterLeft = NAV_DUMP_AFTER
+
+    /** 自证日志剩余次数（v3.15.75：一次导航就能看到两条通知各自的 id / tag / displayed） */
+    private var navApplyLeft = NAV_APPLY_LOGS
+
+    /** dump / 自证日志的次数上限 */
+    private const val NAV_DUMP_BEFORE = 2
+    private const val NAV_DUMP_AFTER = 2
+    private const val NAV_APPLY_LOGS = 5
+
+    /** 导航批量命中时 header 子树的遍历深度上限（dump 实测最深处只有 2 层，5 足够） */
+    private const val NAV_WALK_DEPTH = 5
 
     @Volatile
     private var idsReady = false
@@ -167,6 +184,20 @@ internal object ArkMiniBarStyleHook {
 
     @Volatile
     private var circleId = 0
+
+    /**
+     * 双 id 变体（v3.15.75）：同一个 header 会切成 `*_public` 子节点（锁屏 / 内容加密态），
+     * 真机 dump 见过 `title_header_live_public` / `content_header_live_public`。
+     * 0 = 该 ROM 没有这个变体。解析进 [resolveIds] 缓存，preDraw 每帧路径不再查表。
+     */
+    @Volatile
+    private var publicTitleId = 0
+
+    @Volatile
+    private var publicContentId = 0
+
+    @Volatile
+    private var publicCircleId = 0
 
     /** 每个头部 + 深浅组合只打一条日志，避免通知刷新时刷屏（上限兜底，防长驻进程缓慢增长） */
     private val logged: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
@@ -316,27 +347,49 @@ internal object ArkMiniBarStyleHook {
     ) {
         val parent = header as? ViewGroup ?: return
         val parsed = navPayloadOf(row)
-        // v3.15.72：把 header 整棵子树 dump 出来（前 3 次）。
+        // v3.15.72：把 header 整棵子树 dump 出来（前 2 次，写入前）。
         // 导航条此前是「哑」的，只能靠用户截图猜；这条一次性把「系统到底用哪个
         // TextView 画那行字 / 有没有第二个标题控件」固化下来。
         if (navDumpLeft > 0) {
             navDumpLeft--
             XposedBridge.log(
-                "[$TAG] navDump(${3 - navDumpLeft}/3): fromShadow=${parsed.present} " +
+                "[$TAG] navDump(${NAV_DUMP_BEFORE - navDumpLeft}/$NAV_DUMP_BEFORE): " +
+                    "fromShadow=${parsed.present} " +
                     "instr='${parsed.instr.take(24)}' remain=${parsed.remainMs} " +
                     "total=${parsed.totalMs} turn=${parsed.turn} yawed=${parsed.yawed}\n" +
                     dumpSubtree(header)
             )
         }
-        // v3.15.71：不是我们的影子（高德原生导航通知 / 其它实况）就**什么都不画**，
-        // 保持系统原样。v3.15.70 会把它 GONE 掉，反而比不画更糟：那一行本来就是
-        // 系统唯一显示出来的导航条，藏掉等于整条没了。
-        if (!parsed.present) return
+        // v3.15.75 收起清理：影子发来全空载荷（无指令 / 无全程 / 无锚点）= 导航已结束，
+        // 清掉 lastGood 并把 overlay 藏起来 —— 避免结束后迷你条残留上一帧指令。
+        // 注意保留 tag 里的 overlay 引用（只 GONE 不 removeView），下次导航直接复用，
+        // 否则会往 header 里叠第二个 overlay。
+        if (parsed.present && parsed.instr.isBlank() && parsed.totalMs == 0L && parsed.remainMs < 0L) {
+            lastGoodNav = null
+            (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.GONE
+            return
+        }
+        // v3.15.75 双源模型（核心修复）：不再因 `!parsed.present` 早退。
+        //
+        // dumpsys notification 已证：屏幕上显示的可能是**高德原生那条**
+        // （id=99910001, tag=null，extras 里没有 NAV_KEY_*，present=false），
+        // 而此前所有视觉改造只落在影子行（tag=flymeark_live_nav）上 ——
+        // 那条未必上屏，于是改造从未生效。
+        // 现在：影子行把数据喂进 lastGoodNav；原生行复用 lastGoodNav 套样式。
+        // 两条都覆盖，无论哪条上屏视觉都正确。
+        //
+        // 安全护栏：非影子行只在该行**确实显示**时才改造 —— 高德还有路况 / 限行等
+        // 其它实况通知，绝不允许它们被错误套上导航样式。
+        val displayed = header.isShown && header.isAttachedToWindow && header.height > 0
+        if (!parsed.present && (lastGoodNav == null || !displayed)) {
+            logNavApply(parsed, displayed, header, row, density)
+            return
+        }
         (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.VISIBLE
         // present=true 但三字段全空 = 反射只读到一部分（正常帧 instr 必非空，见 buildShadow），
         // 此时沿用上一次成功的载荷，语义等同「两次播报之间冻结」。
         val usable = parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L
-        val p = if (usable) {
+        val p = if (parsed.present && usable) {
             lastGoodNav = parsed
             parsed
         } else {
@@ -357,55 +410,28 @@ internal object ArkMiniBarStyleHook {
             header.setTag(KEY_NAV, overlay)
         }
         overlay.setData(
-            p.turn, p.remainMs, p.totalMs, p.timeText, p.timeUnit, night, p.yawed
+            p.instr, p.turn, p.remainMs, p.totalMs, p.timeText, p.timeUnit, night, p.yawed
         )
 
-        // 系统模板显示的是通知标题（固定「高德地图」），设计稿要的是**下一步指令**。
-        // 每次影子刷新都会重进这里，覆盖不会被系统改回去。
-        // v3.15.67：字号对齐设计稿 `.bar .nm { font-size:13px; font-weight:600 }` ——
-        // 系统默认约 14–15sp 偏大。用 PX 传（`13f * density`），避免 sp 再被 fontScale 二次放大。
-        if (p.instr.isNotBlank() && titleId != 0) {
-            val tv = header.findViewById<View>(titleId) as? TextView
-            if (tv != null) {
-                if (tv.text?.toString() != p.instr) tv.text = p.instr
-                tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, 13f * density)
-            }
-        }
-        // v3.15.73：同一个 header 会切成 `*_public` 子节点（锁屏 / 内容加密态，
-        // 真机 dump 见过 `title_header_live_public` + `content_header_live_public`='已加密'）。
-        // 那时上面按 id 找 `title_header_live` 会返回 null —— 字号就退回系统默认 20sp。
-        // 这里按资源名再兜一次，只调字号，**不碰文案**：文案已经由影子通知的
-        // contentTitle 带过来了（见 ArkNavLiveInjector.buildShadow 的 v3.15.73 注释）。
-        if (titleId != 0) {
-            try {
-                val publicId = Resources.getSystem().getIdentifier(
-                    "title_header_live_public", "id", "android"
-                )
-                if (publicId != 0) {
-                    (header.findViewById<View>(publicId) as? TextView)?.setTextSize(
-                        TypedValue.COMPLEX_UNIT_PX, 13f * density
-                    )
-                }
-            } catch (_: Throwable) {
-                // 该 ROM 没有这个变体就跳过
-            }
-        }
-
-        // v3.15.67：设计稿导航迷你条只有「一行指令 + 2dp 进度」，没有副标题。
-        // 必须先清空 text —— [ensureTextCentered] 见到副标题有内容就会早退，
-        // 标题拿不到 CENTER_VERTICAL，会退回贴顶。
-        if (contentId != 0) {
-            val sub = header.findViewById<View>(contentId) as? TextView
-            if (sub != null) {
-                sub.visibility = View.GONE
-                if (sub.text != null) sub.text = null
-            }
-        }
-
+        // v3.15.75：标题 / 字号 / 圆环改为「多实例 + 双 id 变体」批量命中
+        //（title_header_live 与 *_public 变体都收进来），替代原先的单点 findViewById。
+        writeNavTitle(header, p.instr, density)
+        hideNavChrome(header)
         ensureTextShift(header, density)
         ensureTextCentered(header)
-        // 空心圆让位给 logo：只 GONE 不 removeView（系统仍会读写它）
-        if (circleId != 0) header.findViewById<View>(circleId)?.visibility = View.GONE
+        // v3.15.75（方案 A）：系统每次 RemoteViews re-apply 都会把标题刷回「高德地图」、
+        // 字号刷回 20sp、圆环刷回 VISIBLE。挂 preDraw 每帧兜底校正，谁也盖不掉。
+        armPredraw(header)
+
+        logNavApply(parsed, displayed, header, row, density)
+        // v3.15.75：写入**之后**再 dump 一次（前 2 次），对照写入有没有被系统覆盖
+        if (navDumpAfterLeft > 0) {
+            navDumpAfterLeft--
+            XposedBridge.log(
+                "[$TAG] navDumpAfter(${NAV_DUMP_AFTER - navDumpAfterLeft}/$NAV_DUMP_AFTER):\n" +
+                    dumpSubtree(header)
+            )
+        }
     }
 
     /** 导航迷你条载荷：从影子通知的顶层 extras 读（见 ArkConstants.NAV_KEY_*） */
@@ -483,6 +509,160 @@ internal object ArkMiniBarStyleHook {
         "?"
     }
 
+    // ------------------------------------------------------------------
+    // 导航批量命中 / preDraw 兜底（v3.15.75，独立私有函数 —— 红线②：
+    // 消息条的 ensureTextCentered / applyText / styleFrom 签名与函数体不动）
+    // ------------------------------------------------------------------
+
+    /** 递归收集 header 子树里所有命中 [titleId] 或 [publicTitleId] 的 TextView */
+    private fun navTitleViews(header: View): List<TextView> {
+        val out = ArrayList<TextView>(2)
+        collectTitleViews(header, 0, out)
+        return out
+    }
+
+    private fun collectTitleViews(v: View, depth: Int, out: MutableList<TextView>) {
+        if (depth > NAV_WALK_DEPTH) return
+        if (v is TextView && (v.id == titleId || v.id == publicTitleId)) out.add(v)
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) collectTitleViews(v.getChildAt(i), depth + 1, out)
+        }
+    }
+
+    /** 递归收集 header 子树里所有命中 [circleId] 或 [publicCircleId] 的圆环控件 */
+    private fun navCircleViews(header: View): List<View> {
+        val out = ArrayList<View>(2)
+        collectCircleViews(header, 0, out)
+        return out
+    }
+
+    private fun collectCircleViews(v: View, depth: Int, out: MutableList<View>) {
+        if (depth > NAV_WALK_DEPTH) return
+        if (v.id != View.NO_ID && (v.id == circleId || v.id == publicCircleId)) out.add(v)
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) collectCircleViews(v.getChildAt(i), depth + 1, out)
+        }
+    }
+
+    /**
+     * 把指令写入所有命中的标题 TextView（主变体 + public 变体都覆盖）。
+     *
+     * 字号对齐设计稿 `.bar .nm { font-size:13px; font-weight:600 }` —— 系统默认 20sp。
+     * 用 PX 传（`13f * density`），避免 sp 再被 fontScale 二次放大。
+     * **幂等 + 带比较**：文案 / 字号已经一致就不写，preDraw 每帧调用也不会触发 requestLayout。
+     */
+    private fun writeNavTitle(header: View, instr: String, densityPx: Float) {
+        if (instr.isBlank()) return
+        val targetPx = 13f * densityPx
+        for (tv in navTitleViews(header)) {
+            if (tv.text?.toString() != instr) tv.text = instr
+            if (tv.textSize != targetPx) tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, targetPx)
+        }
+    }
+
+    /**
+     * 藏掉导航条上的系统元素：空心圆（主 / public 变体）与副标题。
+     * 只 GONE 不 removeView（红线②：系统仍会读写圆环）；主副标题还要清空 text ——
+     * [ensureTextCentered] 见到副标题有内容就会早退，标题拿不到 CENTER_VERTICAL。
+     * 同样幂等 + 带比较，供 preDraw 每帧调用。
+     */
+    private fun hideNavChrome(header: View) {
+        for (v in navCircleViews(header)) {
+            if (v.visibility != View.GONE) v.visibility = View.GONE
+        }
+        if (contentId != 0) {
+            val sub = header.findViewById<View>(contentId) as? TextView
+            if (sub != null) {
+                if (sub.visibility != View.GONE) sub.visibility = View.GONE
+                if (sub.text != null) sub.text = null
+            }
+        }
+        if (publicContentId != 0) {
+            val pub = header.findViewById<View>(publicContentId) as? TextView
+            // public 变体只藏不清：'已加密' 是系统状态文案，清掉风险更大
+            if (pub != null && pub.visibility != View.GONE) pub.visibility = View.GONE
+        }
+    }
+
+    /**
+     * preDraw 每帧兜底重写（v3.15.75 方案 A）。
+     *
+     * 系统每次 RemoteViews re-apply 会把标题刷回「高德地图」、字号刷回 20sp、
+     * 圆环刷回 VISIBLE，单点写入追不上。挂 preDraw：每次真正绘制前把指令 / 字号 /
+     * 圆环可见性校正一遍，谁也盖不掉。一个 header 只挂一次（[KEY_PREDRAW] 守卫）。
+     */
+    private fun armPredraw(header: View) {
+        if (header.getTag(KEY_PREDRAW) != null) return
+        header.setTag(KEY_PREDRAW, true)
+        header.viewTreeObserver.addOnPreDrawListener(object :
+            ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                try {
+                    val o = header.getTag(KEY_NAV) as? ArkMiniNavView
+                    // 导航已收起时 overlay 是 GONE，不再每帧重写（避免结束时残留指令）
+                    if (o != null && o.visibility == View.VISIBLE) {
+                        writeNavTitle(header, o.instrText, o.densityPx)
+                        hideNavChrome(header)
+                    }
+                } catch (_: Throwable) {
+                    // 绘制前回调绝不允许抛异常，否则整条通知绘制链路会被打断
+                }
+                return true
+            }
+        })
+    }
+
+    /** row 子树里 `rl_header_live` 的实例数（contracted / expanded / headsUp 各一份） */
+    private fun countHeaders(header: View): Int {
+        val row = rowOf(header) ?: return 1
+        var n = 0
+        fun rec(v: View, depth: Int) {
+            if (depth > 10) return
+            if (v.id == headerId) n++
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) rec(v.getChildAt(i), depth + 1)
+            }
+        }
+        rec(row, 0)
+        return n
+    }
+
+    /**
+     * 自证日志（v3.15.75）：一条日志同时看到「这条 row 的 sbn id / tag、是不是影子、
+     * header 是否显示、标题命中几个、圆环命中几个、写入后的文案与字号」。
+     * 一次导航即可彻底终结「屏幕上到底是哪一条」的争论。只打前 [NAV_APPLY_LOGS] 次。
+     */
+    private fun logNavApply(
+        parsed: NavMiniPayload,
+        displayed: Boolean,
+        header: View,
+        row: View?,
+        density: Float,
+    ) {
+        if (navApplyLeft <= 0) return
+        navApplyLeft--
+        val sbn = sbnOf(row)
+        val id: Int? = try {
+            XposedHelpers.callMethod(sbn, "getId") as? Int
+        } catch (_: Throwable) {
+            null
+        }
+        val tag: String? = try {
+            XposedHelpers.callMethod(sbn, "getTag") as? String
+        } catch (_: Throwable) {
+            null
+        }
+        val titles = navTitleViews(header)
+        val first = titles.firstOrNull()
+        val sizeSp = first?.textSize?.let { if (density > 0f) it / density else 0f }
+        XposedBridge.log(
+            "[$TAG] navApply: shadow=${parsed.present} displayed=$displayed " +
+                "sbnId=$id tag=$tag hdrs=${countHeaders(header)} " +
+                "titles=${titles.size} circles=${navCircleViews(header).size} " +
+                "after='${first?.text}' size=$sizeSp"
+        )
+    }
+
     /**
      * 导航迷你条的「非文字层」：一个 View 自绘左块 / 进度 / 时间值 / logo。
      * 透明区域不遮挡系统文字，也不拦截点击（View 默认 clickable=false）。
@@ -528,6 +708,16 @@ internal object ArkMiniBarStyleHook {
         private var turn = ArkConstants.NAV_TURN_STRAIGHT
 
         /**
+         * 当前指令文案（v3.15.75）：preDraw 兜底重写时要读 —— 系统每次 re-apply
+         * 会把标题刷回「高德地图」，preDraw 里靠这个字段拿回指令再写回去。
+         */
+        var instrText: String = ""
+            private set
+
+        /** 本 view 的 density（px = dp × 它），preDraw 兜底重写换算 13sp 用 */
+        val densityPx: Float get() = density
+
+        /**
          * 本趟**剩余**毫秒（v3.15.67 锚点式）。
          *
          * v3.15.66 及以前这里存的是 `started`（出发时刻），进度 / 时间都拿
@@ -561,6 +751,7 @@ internal object ArkMiniBarStyleHook {
         }
 
         fun setData(
+            instr: String,
             turn: Int,
             remainMs: Long,
             totalMs: Long,
@@ -569,6 +760,7 @@ internal object ArkMiniBarStyleHook {
             night: Boolean,
             yawed: Boolean,
         ) {
+            instrText = instr
             this.turn = turn
             this.remainMs = remainMs
             this.totalMs = totalMs
@@ -1064,6 +1256,10 @@ internal object ArkMiniBarStyleHook {
         titleId = r.getIdentifier("title_header_live", "id", "android")
         contentId = r.getIdentifier("content_header_live", "id", "android")
         circleId = r.getIdentifier("iv_circle_progress_live", "id", "android")
+        // v3.15.75：public 变体（存在才有值），解析一次缓存住
+        publicTitleId = r.getIdentifier("title_header_live_public", "id", "android")
+        publicContentId = r.getIdentifier("content_header_live_public", "id", "android")
+        publicCircleId = r.getIdentifier("iv_circle_progress_live_public", "id", "android")
         idsReady = true
     }
 
