@@ -4105,6 +4105,18 @@ internal object ArkNavLiveInjector {
     @Volatile
     private var decorRef: WeakReference<View>? = null
 
+    /**
+     * AJX3 `Label` 的 Class 对象（v3.15.88 取数通道）。
+     *
+     * `com.autonavi.minimap.ajx3.widget.view.Label` 继承 `android.view.View`（**不是 TextView**，
+     * 所以 setText / setContentDescription / Canvas.drawText 四个旧通道全落空 —— 这正是
+     * 3.15.86 取证里四通道 0 条的直接原因）。文字存在 `protected String mText`，
+     * 公开方法 `getText()` / `setText(String)`。本字段在 [install] 里用高德的 classLoader
+     * 反射解析一次，失败为 null（步行三格退化为继续用旧通道）。
+     */
+    @Volatile
+    private var labelCls: Class<*>? = null
+
     /** 控件树 dump 是否已经给本趟挂过定时任务（一趟只挂一次，重置点在 [resetNavPayload]） */
     private var vProbeScheduled = false
 
@@ -4364,6 +4376,8 @@ internal object ArkNavLiveInjector {
             } catch (_: Throwable) {
                 null
             }
+            // v3.15.88：AJX3 Label 的 Class 也取一次局部快照（@Volatile 字段不能靠智能转换）。
+            val label = labelCls
             val queue = ArrayDeque<View>()
             queue.addLast(root)
             var guard = 0
@@ -4372,6 +4386,24 @@ internal object ArkNavLiveInjector {
                 if (cls != null && cls.isInstance(v)) {
                     val t = try {
                         (v as TextView).text?.toString() ?: ""
+                    } catch (_: Throwable) {
+                        ""
+                    }
+                    if (t.isNotEmpty()) {
+                        val key = "${v.javaClass.simpleName}:$t"
+                        if (seen.add(key) && n++ < 60) {
+                            if (out.isNotEmpty()) out.append(" | ")
+                            out.append(v.javaClass.simpleName).append('(')
+                                .append(v.width).append('x').append(v.height).append(")='")
+                                .append(t.take(24)).append('\'')
+                        }
+                    }
+                }
+                // v3.15.88：AJX3 Label（extends View，不是 TextView，所以上面那支进不来）。
+                // 反射 getText() 一起留证 —— 下一版若 setText 钩子漏了，这行还能兜底对照。
+                if (label != null && label.isInstance(v)) {
+                    val t = try {
+                        XposedHelpers.callMethod(v, "getText")?.toString() ?: ""
                     } catch (_: Throwable) {
                         ""
                     }
@@ -4401,6 +4433,70 @@ internal object ArkNavLiveInjector {
             }
             log("VPROBE-LOCALE[$tag] n=$n $out")
         } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 是不是「像三格数字 / 转向」的文案（v3.15.88，AJX Label 专用预筛）。
+     *
+     * AJX3 `Label` 遍布整个高德界面（按钮、徽标、里程、路名…），不能像 [rememberText]
+     * 那样全收，否则日志和缓冲都会被刷爆。所以进 [rememberText] 之前先砍一刀：
+     * **必须含数字** 且 **含一个导航量词**。
+     *
+     * `s.contains("米")` 会误伤「玉米」「米饭」这类词，但 [rememberText] 后面还有
+     * `parseUiTrip` 的单格正则 + 长度闸兜底，误判只会多走几步、多打几条日志，
+     * 不会写错数据 —— 取数阶段**宁可多抓不可漏**。
+     *
+     * 注意：这跟 3.15.86 探针 1 里的 [looksLikeTripDesc]（`CharSequence` 版，只认
+     * 「到达 / 剩余距离」长串）是**两个不同的预筛**，别合并 —— 那个为了抓长串，
+     * 这个为了抓单格数字，语义不同。
+     */
+    private fun looksLikeNavText(s: String): Boolean {
+        var hasDigit = false
+        for (c in s) {
+            if (c in '0'..'9') {
+                hasDigit = true
+                break
+            }
+        }
+        if (!hasDigit) return false
+        return s.contains("公里") || s.contains("千米") || s.contains("米") ||
+            s.contains("分钟") || s.contains("小时") || s.contains("分") ||
+            s.contains("到达") || s.contains("直行") || s.contains("左转") ||
+            s.contains("右转") || s.contains("剩余")
+    }
+
+    /**
+     * hook AJX3 `Label.setText`，把文字喂给现有解析器（v3.15.88 取数版，不再是探针）。
+     *
+     * `Label` 继承 `android.view.View` 且自绘，`setText(String)` 是它的**实时更新入口**。
+     * 抓到的串交给 [rememberText] —— 那条链里 `uiTripPrefilter` → [parseUiTrip] →
+     * [parseUiTripLine] 全在，所以步行如果是 `剩余距离…到达` 整串会被 3.15.84 的正则接住，
+     * 如果是 `8.2公里` 单格也会被单格正则接住。
+     *
+     * 铁律：这里**只读** —— 只调 [rememberText] 喂解析器，不直接写任何载荷字段；
+     * 写入规则仍全部留在 [parseUiTrip] / [parseUiTripLine]。
+     */
+    private fun hookAjxLabelText() {
+        val cls = labelCls ?: return
+        try {
+            XposedBridge.hookAllMethods(
+                cls, "setText",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val s = param.args.firstOrNull() as? String ?: return
+                            if (s.length !in 2..60) return
+                            if (!looksLikeNavText(s)) return
+                            rememberText(s)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("ajx label: hooked Label.setText")
+        } catch (t: Throwable) {
+            probeRaw("ajx label: hook failed (${t.javaClass.simpleName})")
         }
     }
 
@@ -4795,6 +4891,14 @@ internal object ArkNavLiveInjector {
         hookCanvasText()
         // v3.15.87 探针 5A：从 Activity.onResume 拿真正的 DecorView（修 3.15.86 抓错根的毛病）。
         hookActivityForRoot()
+        // v3.15.88 取数通道：AJX3 Label 的 setText 是步行两条数字的实时更新入口。
+        // 先反射解析一次 Class（用高德的 classLoader），失败为 null（退化为旧通道）。
+        labelCls = try {
+            Class.forName("com.autonavi.minimap.ajx3.widget.view.Label", false, lpp.classLoader)
+        } catch (_: Throwable) {
+            null
+        }
+        hookAjxLabelText()
 
         // 不在 App 侧 hook cancel：高德 cancel 的通知不一定是导航那条，一律清影子会让胶囊
         // 在高德刷新通知的间隙里闪没。销毁同步统一放 SystemUI 的 onNotificationRemoved。
