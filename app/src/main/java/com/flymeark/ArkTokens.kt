@@ -175,6 +175,18 @@ internal object ArkTokens {
     const val NAV_YAW_RED = 0xFFE5484D.toInt()
 
     /**
+     * 偏航转向块三段红（v3.15.68）：设计稿 `handoff-minibar.html` L54
+     * `.turnbg.warn{background:linear-gradient(160deg,#F0656A 0%,#E5484D 62%,#C93A3F 100%)}`。
+     *
+     * 与 [TURN_TOP] / [TURN_MID] / [TURN_BOTTOM] 完全同构（同 160deg、同 0/62%/100% stop），
+     * 只是换色。中间档与 [NAV_YAW_RED] 同值 —— 设计稿就是这么写的，不合并常量是为了
+     * 让「渐变三档」与「纯色语义色」两套用途各自可读。
+     */
+    const val YAW_TOP = 0xFFF0656A.toInt()
+    const val YAW_MID = 0xFFE5484D.toInt()
+    const val YAW_BOTTOM = 0xFFC93A3F.toInt()
+
+    /**
      * 箭头圆底中性色：设计稿 #F2F4F7。
      * 深色无设计稿值，取白 14% 的中性叠层，不做反色。
      */

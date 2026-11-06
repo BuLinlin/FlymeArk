@@ -282,7 +282,10 @@ internal object ArkMiniBarStyleHook {
      * 文字仍由系统 TextView 画，我们只右移让位 + 覆盖成播报指令。
      *
      * v3.15.67 补齐与设计稿的三处偏差：指令 13sp（PX 传）/ 隐藏副标题（设计稿没有第二行）/
-     * 偏航时转向块·进度·时间值同步转 [ArkTokens.NAV_YAW_RED]。
+     * 偏航时转向块·进度·时间值同步转红。
+     *
+     * v3.15.68 订正偏航态细节：转向块不是纯红而是三段红渐变（`.turnbg.warn`），
+     * 时间值同时加粗到 600（偏航态 inline `font-weight:600`）。
      */
     private fun applyNavStructure(
         header: View,
@@ -381,6 +384,17 @@ internal object ArkMiniBarStyleHook {
         private val appIcon: Drawable?,
     ) : View(context) {
 
+        /**
+         * 时间值字重（v3.15.68）：常态 500 / 偏航 600。
+         *
+         * 设计稿 `.bar .t{font-weight:500}`，偏航态 L285 是 inline
+         * `style="color:#E5484D;font-weight:600"` —— 只有偏航时才加粗，所以字重必须
+         * 跟着 [yawed] 走，不能在 paint 初始化里钉死。
+         * 这两个字段必须声明在 [textPaint] **之前**（属性按声明顺序初始化）。
+         */
+        private val typeNormal: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        private val typeStrong: Typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+
         private val surfacePaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -394,7 +408,7 @@ internal object ArkMiniBarStyleHook {
         private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textAlign = Paint.Align.RIGHT
             textSize = 12f * density
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            typeface = typeNormal
         }
         private val arrowPath = Path()
         private val turnRect = RectF()
@@ -421,10 +435,17 @@ internal object ArkMiniBarStyleHook {
 
         private var timeFallback = ""
 
-        /** 蓝色 160deg 渐变；按 view 高度缓存（几何只跟高度有关，见 [blueShader]） */
-        private var blueShader: Shader? = null
+        /**
+         * 转向块 160deg 三段渐变（v3.15.68 起蓝 / 红两套）；按「view 高度 + 是否偏航」缓存。
+         *
+         * 几何只跟高度有关，颜色只跟 [yawed] 有关，所以两个 key 就够 —— 蓝红切换时
+         * 各存一份，不会互相覆盖（缓存命中就零分配）。
+         */
+        private var turnShader: Shader? = null
 
-        private var blueShaderHeight = -1
+        private var turnShaderHeight = -1
+
+        private var turnShaderYawed = false
 
         init {
             setWillNotDraw(false)
@@ -452,12 +473,15 @@ internal object ArkMiniBarStyleHook {
             }
             trackPaint.color =
                 if (night) ArkTokens.TRACK_NEUTRAL_DARK else ArkTokens.TRACK_NEUTRAL_LIGHT
-            // 偏航：时间值同样转警示红；箭头恒白（[arrowPaint] 在字段初始化里定死，不随偏航变）
+            // 偏航：时间值同样转警示红并加粗到 600（设计稿偏航态 inline font-weight:600）
+            // 箭头恒白（[arrowPaint] 在字段初始化里定死，不随偏航变，也不换成回环图标 ——
+            // 偏航后高德很快播「70 米后左转」并给出新 NAV_KEY_TURN，换图标会让用户看不到真实转向）
             textPaint.color = when {
                 yawed -> ArkTokens.NAV_YAW_RED
                 night -> ArkTokens.TEXT_SECONDARY_DARK
                 else -> ArkTokens.SUBTLE_TEXT_LIGHT
             }
+            textPaint.typeface = if (yawed) typeStrong else typeNormal
             invalidate()
         }
 
@@ -467,16 +491,14 @@ internal object ArkMiniBarStyleHook {
             if (w <= 0f || cy <= 0f) return
             val d = density
 
-            // ① 40×40 R12 蓝渐变转向块（偏航时整块转红）
+            // ① 40×40 R12 三段渐变转向块（常态蓝 / 偏航红，v3.15.68 起都是 160deg 渐变）
             val left = 10f * d
             val size = 40f * d
             turnRect.set(left, cy - size / 2f, left + size, cy + size / 2f)
-            if (yawed) {
-                surfacePaint.shader = null
-                surfacePaint.color = ArkTokens.NAV_YAW_RED
-            } else {
-                surfacePaint.shader = blueGradient(turnRect, size)
-            }
+            surfacePaint.shader = turnGradient(turnRect, size, yawed)
+            // shader 生效时 color 不参与绘制，这里只作兜底（万一渐变创建失败也不会画成黑块）
+            surfacePaint.color =
+                if (yawed) ArkTokens.NAV_YAW_RED else ArkTokens.BRAND_LIGHT
             c.drawRoundRect(turnRect, 12f * d, 12f * d, surfacePaint)
             drawArrow(c, left + size / 2f, cy - size / 2f, size)
 
@@ -511,24 +533,37 @@ internal object ArkMiniBarStyleHook {
         }
 
         /**
-         * 蓝色转向块渐变（CSS `160deg` ≈ 从左上、向右偏 20° 往下，`tan20° ≈ 0.364`）。
+         * 转向块 160deg 三段渐变（v3.15.68）：常态蓝 / 偏航红，几何同构、只换色。
          *
-         * v3.15.67：从 `onSizeChanged` 挪到绘制期 —— 偏航时整块要换成纯色，
-         * 颜色必须**每帧按 [yawed] 决定**，不能在尺寸变化时写死一次。
-         * 渐变几何只与 view 高度有关，因此按高度缓存：稳定态下不产生分配。
+         * 蓝：设计稿 `.turnbg`  `#3D77FF 0% → #2F6BFF 62% → #2455D6 100%`
+         * 红：设计稿 `.turnbg.warn` `#F0656A 0% → #E5484D 62% → #C93A3F 100%`
+         *
+         * CSS `160deg` ≈ 从左上、向右偏 20° 往下（`tan20° ≈ 0.364`），所以终点取
+         * `(left + size*0.364, top + size)`。
+         *
+         * 缓存的 key 是「view 高度 + yawed」：几何只跟高度有关、颜色只跟 yawed 有关，
+         * 蓝红两份各存一次，来回切换不会互相覆盖，稳定态下不产生分配。
          */
-        private fun blueGradient(rect: RectF, size: Float): Shader {
+        private fun turnGradient(rect: RectF, size: Float, yawed: Boolean): Shader {
             val h = height
-            blueShader?.let { if (blueShaderHeight == h) return it }
+            turnShader?.let {
+                if (turnShaderHeight == h && turnShaderYawed == yawed) return it
+            }
+            val colors = if (yawed) {
+                intArrayOf(ArkTokens.YAW_TOP, ArkTokens.YAW_MID, ArkTokens.YAW_BOTTOM)
+            } else {
+                intArrayOf(ArkTokens.TURN_TOP, ArkTokens.TURN_MID, ArkTokens.TURN_BOTTOM)
+            }
             val grad = LinearGradient(
                 rect.left, rect.top,
                 rect.left + size * 0.364f, rect.top + size,
-                intArrayOf(ArkTokens.TURN_TOP, ArkTokens.TURN_MID, ArkTokens.TURN_BOTTOM),
+                colors,
                 floatArrayOf(0f, 0.62f, 1f),
                 Shader.TileMode.CLAMP,
             )
-            blueShader = grad
-            blueShaderHeight = h
+            turnShader = grad
+            turnShaderHeight = h
+            turnShaderYawed = yawed
             return grad
         }
 
