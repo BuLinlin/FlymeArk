@@ -290,6 +290,19 @@ internal object ArkNavLiveInjector {
      */
     private const val ENDING_REPOST_GUARD_MS = 1_500L
 
+    /**
+     * 「退出导航后残留驾车通知」的静默判定阈值（v3.15.89）。
+     *
+     * 真机 17:54:53 退出骑行 → 17:54:55 hit id=99910001（驾车）：高德回到首页后重发一条
+     * `navigating=true` 的驾车常驻通知，跟真驾车通知在通知层面**无法区分**（text 都是裸
+     * 「正在导航」，无方式词）。唯一可靠信号是：真导航有密集播报，退出后的残留通知是
+     * 静默的。
+     *
+     * 所以「距上次播报活动超过 30s 才冒出来、又不带方式词」的通知 → 判定为退出残留，
+     * 不投胶囊。30s 足够宽容：真导航播报间隔通常 <10s（转向密集时 1~3s 一条）。
+     */
+    private const val RESIDUAL_REPOST_GUARD_MS = 30_000L
+
     // ---------------------------------------------------------------- 跨趟兜底值（v3.15.66）
     //
     // 高德「结束导航 → 重开同一条路线」时**不会重播** `全程X公里, 大约需要X分钟`，
@@ -370,6 +383,18 @@ internal object ArkNavLiveInjector {
      */
     @Volatile
     private var lastNavNotifyAt = 0L
+
+    /**
+     * 最近一次导航播报活动（TTS / 转向指令）的时刻，`elapsedRealtime`；0 = 本进程还没见过播报。
+     *
+     * v3.15.89：这是「导航是否真的在进行」的**唯一可靠信号**。真导航一定有密集播报；
+     * 退出导航后高德重发的那条驾车常驻通知是静默的。配合 [RESIDUAL_REPOST_GUARD_MS]
+     * 用来拦住「退出后立刻冒出来的伪驾车通知」（详见 [postShadow] 里的闸）。
+     *
+     * `@Volatile`：写入在播报回调线程，读取在 `notify` hook 线程。
+     */
+    @Volatile
+    private var lastNaviActivityAt = 0L
 
     /** 会话状态：空闲（还没见过导航通知） */
     private const val STATE_IDLE = 0
@@ -688,6 +713,47 @@ internal object ArkNavLiveInjector {
                     lastSkipLogAt = now0
                     log("skip (ending repost guard)")
                 }
+                return
+            }
+        }
+
+        // v3.15.89：拦截「退出导航后高德重发的静默驾车通知」。
+        //
+        // 真机实证（qa_tmp/logs/mod6.log 17:54:53 退出骑行 → 17:54:55 hit id=99910001 驾车）：
+        // 高德退出导航回到首页会重发一条 navigating=true 的驾车常驻通知，它与真驾车通知
+        // 在通知层面**完全无法区分**（text 都是裸「正在导航」，无方式词）。
+        //
+        // 唯一可靠信号：真导航有播报，退出后的残留通知是静默的。
+        // 规则：这条通知「不带方式词」（title/text 里都没有 步行/骑行/开车 等）且
+        // 「本进程已有过播报、但距上次播报超过 [RESIDUAL_REPOST_GUARD_MS]」→ 判定为退出残留，
+        // 直接 return 不投胶囊。
+        //
+        // 为什么安全（三条论证）：
+        //  1. 不误伤真驾车导航 —— 它有密集播报，lastNaviActivityAt 一直刷新，idle 恒 <30s；
+        //     冷启动第一次真导航 lastNaviActivityAt=0，直接放行。
+        //  2. 不误伤骑行/步行 —— 它们的通知带方式词，isModeExplicit=true，直接放行；
+        //     这条闸只针对「不带方式词」的驾车型通知。
+        //  3. 切方式（骑行→步行→驾车）已被方式词覆盖：骑行/步行带方式词直接过闸；
+        //     切到驾车后若真有播报，lastNaviActivityAt 会很快刷新，闸也不会误杀。
+        //
+        // 放在 resolveNm 之前：这条伪通知越早拦越省。text/title 直接从 src.extras 取，
+        // 不依赖下面的 resolveNm（下方 712 行的提取在 resolveNm 之后，这里够不着）。
+        val residualTitle = try {
+            src.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+        } catch (_: Throwable) {
+            null
+        }
+        val residualText = try {
+            src.extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim()
+        } catch (_: Throwable) {
+            null
+        }
+        val isModeExplicit =
+            detectTravelMode("${residualTitle.orEmpty()} ${residualText.orEmpty()}") != null
+        if (!isModeExplicit && lastNaviActivityAt != 0L) {
+            val idle = SystemClock.elapsedRealtime() - lastNaviActivityAt
+            if (idle > RESIDUAL_REPOST_GUARD_MS) {
+                log("skip (silent residual nav notif, idle=${idle}ms)")
                 return
             }
         }
@@ -2549,6 +2615,9 @@ internal object ArkNavLiveInjector {
             nm.notify(NAV_SHADOW_TAG, NAV_SHADOW_ID, shadow)
             lastNaviText = content
             lastShadowSig = sig
+            // v3.15.89：播报成功投递 = 一次导航活动，刷新「最近播报」时刻，
+            // 供 [postShadow] 里的「静默残留驾车通知」闸使用。
+            lastNaviActivityAt = SystemClock.elapsedRealtime()
             XposedBridge.log("[${ArkConstants.LOG_TAG}] navTts: $content")
         } catch (_: Throwable) {
         }
