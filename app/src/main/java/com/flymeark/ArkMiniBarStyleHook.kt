@@ -137,6 +137,13 @@ internal object ArkMiniBarStyleHook {
     private val KEY_PREDRAW = "flymeark.mini.predraw".hashCode()
 
     /**
+     * v3.15.77：这条 header 是**导航迷你条**，不要胶囊底色。
+     * 只在 [applyNavStructure] 的身份确认之后设置；消息条 / 音乐条永远读不到这个 tag，
+     * 于是 [applyBackground] 对它们走的还是原来那条路。
+     */
+    private val KEY_NAV_NOBG = "flymeark.mini.navnobg".hashCode()
+
+    /**
      * 上一次**成功解析**的导航载荷（v3.15.69）。
      *
      * [navPayloadOf] 的 catch 会返回全默认的 [NavMiniPayload]（反射失败时唯一的活路），
@@ -169,6 +176,23 @@ internal object ArkMiniBarStyleHook {
 
     /** 导航批量命中时 header 子树的遍历深度上限（dump 实测最深处只有 2 层，5 足够） */
     private const val NAV_WALK_DEPTH = 5
+
+    /** v3.15.77：标题垂直居中前必须先清掉的、与 CENTER_VERTICAL 冲突的规则 */
+    private val NAV_CENTER_CONFLICT_RULES = intArrayOf(
+        RelativeLayout.ALIGN_PARENT_TOP,
+        RelativeLayout.ALIGN_PARENT_BOTTOM,
+        RelativeLayout.ALIGN_TOP,
+        RelativeLayout.BELOW,
+        RelativeLayout.ABOVE,
+    )
+
+    /** v3.15.77 一次性诊断：Flyme 实况数据可能挂在这些子 Bundle 上，逐个探一层 */
+    private val NAV_LIVE_BUNDLE_KEYS = listOf(
+        "notification.live", "android.live", "live", "capsule", "flyme.live",
+    )
+
+    /** 高德源通知 extras 已 dump 过（v3.15.77 一次性诊断，只打一次） */
+    private var liveDumpDone = false
 
     @Volatile
     private var idsReady = false
@@ -402,6 +426,15 @@ internal object ArkMiniBarStyleHook {
             null
         }
         val isNavCategory = notif?.category == Notification.CATEGORY_NAVIGATION
+        // v3.15.77 改动四：一次性诊断 —— 高德原生通知到底带了什么转向字段。
+        // 用户观察到截图里那个红色大箭头不是我们画的（我们的箭头在 40dp 块里、
+        // 是白色），说明 Flyme 实况窗自己渲染了结构化转向信息，而那些数据很可能
+        // 就躺在源通知 extras 里（我们目前是 hook 语音播报 + 正则猜同一件事）。
+        // 只读不写：这条日志决定下一版是「删掉语音解析链直接读通知」还是维持现状。
+        if (!parsed.present && isNavCategory && !liveDumpDone) {
+            liveDumpDone = true
+            dumpNavSrcExtras(notif)
+        }
         // 身份已知（category 读得到）按 category 判；读不到回退 displayed（旧行为兜底）
         val isOurs = parsed.present ||
             (notif != null && isNavCategory) ||
@@ -410,6 +443,13 @@ internal object ArkMiniBarStyleHook {
             logNavApply(parsed, displayed, header, row, density)
             return
         }
+        // v3.15.77 改动一：身份确认后立即标记「导航行不要胶囊底」——
+        // styleFrom 里 applyNavStructure 先跑、applyBackground 后跑，tag 设好之后
+        // applyBackground 直接 return false，不会再画回来。
+        header.setTag(KEY_NAV_NOBG, true)
+        // 已经铺上去的玻璃要主动撤掉（否则本帧仍会显示上一次的胶囊）。
+        // 只撤我们自己的：不是我们的玻璃就绝不碰系统背景（oursGlass 判空保护）。
+        if (oursGlass(header.background) != null) header.background = null
         // v3.15.76 订正 2：身份确认即挂 preDraw，与「本帧改造是否成功」解耦 ——
         // 这一帧没数据下一帧 preDraw 自己会补（writeNavTitle / hideNavChrome
         // 幂等 + 带比较，重复调用无副作用）。overlay 不存在时 preDraw 里判空跳过。
@@ -450,6 +490,10 @@ internal object ArkMiniBarStyleHook {
         hideNavChrome(header)
         ensureTextShift(header, density)
         ensureTextCentered(header)
+        // v3.15.77：**最后**居中 —— ensureTextShift 会往 paddingLeft 上叠加，
+        // 必须由 centerNavTitle 收口成「与进度轨左端对齐」的 60dp，否则首帧会跳一下。
+        // 顺序与 preDraw 里保持一致（write → chrome → center）。
+        centerNavTitle(header)
         // v3.15.75（方案 A）：系统每次 RemoteViews re-apply 都会把标题刷回「高德地图」、
         // 字号刷回 20sp、圆环刷回 VISIBLE。挂 preDraw 每帧兜底校正，谁也盖不掉。
         armPredraw(header)
@@ -623,6 +667,83 @@ internal object ArkMiniBarStyleHook {
     }
 
     /**
+     * v3.15.77 一次性诊断：dump 高德源（`cat=navigation`）通知 extras 的全部键值，
+     * 并单独探一层 Flyme 可能用的实况子 Bundle。**只读不写，不改任何行为。**
+     *
+     * `Bundle.get(String)` 在 API 33 起 deprecated（推荐用类型化 getter），但诊断要
+     * 「不知道类型地把值打出来」，类型化 getter 做不到 —— 这里只压掉这条 deprecation。
+     */
+    @Suppress("DEPRECATION")
+    private fun dumpNavSrcExtras(notif: Notification?) {
+        try {
+            val ex = notif?.extras
+            val keys = ex?.keySet()?.sorted()?.joinToString(",") { k ->
+                val v = ex.get(k)
+                "$k=${v?.toString()?.take(48)}"
+            }
+            XposedBridge.log(
+                "[$TAG] navSrcExtras: cat=${notif?.category} " +
+                    "template=${ex?.getString("android.template")} keys=[$keys]"
+            )
+            for (k in NAV_LIVE_BUNDLE_KEYS) {
+                ex?.getBundle(k)?.let { b ->
+                    XposedBridge.log(
+                        "[$TAG] navSrcExtras.$k keys=[${b.keySet().joinToString(",")}]"
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("[$TAG] navSrcExtras failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 导航标题**真正**垂直居中 + 左内边距对齐进度轨（v3.15.77）。
+     *
+     * 为什么受保护的 [ensureTextCentered] 不够：它只在第一次调时 `addRule(CENTER_VERTICAL)`
+     * 然后打 [KEY_CENTERED] tag；系统每次 RemoteViews re-apply 会把 layoutParams 重置回
+     * 模板默认（贴顶），而 tag 拦住不再重设 —— 于是「左转」两个字一直贴在顶端。
+     * 这里每帧（preDraw）按「当前 lp 的真实值」判断，缺什么补什么。
+     *
+     * 左内边距 = 60dp 的依据：[ArkMiniNavView.onDraw] 里转向块画在 `left = 10dp`、
+     * `size = 40dp`，进度轨从 `left + size + 10dp = 60dp` 起 —— 文字必须与轨道左端对齐。
+     *
+     * **幂等**：布局规则 / padding / margin 全部已到位就整体跳过。`tv.layoutParams = lp`
+     * 这个回写动作本身会 requestLayout，preDraw 里每帧无条件回写会抖动，所以必须守卫。
+     */
+    private fun centerNavTitle(header: View) {
+        val density = header.resources.displayMetrics.density
+        val targetLeft = (60f * density).toInt()
+        for (tv in navTitleViews(header)) {
+            val paddingOk = tv.paddingTop == 0 &&
+                tv.paddingBottom == 0 &&
+                tv.paddingLeft == targetLeft
+            if (!paddingOk) {
+                // 清掉可能造成贴顶 / 偏移的内边距，左内边距与进度轨左端对齐
+                tv.setPadding(targetLeft, 0, tv.paddingRight, 0)
+            }
+
+            val lp = tv.layoutParams as? RelativeLayout.LayoutParams ?: continue
+            val centeredOk = lp.getRule(RelativeLayout.CENTER_VERTICAL) == RelativeLayout.TRUE
+            var conflicts = false
+            for (verb in NAV_CENTER_CONFLICT_RULES) {
+                if (lp.getRule(verb) != 0) {
+                    conflicts = true
+                    break
+                }
+            }
+            val marginsOk = lp.topMargin == 0 && lp.bottomMargin == 0
+            if (!centeredOk || conflicts || !marginsOk) {
+                if (!centeredOk) lp.addRule(RelativeLayout.CENTER_VERTICAL, RelativeLayout.TRUE)
+                for (verb in NAV_CENTER_CONFLICT_RULES) lp.addRule(verb, 0)
+                lp.topMargin = 0
+                lp.bottomMargin = 0
+                tv.layoutParams = lp // 必须回写，否则规则不触发重新布局
+            }
+        }
+    }
+
+    /**
      * preDraw 每帧兜底重写（v3.15.75 方案 A）。
      *
      * 系统每次 RemoteViews re-apply 会把标题刷回「高德地图」、字号刷回 20sp、
@@ -641,6 +762,7 @@ internal object ArkMiniBarStyleHook {
                     if (o != null && o.visibility == View.VISIBLE) {
                         writeNavTitle(header, o.instrText, o.densityPx)
                         hideNavChrome(header)
+                        centerNavTitle(header)
                     }
                 } catch (_: Throwable) {
                     // 绘制前回调绝不允许抛异常，否则整条通知绘制链路会被打断
@@ -1147,6 +1269,9 @@ internal object ArkMiniBarStyleHook {
      * 与整行点击区，动它风险远大于在 drawable 上做 inset。
      */
     private fun applyBackground(header: View, night: Boolean): Boolean {
+        // v3.15.77：导航迷你条不要胶囊底（用户明确要求），内容直接落在通知卡背景上。
+        // 只在导航分支打这个 tag，消息条 / 音乐条完全不受影响。
+        if (header.getTag(KEY_NAV_NOBG) != null) return false
         val current = oursGlass(header.background)
         // 同深浅且已是我们自己的玻璃 → 不重建，避免通知刷新时反复分配
         if (current != null && current.night == night) return false
