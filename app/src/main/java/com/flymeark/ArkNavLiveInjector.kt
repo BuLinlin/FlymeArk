@@ -3345,6 +3345,42 @@ internal object ArkNavLiveInjector {
     /** `14:32 到达` / `预计 14:32 到达` / `预计下午两点十分到达`（整串锚定，`到达  杭州东站` 不匹配） */
     private val UI_ETA_RE = Regex("^\\s*(?:预计)?\\s*(.{1,20}?)\\s*到达\\s*$")
 
+    // ---- v3.15.84：三格拼一行的整串通道（骑行 / 步行的唯一活路） ----
+    //
+    // 真机实证（17:11:00 `NAV UI CAND`，来自 `qa_tmp/logs/mod.log`）：
+    //
+    //   `剩余距离9.2公里预计需要36分钟17:44到达`
+    //   `剩余距离9.2公里预计需要36分钟17:45到达`   ← 到达时刻每分钟刷一次
+    //   `剩余距离9.2公里预计需要36分钟17:46到达`
+    //
+    // 这串是高德导航页底部卡片的三格**无障碍描述**，走 `View.setContentDescription`。
+    // 骑行 / 步行**只有**这条通道：它们的通知正文只有 `请移动到户外开阔地带`，
+    // TTS 广播里 `分钟` / `小时` 命中 0 次（真机整趟日志实证）。
+    //
+    // 为什么 [UI_DIST_RE] / [UI_TIME_RE] / [UI_ETA_RE] 三条全都接不住：那三条是
+    // **整串锚定**的（`^\s*...\s*$`），而这串里 `公里` 后面还有
+    // `预计需要36分钟17:44到达` —— 这正是骑行 / 步行三格一直 `--` 的直接原因。
+
+    /** 三格拼一行的整串上限（`剩余距离9.2公里预计需要36分钟17:44到达` 是 24 字，留足余量到 60） */
+    private const val UI_TRIP_LINE_MAX = 60
+
+    /**
+     * 高德导航页底部卡片三格的整串描述（**不加 `^` / `$`**）。
+     *
+     * 刻意不锚定：高德以后在这串前面加个「距终点」之类的前缀，一锚就又废了。
+     * 分组：
+     *  - g1 / g2：距离数值 + 单位（`9.2` / `公里`）
+     *  - g3 / g4：耗时数值 + 单位（`36` / `分钟`，或 `1` / `小时`）
+     *  - g5 / g6：小时制后面的分钟尾（`2` / `分`，可缺）
+     *  - g7：到达时刻（`17:44`）
+     */
+    private val UI_TRIP_LINE_RE = Regex(
+        "剩余距离\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(公里|千米|米)\\s*" +
+            "预计需要\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(小时|分钟|分)" +
+            "(?:\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(分钟|分))?\\s*" +
+            "(\\d{1,2}[:：]\\d{2})\\s*到达"
+    )
+
     /**
      * 裸 `NN米` 的距离下限（无「剩余 / 全程」前缀时）。
      *
@@ -3439,7 +3475,7 @@ internal object ArkNavLiveInjector {
      */
     private fun uiTripPrefilter(s: CharSequence): Boolean {
         val n = s.length
-        if (n < 2 || n > UI_TEXT_MAX) return false
+        if (n < 2 || n > UI_TRIP_LINE_MAX) return false
         var digits = 0
         var mark = 0
         for (i in 0 until n) {
@@ -3483,6 +3519,111 @@ internal object ArkNavLiveInjector {
     }
 
     /**
+     * `HH:mm` → `H点mm分`，再交给 [ArkNavParse.parseClock]（v3.15.84）。
+     *
+     * 为什么不直接把 `17:44` 丢给 `parseClock`：它的 `CLOCK_RE` 要求串里有
+     * `点` 或 `时`（`17点44分` / `下午三点`），纯 `17:44` 会**直接返回 null** ——
+     * 而 `ArkNavParse.kt` 是红线文件，一行都不能改。
+     * 所以在这里把「界面上的冒号格式」翻译成「它能读的写法」，复用它已经验证过的
+     * 时段词处理、范围校验与补零逻辑。
+     *
+     * @return `HH:mm`；格式不对 / 数值越界返回 null
+     */
+    private fun uiClockOf(raw: String): String? {
+        val m = UI_CLOCK_RE.find(raw) ?: return null
+        val h = m.groupValues[1]
+        val mi = m.groupValues[2]
+        if (h.isEmpty() || mi.isEmpty()) return null
+        return ArkNavParse.parseClock("$h\u70b9${mi}\u5206")
+    }
+
+    /** `17:44` / `9：05` → (时, 分) */
+    private val UI_CLOCK_RE = Regex("^(\\d{1,2})[:：](\\d{1,2})$")
+
+    /**
+     * 解析 [UI_TRIP_LINE_RE] 那一整串。命中返回 true（调用方据此跳过单格通道）。
+     *
+     * ## 写入规则（与单格通道**刻意不同的一处**）
+     *
+     * **距离首见即定**：这串里的距离是「剩余距离」，但**首趟那一刻剩余 = 全程**，
+     * 所以首次见到时把它当「总里程」写下来；之后它随行进递减，绝不许覆盖已定的值 ——
+     * 否则迷你条上的总里程会一路往下掉（`9.2` → `8.7` → `8.1` …）。
+     *
+     * 耗时沿用 v3.15.82 单格通道的三条口径（展示值每次都写 / 分母只写一次 /
+     * 锚点每次挪到此刻），这样进度球不会倒着跑。到达时刻是高德自己算的，
+     * 永远覆盖兜底（[etaExplicit]）。
+     *
+     * @param raw 已 `trim()` 的界面文案
+     * @param now 本帧的 `elapsedRealtime`
+     * @return true = 认出了这一串（无论是否真的写了字段）
+     */
+    private fun parseUiTripLine(raw: String, now: Long): Boolean {
+        val m = UI_TRIP_LINE_RE.find(raw) ?: return false
+        // 已经收尾：认了这一串，但一个字节都不许写（否则会把胶囊复活成假载荷）
+        if (navState == STATE_ENDING) return true
+        var changed = false
+
+        // ---- 距离：首见即定，后续「剩余距离」不覆盖 ----
+        val dv = uiNum(m.groupValues[1])
+        if (dv != null && dv > 0.0 && totalDistValue.isEmpty()) {
+            var unit = m.groupValues[2]
+            if (unit == "千米") unit = "公里"
+            totalDistValue = ArkNavParse.fmtNum(dv)
+            totalDistUnit = unit
+            changed = true
+        }
+
+        // ---- 耗时 ----
+        val tv = uiNum(m.groupValues[3])
+        if (tv != null && tv > 0.0) {
+            val timeMs: Long
+            val tValue: String
+            val tUnit: String
+            if (m.groupValues[4] == "小时") {
+                val extra = uiNum(m.groupValues[5]) ?: 0.0
+                timeMs = ((tv * 60.0 + extra) * 60_000.0).toLong()
+                tValue = ArkNavParse.fmtNum(tv)
+                tUnit = "小时"
+            } else {
+                timeMs = (tv * 60_000.0).toLong()
+                tValue = ArkNavParse.fmtNum(tv)
+                tUnit = "分钟"
+            }
+            if (timeMs > 0L) {
+                if (tValue != totalTimeValue || tUnit != totalTimeUnit) {
+                    totalTimeValue = tValue
+                    totalTimeUnit = tUnit
+                    changed = true
+                }
+                if (tripTotalMs <= 0L) {
+                    tripTotalMs = timeMs
+                    totalMs = timeMs
+                    changed = true
+                }
+                anchorRemainMs = timeMs
+                anchorAt = now
+                remainMs = timeMs
+            }
+        }
+
+        // ---- 实时到达（`17:44` 走 [uiClockOf] 翻译，见那里的注释） ----
+        uiClockOf(m.groupValues[7])?.let {
+            if (it != etaText) {
+                etaText = it
+                etaExplicit = true
+                changed = true
+            }
+        }
+
+        if (changed) {
+            uiTripHits++
+            logUiTrip(raw)
+            republishFromUiTrip(now)
+        }
+        return true
+    }
+
+    /**
      * 从一条界面文案里解析三格数字（v3.15.82）。
      *
      * ## 三条时间写入条件（这条最容易搞错，写清楚）
@@ -3504,9 +3645,15 @@ internal object ArkNavLiveInjector {
     private fun parseUiTrip(s: CharSequence) {
         try {
             val raw = s.toString().trim()
-            if (raw.isEmpty() || raw.length > UI_TEXT_MAX) return
+            if (raw.isEmpty() || raw.length > UI_TRIP_LINE_MAX) return
             uiScanCand++
             val now = SystemClock.elapsedRealtime()
+            // v3.15.84 ①：三格整串通道（骑行 / 步行只有这一条路），命中就结束，
+            // 不再跑下面单格那三条 —— 否则整串会被三条锚定正则轮流试一遍，纯浪费。
+            if (parseUiTripLine(raw, now)) return
+            // v3.15.84 ②：单格通道。整串不可能超过 UI_TEXT_MAX 字，
+            // 超了必然不是单格文案（比如一段播报），直接走人。
+            if (raw.length > UI_TEXT_MAX) return
 
             // ---- 距离 ----
             var distHit = false
