@@ -2007,30 +2007,29 @@ internal object ArkNavLiveInjector {
         }
     }
 
-    /** 两套额度是否都还有剩（都没有就完全跳过后续反射） */
+    /** 两套额度是否都还有剩（只读判断，不打日志；都没有就完全跳过后续反射） */
     private fun svcIntentAnyBudgetLeft(): Boolean = synchronized(svcIntentLock) {
         svcIntentDumps < SVC_INTENT_MAX_DUMP || svcIntentNoExtraDumps < SVC_INTENT_NOEXTRA_BUDGET
     }
 
-    /** 主额度还有吗；用尽时打一次 `cap reached` 提示后返回 false */
-    private fun svcIntentHasBudget(): Boolean = synchronized(svcIntentLock) {
-        if (svcIntentDumps < SVC_INTENT_MAX_DUMP) return@synchronized true
-        if (!svcIntentCapLogged) {
-            svcIntentCapLogged = true
-            log("NAV SVC INTENT DUMP: cap reached ($SVC_INTENT_MAX_DUMP)")
+    /**
+     * 认领一个 `serviceClassName:action` 组合（主额度）；已认领过或主额度用尽返回 false。
+     *
+     * 主额度用尽的那一刻打一次 `cap reached (8)`（`svcIntentCapLogged` 保证只打一次）。
+     * 提示放在这里而不是放在前置闸门里，是因为前置闸门可能因为「弱额度也满了」而提前返回 ——
+     * 那样这条提示就永远打不出来。
+     */
+    private fun svcIntentClaim(key: String): Boolean = synchronized(svcIntentLock) {
+        if (svcIntentDumps >= SVC_INTENT_MAX_DUMP) {
+            if (!svcIntentCapLogged) {
+                svcIntentCapLogged = true
+                log("NAV SVC INTENT DUMP: cap reached ($SVC_INTENT_MAX_DUMP)")
+            }
+            return@synchronized false
         }
-        false
-    }
-
-    /** 认领一个 `serviceClassName:action` 组合（主额度）；已认领过或主额度用尽返回 false */
-    private fun svcIntentClaim(key: String): Boolean {
-        if (!svcIntentHasBudget()) return false
-        return synchronized(svcIntentLock) {
-            if (svcIntentDumps >= SVC_INTENT_MAX_DUMP) return@synchronized false
-            if (!svcIntentSeen.add(key)) return@synchronized false
-            svcIntentDumps++
-            true
-        }
+        if (!svcIntentSeen.add(key)) return@synchronized false
+        svcIntentDumps++
+        true
     }
 
     /**
