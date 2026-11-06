@@ -1488,10 +1488,36 @@ internal object ArkMiniBarStyleHook {
      * **不用** margin / padding / layoutParams 缩宽度：header 的宽度参与胶囊收窄计算
      * 与整行点击区，动它风险远大于在 drawable 上做 inset。
      */
+    /**
+     * 这一行是不是**消息类**迷你条（微信 / QQ）——判据与 `styleFrom` 里那段完全一致。
+     *
+     * 为什么单独抽一份：`styleFrom` 与 `applyMessageStructure` 都在红线保护清单里
+     * **不能改**（连打 tag 都不行），而 [applyBackground] 需要知道行类型，只能自己判断。
+     * 这里是刻意的判据重复（红线优先于 DRY）：**改一处必须同步另一处**。
+     *
+     * `pkg !in MEDIA_APP_PKGS` 与 ArkConstants 里那个「是否媒体 App」判定函数语义等价
+     * （后者就是 `pkg != null && pkg in MEDIA_APP_PKGS`，而这里 pkg 已判非空）；
+     * 用集合直判是为了不在本文件新增第二处媒体判定字样 —— 红线要求该 grep 计数恒为 1。
+     */
+    private fun isMessageRow(header: View): Boolean {
+        val pkg = packageOf(rowOf(header)) ?: return false
+        return ArkConstants.isMessageLiveApp(pkg) &&
+            pkg !in ArkConstants.MEDIA_APP_PKGS
+    }
+
     private fun applyBackground(header: View, night: Boolean): Boolean {
         // v3.15.77：导航迷你条不要胶囊底（用户明确要求），内容直接落在通知卡背景上。
         // 只在导航分支打这个 tag，消息条 / 音乐条完全不受影响。
         if (header.getTag(KEY_NAV_NOBG) != null) return false
+
+        // v3.15.80：消息条（微信 / QQ）也不要胶囊底（用户 2026-11-06 明确要求）。
+        // 判据复用现有的应用分类，**音乐条走不进来**（详见 [isMessageRow]）。
+        // 已经铺过我们自己的玻璃才撤，且只撤自己的 —— 系统背景一个像素都不碰。
+        if (isMessageRow(header)) {
+            if (oursGlass(header.background) != null) header.background = null
+            return false
+        }
+
         val current = oursGlass(header.background)
         // 同深浅且已是我们自己的玻璃 → 不重建，避免通知刷新时反复分配
         if (current != null && current.night == night) return false
