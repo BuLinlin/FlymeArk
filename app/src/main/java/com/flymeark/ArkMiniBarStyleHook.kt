@@ -198,6 +198,9 @@ internal object ArkMiniBarStyleHook {
     /** v3.15.78：自驱轮询间隔。播报间隔通常 >3s，1s 一跳足够且不会打爆 IPC */
     private const val NAV_POLL_INTERVAL_MS = 1000L
 
+    /** v3.15.78：自驱轮询连续异常的重试上限，超过就放开 tag 等下一次重挂 */
+    private const val NAV_POLL_MAX_FAILS = 3
+
     /** v3.15.78：navApply 日志心跳间隔（载荷不变时每 60s 补一条，保证时间线不断） */
     private const val NAV_APPLY_HEARTBEAT_MS = 60_000L
 
@@ -873,11 +876,15 @@ internal object ArkMiniBarStyleHook {
         if (header.getTag(KEY_POLL) != null) return
         header.setTag(KEY_POLL, true)
         val ref = WeakReference(header)
+        // 连续异常计数：异常不续命是有代价的（tag 已置位 → 本 header 整趟不再自驱），
+        // 所以折中成「先退避重试 3 次，仍失败才放开 tag 让下一次 applyNavStructure 重挂」。
+        var fails = 0
         val tick = object : Runnable {
             override fun run() {
                 val h = ref.get()
                 // 退出条件：header 被回收 / 已 detach → 不再 postDelayed（防泄漏）
                 if (h == null || !h.isAttachedToWindow) return
+                var ok = true
                 try {
                     val o = h.getTag(KEY_NAV) as? ArkMiniNavView
                     // overlay 还没建出来 / 已经收起 → 本帧不写，但继续等（数据可能后到）
@@ -896,9 +903,20 @@ internal object ArkMiniBarStyleHook {
                             }
                         }
                     }
-                    h.postDelayed(this, NAV_POLL_INTERVAL_MS)
                 } catch (_: Throwable) {
-                    // 异常即停，不再续命
+                    ok = false
+                }
+                if (ok) {
+                    fails = 0
+                    h.postDelayed(this, NAV_POLL_INTERVAL_MS)
+                } else {
+                    fails++
+                    if (fails <= NAV_POLL_MAX_FAILS) {
+                        h.postDelayed(this, NAV_POLL_INTERVAL_MS * 3)
+                    } else {
+                        // 连续失败：放开去重 tag，下次 applyNavStructure 可重新挂上
+                        h.setTag(KEY_POLL, null)
+                    }
                 }
             }
         }
