@@ -34,8 +34,10 @@ internal object ArkLiveSettingsHook {
     private val TARGETS = linkedMapOf(
         "com.tencent.qqmusic" to "QQ音乐",
         "com.netease.cloudmusic" to "网易云音乐",
+        "com.salt.music" to "Sait Player",
         "com.tencent.mm" to "微信",
         "com.tencent.mobileqq" to "QQ",
+        "com.tencent.tim" to "TIM",
         "com.autonavi.minimap" to "高德地图"
     )
 

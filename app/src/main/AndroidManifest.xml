@@ -14,6 +14,8 @@
         <package android:name="com.netease.cloudmusic" />
         <package android:name="com.tencent.mm" />
         <package android:name="com.tencent.mobileqq" />
+        <package android:name="com.tencent.tim" />
+        <package android:name="com.salt.music" />
         <!-- v3.15.61：导航展开卡的「回到导航」按钮要用 getLaunchIntentForPackage()
              拉起高德；不声明这条同样会 NameNotFoundException。 -->
         <package android:name="com.autonavi.minimap" />

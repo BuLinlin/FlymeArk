@@ -127,16 +127,13 @@ internal object ArkMessageLiveInjector {
         // 正文只用来判断「这条到底是不是一条消息」，不再进胶囊
         if (rawTitle.isNullOrBlank() && rawText.isNullOrBlank()) return
 
-        // v3.15.33：胶囊只放隐私占位，不放昵称 / 群名 / 正文。
-        // 正文仍在原生通知卡片里，点卡片或点胶囊都能进会话，信息不丢。
-        val appLabel = ArkConstants.messageAppLabel(pkg)
+        // v3.15.91：显示真实内容 —— 标题=真实群名/昵称，副标题=「N 条新消息 · 相对时间」。
+        // （推翻 v3.15.33 的隐私占位，用户拍板锁屏可显示真实会话名，正文摘要仍不落胶囊。）
         val count = sessionMessageCount(extras, rawText, rawTitle)
-        val content = if (count > 1) {
-            "有 $count 条新消息 · 点击查看"
-        } else {
-            "有新消息 · 点击查看"
-        }
-        val title = appLabel
+        val whenText = relativeTimeOf(src.`when`)
+        val title = if (rawTitle.isNullOrBlank()) ArkConstants.messageAppLabel(pkg) else rawTitle
+        val countText = if (count > 1) "$count 条新消息" else "1 条新消息"
+        val content = "$countText · $whenText"
 
         val smallIcon = try { src.getSmallIcon() } catch (_: Throwable) { null } ?: return
         val largeIcon = messageIcon(src)
@@ -231,6 +228,18 @@ internal object ArkMessageLiveInjector {
      * ⑤ 都拿不到返回 0，只显示「有新消息」，宁可不报数也不报错数。
      */
     private val COUNT_IN_TEXT = Regex("""(\d+)\s*条""")
+
+    /** 通知相对时间：刚刚 / N 分钟前 / N 小时前 / N 天前 */
+    private fun relativeTimeOf(whenMillis: Long): String {
+        if (whenMillis <= 0) return "刚刚"
+        val diff = (System.currentTimeMillis() - whenMillis) / 1000L
+        return when {
+            diff < 60 -> "刚刚"
+            diff < 3600 -> "${diff / 60} 分钟前"
+            diff < 86400 -> "${diff / 3600} 小时前"
+            else -> "${diff / 86400} 天前"
+        }
+    }
 
     /**
      * v3.15.47：由 [ArkMiniBarStyleHook]（运行在 SystemUI 进程）复用，用于迷你条右上角

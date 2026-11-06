@@ -24,8 +24,9 @@ object ArkConstants {
      */
     const val MEDIA_APP_PKG = "com.tencent.qqmusic"
     const val NETEASE_MUSIC_PKG = "com.netease.cloudmusic"
+    const val SAIT_MUSIC_PKG = "com.salt.music"
 
-    val MEDIA_APP_PKGS: Set<String> = setOf(MEDIA_APP_PKG, NETEASE_MUSIC_PKG)
+    val MEDIA_APP_PKGS: Set<String> = setOf(MEDIA_APP_PKG, NETEASE_MUSIC_PKG, SAIT_MUSIC_PKG)
 
     /** 是否为本模块支持的媒体 App 包名（网易云/QQ音乐） */
     fun isMediaApp(pkg: String?): Boolean = pkg != null && pkg in MEDIA_APP_PKGS
@@ -41,11 +42,12 @@ object ArkConstants {
      */
     const val WECHAT_PKG = "com.tencent.mm"
     const val QQ_PKG = "com.tencent.mobileqq"
+    const val TIM_PKG = "com.tencent.tim"
 
-    /** 消息实况 App 集合（微信 / QQ） */
-    val MESSAGE_LIVE_PKGS: Set<String> = setOf(WECHAT_PKG, QQ_PKG)
+    /** 消息实况 App 集合（微信 / QQ / TIM） */
+    val MESSAGE_LIVE_PKGS: Set<String> = setOf(WECHAT_PKG, QQ_PKG, TIM_PKG)
 
-    /** 是否为本模块支持的消息实况 App 包名（微信/QQ） */
+    /** 是否为本模块支持的消息实况 App 包名（微信/QQ/TIM） */
     fun isMessageLiveApp(pkg: String?): Boolean = pkg != null && pkg in MESSAGE_LIVE_PKGS
 
     // ------------------------------------------------------------------
@@ -96,6 +98,12 @@ object ArkConstants {
     /** 网易云音乐｜红 #C20C0C */
     const val BRAND_NETEASE = 0xFFC20C0C.toInt()
 
+    /** TIM｜官方蓝 #2C6FEE */
+    const val BRAND_TIM = 0xFF2C6FEE.toInt()
+
+    /** Sait Player｜青绿 #00BCD4（兜底品牌色，无官方规范） */
+    const val BRAND_SAIT = 0xFF00BCD4.toInt()
+
     /** 兜底底色（未知 App） */
     const val BRAND_FALLBACK = 0xFF333333.toInt()
 
@@ -103,8 +111,10 @@ object ArkConstants {
     fun brandColorOf(pkg: String?): Int = when (pkg) {
         WECHAT_PKG -> BRAND_WECHAT
         QQ_PKG -> BRAND_QQ
+        TIM_PKG -> BRAND_TIM
         MEDIA_APP_PKG -> BRAND_QQMUSIC
         NETEASE_MUSIC_PKG -> BRAND_NETEASE
+        SAIT_MUSIC_PKG -> BRAND_SAIT
         else -> BRAND_FALLBACK
     }
 
@@ -116,6 +126,7 @@ object ArkConstants {
     fun messageAppLabel(pkg: String?): String = when (pkg) {
         WECHAT_PKG -> "微信"
         QQ_PKG -> "QQ"
+        TIM_PKG -> "TIM"
         else -> "消息"
     }
 
@@ -336,6 +347,12 @@ object ArkConstants {
 
     /** 导航展开卡：全程距离单位（String，「公里」/「米」） */
     const val NAV_KEY_DIST_UNIT = "flymeark.nav.dist_unit"
+
+    /** 导航展开卡：**剩余路程**数值（String，如「9.2」；空串表示未取到 → 回落全程距离） */
+    const val NAV_KEY_REMAIN_DIST = "flymeark.nav.remain_dist"
+
+    /** 导航展开卡：剩余路程单位（String，「公里」/「米」） */
+    const val NAV_KEY_REMAIN_DIST_UNIT = "flymeark.nav.remain_dist_unit"
 
     /** 导航展开卡：总耗时数值（String，分钟数或小时数） */
     const val NAV_KEY_TIME = "flymeark.nav.time"

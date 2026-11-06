@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.content.res.Resources
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
@@ -18,9 +19,13 @@ import android.graphics.LinearGradient
 import android.graphics.Shader
 import android.os.Bundle
 import android.util.TypedValue
+import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
+import android.widget.LinearLayout
+import android.widget.PopupWindow
 import android.widget.RelativeLayout
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
@@ -96,9 +101,6 @@ internal object ArkMiniBarStyleHook {
     private const val CHEVRON_DEPTH_DP = 3f
     private const val CHEVRON_STROKE_DP = 1.6f
 
-    /** 徽标白环宽度（设计稿徽标边缘有 ~2px 浅色分离带） */
-    private const val BADGE_RING_DP = 1.5f
-
     /** 徽标数字与圆边的安全内距；两位数靠**缩字号**而不是撑宽来适配 */
     private const val BADGE_TEXT_PAD_DP = 1f
 
@@ -108,19 +110,26 @@ internal object ArkMiniBarStyleHook {
     /** 图标方块四周留白（= 徽标可外溢的空间），view 边长 = 图标 + 2×它 */
     private const val ICON_PAD_DP = 4f
 
-    /** 图标方块距 header 左边缘。叠加 [ICON_PAD_DP] 后图标本体距 header 10dp
-     *  = 距玻璃胶囊左沿 6dp（玻璃水平内嵌 [BAR_INSET_H_DP]） */
-    private const val ICON_START_DP = 10f
+    /** 图标方块距 header 左边缘。对齐系统实况通知边距
+     *  live_notification_perimeter_margins = 5dp（从 SystemUI.apk dump 实测） */
+    private const val ICON_START_DP = 5f
 
     /** 徽标贴 view 边缘的安全距，保证整圆落在玻璃胶囊内不被切 */
     private const val BADGE_EDGE_DP = 2f
 
-    /** 玻璃胶囊的水平 / 垂直内嵌（v3.15.48：通栏白底 → 内嵌 pill，左右露出壁纸） */
-    private const val BAR_INSET_H_DP = 8f
-    private const val BAR_INSET_V_DP = 4f
+    /** 玻璃胶囊的水平 / 垂直内嵌。对齐系统实况通知 perimeter_margins=5dp */
+    private const val BAR_INSET_H_DP = 5f
+    private const val BAR_INSET_V_DP = 5f
 
-    /** 箭头圆底距玻璃胶囊右沿（胶囊右端是半径 22dp 的半圆，留 9dp 才不压到弧线） */
-    private const val ARROW_END_DP = 9f
+    /** 箭头距玻璃胶囊右沿。对齐系统实况通知 perimeter_margins=5dp */
+    private const val ARROW_END_DP = 5f
+
+    /**
+     * v3.15.93：标题右 margin（给右侧「N条新消息·刚刚」副标题文字区让位）。
+     * 副标题 gravity=END 靠右，文字约 150dp 宽；标题靠左全宽，右 margin 留 170dp
+     * 保证标题过长时 ellipsize 截断、不与副标题重叠，也不会把副标题挤出。
+     */
+    private const val TITLE_END_GUARD_DP = 170f
 
     /** 徽标数字上限：超过就显示「99+」，避免无限撑宽 */
     private const val BADGE_CAP = 99
@@ -148,6 +157,15 @@ internal object ArkMiniBarStyleHook {
     /** v3.15.78：这条 header 已经挂了自驱轮询（一个 header 只挂一条） */
     private val KEY_POLL = "flymeark.mini.poll".hashCode()
 
+    /** v3.15.91：消息展开区（PopupWindow）引用，一个 header 只挂一个，点箭头 toggle */
+    private val KEY_MSG_POPUP = "flymeark.mini.msgpopup".hashCode()
+
+    /** v3.15.91：展开区是否已展开（0/1），供箭头切 v/^ 方向 */
+    private val KEY_MSG_EXPANDED = "flymeark.mini.msgexpanded".hashCode()
+
+    /** v3.15.91：消息胶囊 preDraw 兜底监听已挂（一个 header 只挂一次） */
+    private val KEY_MSG_PREDRAW = "flymeark.mini.msgpredraw".hashCode()
+
     /**
      * 上一次**成功解析**的导航载荷（v3.15.69）。
      *
@@ -170,6 +188,9 @@ internal object ArkMiniBarStyleHook {
 
     /** 导航子树 dump 剩余次数（v3.15.75：写入**之后**再 dump，对照写入有没有被系统覆盖） */
     private var navDumpAfterLeft = NAV_DUMP_AFTER
+
+    /** v3.15.91：消息胶囊 header dump 剩余次数（定位标题「微信」画在哪个 TextView） */
+    private var msgDumpLeft = 3
 
     /** dump 的次数上限（navApply 自证日志 v3.15.78 起改按「载荷变化 + 心跳」打，不再限次） */
     private const val NAV_DUMP_BEFORE = 2
@@ -363,14 +384,217 @@ internal object ArkMiniBarStyleHook {
         density: Float,
         count: Int,
     ) {
-        // ① 应用图标 + 未读徽标
-        val iconOk = ensureIcon(header, pkg, density, count)
+        // ① 应用图标（v3.15.91：去角标，不再传 count → 不画红数字徽标）
+        val iconOk = ensureIcon(header, pkg, density, 0, night)
         // ② 标题 / 副标题右移，给图标让位（只做一次，避免 padding 累加）
         if (iconOk) ensureTextShift(header, density)
         // ③ 标题在 header 里垂直居中 —— 否则文字贴顶、和图标中线差一截（v3.15.48）
         ensureTextCentered(header)
         // ④ 右侧空心圆 → 隐藏，同位置插展开箭头
         ensureArrow(header, night, density)
+        // ⑤ v3.15.91：标题 / 副标题直接覆盖成真实群名 +「N 条新消息 · 刚刚」
+        //    （Flyme 消息胶囊模板不吃 capsuleTitle，跟导航一样在 SystemUI 侧直写 TextView）
+        writeMessageTitle(header)
+        // ⑥ v3.15.91 修复：消息胶囊挂 preDraw 每帧兜底。与导航同理 —— Flyme 的
+        //    RemoteViews 每次来新消息都会 re-apply，把标题刷回「微信」占位、圆环刷回
+        //    VISIBLE、layoutParams 刷回上下堆叠。单点写入追不上，必须每次绘制前校正。
+        armMessagePredraw(header)
+        // 一次性 dump：看清消息胶囊 header 真实 View 结构，定位标题画在哪
+        if (msgDumpLeft > 0) {
+            msgDumpLeft--
+            XposedBridge.log("[$TAG] msgDump(${2 - msgDumpLeft}/2):\n" + dumpSubtree(header))
+        }
+    }
+
+    /**
+     * 消息胶囊标题 / 副标题：从原通知 sbn 读真实群名 + 条数 + 相对时间，直写 TextView。
+     * 与导航的 [writeNavTitle] 同一路子 —— Flyme 模板已把标题渲染成 App 名占位，
+     * 这里按真实内容覆盖（v3.15.91 用户拍板显示真实会话名，推翻 v3.15.33 隐私占位）。
+     *
+     * 布局对齐设计稿「主 15px 加粗 + 次 12px，同一行、副标题靠右」：
+     * 系统模板把 title/content 上下堆叠且 title 20sp 过大，这里把字号压到 15sp/12sp，
+     * 并把 title 靠左、content 靠右（CENTER_VERTICAL），副标题右 margin 给箭头让位。
+     */
+    /**
+     * v3.15.91 修复：幂等重写（供 [armMessagePredraw] 每帧调用）。
+     * 带比较守卫，任何字段已一致就不回写 layoutParams（回写会 requestLayout，每帧
+     * 无条件回写会抖动）—— 与导航 [centerNavTitle] 同一条纪律。
+     */
+    private fun writeMessageTitle(header: View) {
+        val density = header.resources.displayMetrics.density
+        val row = rowOf(header) ?: return
+        val sbn = sbnOf(row) ?: return
+        try {
+            val notif = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+                ?: return
+            val extras = notif.extras ?: return
+            val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+                ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
+            val rawText = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+                ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
+            if (rawTitle.isNullOrBlank() && rawText.isNullOrBlank()) return
+
+            val title = if (rawTitle.isNullOrBlank()) "" else rawTitle
+            val count = ArkMessageLiveInjector.sessionMessageCount(extras, rawText, rawTitle)
+            val countText = if (count > 1) "$count 条新消息" else "1 条新消息"
+            val whenText = relativeWhen(notif.`when`)
+            val sub = "$countText · $whenText"
+
+            // 字号：主 15px 加粗、次 12px（PX 传，避免 sp 被 fontScale 二次放大）
+            val titlePx = 15f * density
+            val subPx = 12f * density
+            // v3.15.92：副标题 rightMargin 必须按箭头热区（44dp）让位，否则 44dp 箭头
+            // View 会盖住「刚刚」等文字（视觉 chevron 22dp，但热区是 44dp）。
+            val arrowSpace = ((ArkTokens.MINI_ARROW_TOUCH_DP + ARROW_END_DP) * density).toInt()
+
+            if (titleId != 0) {
+                val tv = header.findViewById<View>(titleId) as? TextView
+                if (tv != null) {
+                    if (tv.text?.toString() != title) tv.text = title
+                    if (tv.textSize != titlePx) tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, titlePx)
+                    if (tv.typeface?.isBold != true) tv.setTypeface(tv.typeface, Typeface.BOLD)
+                    // 标题文字 gravity 靠左（START），避免 match_parent 下文字居中/靠右
+                    if (tv.gravity != (Gravity.START or Gravity.CENTER_VERTICAL)) {
+                        tv.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    }
+                    // v3.15.92：昵称过长时单行截断，避免把靠右的副标题挤出/重叠
+                    tv.setSingleLine(true)
+                    tv.ellipsize = android.text.TextUtils.TruncateAt.END
+                    val lp = tv.layoutParams as? RelativeLayout.LayoutParams
+                    if (lp != null) {
+                        // 清掉所有可能把标题钉在顶部 / 底部 / 相对其它控件的规则
+                        for (verb in intArrayOf(
+                            RelativeLayout.ALIGN_PARENT_TOP,
+                            RelativeLayout.ALIGN_PARENT_BOTTOM,
+                            RelativeLayout.ALIGN_TOP,
+                            RelativeLayout.ALIGN_BOTTOM,
+                            RelativeLayout.BELOW,
+                            RelativeLayout.ABOVE,
+                            RelativeLayout.ALIGN_PARENT_END,
+                            RelativeLayout.ALIGN_PARENT_RIGHT,
+                            RelativeLayout.RIGHT_OF,
+                            RelativeLayout.LEFT_OF,
+                        )) lp.addRule(verb, 0)
+                        // Flyme 的 RelativeLayout 只认旧槽位 ALIGN_PARENT_LEFT(=9)，
+                        // 不认 API26 新增的 ALIGN_PARENT_START(=20)。必须用 LEFT 才能生效。
+                        lp.addRule(RelativeLayout.ALIGN_PARENT_LEFT, RelativeLayout.TRUE)
+                        lp.addRule(RelativeLayout.CENTER_VERTICAL, RelativeLayout.TRUE)
+                        // v3.15.93：标题不再 LEFT_OF 副标题（副标题已改全宽 + gravity END 靠右，
+                        // 锚定会把标题压成 0 宽）。改为全宽 + 靠左，右 margin 给副标题文字区让位，
+                        // 标题过长时靠 ellipsize 截断，不再与右侧副标题文字重叠。
+                        lp.rightMargin = (TITLE_END_GUARD_DP * density).toInt()
+                        tv.layoutParams = lp
+                        tv.requestLayout()
+                    }
+                }
+            }
+            if (contentId != 0) {
+                val cv = header.findViewById<View>(contentId) as? TextView
+                if (cv != null) {
+                    if (cv.text?.toString() != sub) cv.text = sub
+                    if (cv.textSize != subPx) cv.setTextSize(TypedValue.COMPLEX_UNIT_PX, subPx)
+                    cv.setSingleLine(true)
+                    cv.ellipsize = android.text.TextUtils.TruncateAt.END
+                    // v3.15.93 关键修复：副标题文字**靠右对齐**（gravity END）。
+                    // 此前依赖 RelativeLayout 的 ALIGN_PARENT_RIGHT + WRAP_CONTENT 让副标题
+                    // 缩到右侧，但 Flyme 的消息胶囊 header 在 RemoteViews re-apply 时会把它
+                    // 刷回 match_parent 全宽 + 文字靠左（实测 w=945 left=0），规则改了也不重算。
+                    // 直接改 gravity=END 让文字在全宽 View 内右对齐，最稳、不吃布局引擎。
+                    val wantGravity = Gravity.END or Gravity.CENTER_VERTICAL
+                    if (cv.gravity != wantGravity) cv.gravity = wantGravity
+                    val lp = cv.layoutParams as? RelativeLayout.LayoutParams
+                    if (lp != null) {
+                        // 清掉把副标题钉在标题下方（BELOW）等规则，改为垂直居中，
+                        // 让它与标题同一条水平线（否则会跑到标题下面一行）。
+                        for (verb in intArrayOf(
+                            RelativeLayout.ALIGN_PARENT_TOP,
+                            RelativeLayout.ALIGN_PARENT_BOTTOM,
+                            RelativeLayout.ALIGN_TOP,
+                            RelativeLayout.ALIGN_BOTTOM,
+                            RelativeLayout.BELOW,
+                            RelativeLayout.ABOVE,
+                        )) lp.addRule(verb, 0)
+                        lp.addRule(RelativeLayout.CENTER_VERTICAL, RelativeLayout.TRUE)
+                        // 保持全宽（不设 WRAP_CONTENT），右对齐交给 gravity 完成；
+                        // 右 margin 给箭头热区让位，避免文字被 44dp 箭头 View 盖住。
+                        lp.rightMargin = arrowSpace
+                        cv.layoutParams = lp
+                        cv.requestLayout()
+                    }
+                    // 取证：副标题的父容器类型 + lp 类型 + 靠右规则是否真的写入
+                    val parentCls = (cv.parent as? View)?.javaClass?.simpleName ?: "null"
+                    val lpCls = cv.layoutParams?.javaClass?.simpleName ?: "null"
+                    val lpFull = cv.layoutParams?.javaClass?.name ?: "null"
+                    val rl = cv.layoutParams as? RelativeLayout.LayoutParams
+                    val rulePr = rl?.getRule(RelativeLayout.ALIGN_PARENT_RIGHT)
+                    val ruleCv = rl?.getRule(RelativeLayout.CENTER_VERTICAL)
+                    val ruleBelow = rl?.getRule(RelativeLayout.BELOW)
+                    XposedBridge.log(
+                        "[$TAG] msgSub: sub='$sub' left=${cv.left} top=${cv.top} " +
+                            "w=${cv.width} h=${cv.height} headerH=${header.height} " +
+                            "cvId=${cv.id} cvCls=${cv.javaClass.simpleName} titleId=$titleId contentId=$contentId " +
+                            "parent=$parentCls lp=$lpCls lpFull=$lpFull PR=$rulePr " +
+                            "CV=$ruleCv BELOW=$ruleBelow gravity=${cv.gravity}"
+                    )
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * v3.15.91 修复：消息胶囊每帧兜底（与导航 [armPredraw] 同一机制）。
+     * 系统每次 RemoteViews re-apply 会把标题刷回「微信」、圆环刷回 VISIBLE、布局刷回
+     * 上下堆叠 —— 这里每次绘制前把标题/副标题/布局规则/圆环校正一遍，谁也盖不掉。
+     */
+    private fun armMessagePredraw(header: View) {
+        if (header.getTag(KEY_MSG_PREDRAW) != null) return
+        header.setTag(KEY_MSG_PREDRAW, true)
+        header.viewTreeObserver.addOnPreDrawListener(object :
+            ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                try {
+                    val night = isNight(header.context)
+                    val density = header.resources.displayMetrics.density
+                    // 标题 / 副标题（含布局规则，幂等 + 带比较）
+                    writeMessageTitle(header)
+                    // 圆环每帧重藏（主 + public 双变体，幂等）
+                    hideMessageChrome(header)
+                    // 箭头若还在（未被系统移走）每帧重设颜色 / 圆底
+                    (header.getTag(KEY_ARROW) as? ArkMiniArrowView)?.let { a ->
+                        if (a.isNight != night) a.isNight = night
+                    }
+                    // v3.15.92 一次性取证：dump header 完整结构，看副标题的父容器类型
+                    if (msgDumpLeft > 0) {
+                        msgDumpLeft--
+                        XposedBridge.log("[$TAG] msgDump:\n" + dumpSubtree(header))
+                    }
+                } catch (_: Throwable) {
+                    // 绘制前回调绝不允许抛异常
+                }
+                return true
+            }
+        })
+    }
+
+    /**
+     * 藏掉消息胶囊右侧空心圆（主 / public 双变体），幂等 + 带比较，preDraw 每帧安全。
+     */
+    private fun hideMessageChrome(header: View) {
+        for (v in navCircleViews(header)) {
+            if (v.visibility != View.GONE) v.visibility = View.GONE
+        }
+    }
+
+    private fun relativeWhen(whenMillis: Long): String {
+        if (whenMillis <= 0) return "刚刚"
+        val diff = (System.currentTimeMillis() - whenMillis) / 1000L
+        return when {
+            diff < 60 -> "刚刚"
+            diff < 3600 -> "${diff / 60} 分钟前"
+            diff < 86400 -> "${diff / 3600} 小时前"
+            else -> "${diff / 86400} 天前"
+        }
     }
 
     /**
@@ -637,9 +861,34 @@ internal object ArkMiniBarStyleHook {
             sb.append(" vis=").append(v.visibility)
             sb.append(" ").append(v.left).append(',').append(v.top)
             sb.append(' ').append(v.width).append('x').append(v.height)
+            // v3.15.92：打印父容器类型 + lp 类型，定位副标题父节点到底是不是 RelativeLayout
+            sb.append(" lp=").append(v.layoutParams?.javaClass?.simpleName ?: "null")
+            (v.parent as? View)?.let { p ->
+                sb.append(" parent=").append(p.javaClass.simpleName)
+            }
             if (v is TextView) {
                 sb.append(" size=").append(String.format("%.1f", v.textSize / v.resources.displayMetrics.density))
                 sb.append(" txt='").append(v.text?.toString()?.take(20)).append('\'')
+            }
+            // v3.15.92：打印 RelativeLayout 子 View 的布局规则，定位副标题为何 subTop=62
+            (v.layoutParams as? RelativeLayout.LayoutParams)?.let { lp ->
+                val rules = StringBuilder()
+                fun r(verb: Int, name: String) {
+                    val x = lp.getRule(verb)
+                    if (x != 0) rules.append(name).append('=').append(x).append(' ')
+                }
+                r(RelativeLayout.ALIGN_PARENT_START, "PS")
+                r(RelativeLayout.ALIGN_PARENT_END, "PE")
+                r(RelativeLayout.ALIGN_PARENT_LEFT, "PL")
+                r(RelativeLayout.ALIGN_PARENT_RIGHT, "PR")
+                r(RelativeLayout.ALIGN_PARENT_TOP, "PT")
+                r(RelativeLayout.ALIGN_PARENT_BOTTOM, "PB")
+                r(RelativeLayout.CENTER_VERTICAL, "CV")
+                r(RelativeLayout.CENTER_IN_PARENT, "CIP")
+                r(RelativeLayout.BELOW, "BELOW")
+                r(RelativeLayout.ALIGN_TOP, "AT")
+                r(RelativeLayout.ALIGN_BOTTOM, "AB")
+                if (rules.isNotEmpty()) sb.append(" [").append(rules.toString().trim()).append(']')
             }
             if (v is ViewGroup) {
                 for (i in 0 until v.childCount) walk(v.getChildAt(i), depth + 1)
@@ -1079,7 +1328,7 @@ internal object ArkMiniBarStyleHook {
         private val surfacePaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            color = ArkTokens.BRAND_ON_LIGHT
+            color = ArkTokens.PLACEHOLDER_ON
             strokeWidth = 2.2f * density
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
@@ -1098,6 +1347,9 @@ internal object ArkMiniBarStyleHook {
         private val clipPath = Path()
 
         private var turn = ArkConstants.NAV_TURN_STRAIGHT
+
+        /** 深浅模式（v3.15.91）：来源 logo 占位块要分档，由 [setData] 写入 */
+        private var night = false
 
         /**
          * 当前指令文案（v3.15.75）：preDraw 兜底重写时要读 —— 系统每次 re-apply
@@ -1172,11 +1424,12 @@ internal object ArkMiniBarStyleHook {
             this.totalMs = totalMs
             this.yawed = yawed
             timeFallback = if (timeText.isBlank()) "" else "$timeText $timeUnit".trim()
-            // 偏航：进度填充统一转警示红；正常：品牌蓝（深浅两档）
+            this.night = night
+            // 偏航：进度填充统一转警示红；正常：品牌蓝（v3.15.92 恢复路线进度蓝，
+            // 与转向块同源 TURN_MID —— 设计稿「路线进度默认蓝、偏航转红」）
             fillPaint.color = when {
                 yawed -> ArkTokens.NAV_YAW_RED
-                night -> ArkTokens.BRAND_DARK
-                else -> ArkTokens.BRAND_LIGHT
+                else -> ArkTokens.TURN_MID
             }
             trackPaint.color =
                 if (night) ArkTokens.TRACK_NEUTRAL_DARK else ArkTokens.TRACK_NEUTRAL_LIGHT
@@ -1205,7 +1458,7 @@ internal object ArkMiniBarStyleHook {
             surfacePaint.shader = turnGradient(turnRect, size, yawed)
             // shader 生效时 color 不参与绘制，这里只作兜底（万一渐变创建失败也不会画成黑块）
             surfacePaint.color =
-                if (yawed) ArkTokens.NAV_YAW_RED else ArkTokens.BRAND_LIGHT
+                if (yawed) ArkTokens.NAV_YAW_RED else ArkTokens.TURN_MID
             c.drawRoundRect(turnRect, 12f * d, 12f * d, surfacePaint)
             drawArrow(c, left + size / 2f, cy - size / 2f, size)
 
@@ -1259,7 +1512,11 @@ internal object ArkMiniBarStyleHook {
             val colors = if (yawed) {
                 intArrayOf(ArkTokens.YAW_TOP, ArkTokens.YAW_MID, ArkTokens.YAW_BOTTOM)
             } else {
-                intArrayOf(ArkTokens.TURN_TOP, ArkTokens.TURN_MID, ArkTokens.TURN_BOTTOM)
+                intArrayOf(
+                    ArkTokens.TURN_TOP,
+                    ArkTokens.TURN_MID,
+                    ArkTokens.TURN_BOTTOM,
+                )
             }
             val grad = LinearGradient(
                 rect.left, rect.top,
@@ -1312,14 +1569,10 @@ internal object ArkMiniBarStyleHook {
                 appIcon.draw(c)
                 c.restoreToCount(save)
             } else {
-                // 设计稿 §四.2：未接入时虚线描边占位，不写文字
+                // v3.15.91：中性灰实心占位（去虚线、去描边、不写文字）
                 val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.STROKE
-                    strokeWidth = density
-                    color = 0x668A9099
-                    pathEffect = android.graphics.DashPathEffect(
-                        floatArrayOf(3f * density, 3f * density), 0f
-                    )
+                    style = Paint.Style.FILL
+                    color = if (night) ArkTokens.PLACEHOLDER_DARK else ArkTokens.PLACEHOLDER_LIGHT
                 }
                 c.drawRoundRect(logoRect, radius, radius, p)
             }
@@ -1373,23 +1626,29 @@ internal object ArkMiniBarStyleHook {
         pkg: String,
         density: Float,
         count: Int,
+        night: Boolean,
     ): Boolean {
         val parent = header as? ViewGroup ?: return false
         val existing = header.getTag(KEY_ICON) as? ArkMiniIconView
         if (existing != null) {
-            // 复用：只刷徽标数字
+            // 复用：刷徽标数字 + 深浅模式
             existing.setCount(count)
+            existing.isNight = night
             return true
         }
 
-        val appIcon = appIconOf(header.context, pkg) ?: return false
+        // v3.15.91：取不到彩色图标也不再跳过 —— 仍插入 40×40 恒定槽，
+        // 由 ArkMiniIconView 画中性灰占位块，标题照常右移，绝不塌陷。
+        val appIcon = appIconOf(header.context, pkg)
         val sizePx = ((ArkTokens.MINI_ICON_DP + 2 * ICON_PAD_DP) * density).toInt()
         val iconView = ArkMiniIconView(header.context, density, appIcon)
+        iconView.isNight = night
         iconView.setCount(count)
         iconView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
 
         val lp = RelativeLayout.LayoutParams(sizePx, sizePx)
-        lp.addRule(RelativeLayout.ALIGN_PARENT_START)
+        // Flyme 只认 ALIGN_PARENT_LEFT(=9)，不认 ALIGN_PARENT_START(=20)
+        lp.addRule(RelativeLayout.ALIGN_PARENT_LEFT)
         lp.addRule(RelativeLayout.CENTER_VERTICAL)
         lp.leftMargin = (ICON_START_DP * density).toInt()
         parent.addView(iconView, lp)
@@ -1457,22 +1716,192 @@ internal object ArkMiniBarStyleHook {
      */
     private fun ensureArrow(header: View, night: Boolean, density: Float) {
         val parent = header as? ViewGroup ?: return
-        val arrowPx = (ArkTokens.MINI_ARROW_DP * density).toInt()
+        // v3.15.92：View 尺寸用 44dp 触控热区，chevron 在内部居中画 22dp ——
+        // 点击区域比视觉图标大，符合触控规范（≥44dp）。
+        val arrowPx = (ArkTokens.MINI_ARROW_TOUCH_DP * density).toInt()
         var arrow = header.getTag(KEY_ARROW) as? ArkMiniArrowView
         if (arrow == null) {
             arrow = ArkMiniArrowView(header.context, density)
             val lp = RelativeLayout.LayoutParams(arrowPx, arrowPx)
-            lp.addRule(RelativeLayout.ALIGN_PARENT_END)
+            // Flyme 布局引擎只认 ALIGN_PARENT_RIGHT(=11)，不认 ALIGN_PARENT_END(=21)
+            lp.addRule(RelativeLayout.ALIGN_PARENT_RIGHT)
             lp.addRule(RelativeLayout.CENTER_VERTICAL)
             // 跟着玻璃胶囊往内让，否则圆底会压在胶囊右端半圆的弧线外面
             lp.rightMargin = ((BAR_INSET_H_DP + ARROW_END_DP) * density).toInt()
             parent.addView(arrow, lp)
             header.setTag(KEY_ARROW, arrow)
+            // v3.15.92：点击内联到 View.onTouchEvent，用 onTap 回调触发展开
+            arrow.onTap = { toggleMessageExpand(header, arrow) }
         }
         arrow.isNight = night
         if (circleId != 0) {
             header.findViewById<View>(circleId)?.visibility = View.GONE
         }
+        // v3.15.91：public 变体的空心圆也要藏，否则右侧残留一圈深灰圆环
+        if (publicCircleId != 0) {
+            header.findViewById<View>(publicCircleId)?.visibility = View.GONE
+        }
+    }
+
+    /**
+     * v3.15.91：消息展开/收起 —— 点右侧箭头，在迷你条下方原地弹一层**当前会话**的消息
+     * 列表（单会话版）。跨会话聚合（设计稿那种张三/产品评审群/订阅号并排）需要 SystemUI
+     * 侧跨通知聚合，是后续阶段，本轮先不做。
+     *
+     * 用 [PopupWindow] 而不是往 header 里塞子 View：塞子 View 会撑高卡片、牵动整行高度
+     * 与点击区；PopupWindow 悬浮在 header 之外，不改变消息卡布局（无高度抖动）。
+     */
+    private fun toggleMessageExpand(header: View, arrow: ArkMiniArrowView) {
+        try {
+            val existing = header.getTag(KEY_MSG_POPUP) as? PopupWindow
+            if (existing != null) {
+                existing.dismiss()
+                header.setTag(KEY_MSG_POPUP, null)
+                header.setTag(KEY_MSG_EXPANDED, null)
+                arrow.expanded = false
+                XposedBridge.log("[$TAG] msgExpand: dismissed")
+                return
+            }
+            val row = rowOf(header) ?: run {
+                XposedBridge.log("[$TAG] msgExpand: rowOf=null")
+                return
+            }
+            val lines = messageLinesOfRow(row)
+            if (lines.isEmpty()) {
+                XposedBridge.log("[$TAG] msgExpand: no lines")
+                return
+            }
+            XposedBridge.log("[$TAG] msgExpand: ${lines.size} lines, first='${lines.first().text.take(24)}'")
+            val night = isNight(header.context)
+            val density = header.resources.displayMetrics.density
+            val popup = buildMessagePopup(header.context, lines, night, density)
+            header.setTag(KEY_MSG_POPUP, popup)
+            header.setTag(KEY_MSG_EXPANDED, true)
+            arrow.expanded = true
+            popup.showAsDropDown(header, 0, (BAR_INSET_V_DP * density).toInt())
+        } catch (t: Throwable) {
+            XposedBridge.log("[$TAG] msgExpand failed: $t")
+        }
+    }
+
+    /**
+     * 从原通知 extras 抽出「当前会话」的消息子项（发送人 · 摘要 · 时间）。
+     * 单会话版：只取这一个 App 最新一条通知的 textLines / messages，不跨会话聚合。
+     */
+    private fun messageLinesOfRow(row: View?): List<MessageLine> {
+        val sbn = sbnOf(row) ?: return emptyList()
+        return try {
+            val notif = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+                ?: return emptyList()
+            val extras: Bundle = notif.extras ?: return emptyList()
+            val out = ArrayList<MessageLine>()
+
+            // ① textLines：每行「名字: 内容」
+            val lines = extras.getCharSequenceArray("android.textLines")
+            if (!lines.isNullOrEmpty()) {
+                for (l in lines) {
+                    val t = l.toString().trim()
+                    if (t.isBlank()) continue
+                    out.add(MessageLine("", t, ""))
+                }
+            }
+
+            // ② MessagingStyle messages：每条 sender + text + time
+            val msgs = extras.getParcelableArray("android.messages")
+            if (!msgs.isNullOrEmpty()) {
+                out.clear()
+                for (item in msgs) {
+                    val b = item as? Bundle ?: continue
+                    val sender = b.getCharSequence("sender")?.toString()
+                        ?: b.getCharSequence("text")?.toString().orEmpty()
+                    val text = b.getCharSequence("text")?.toString().orEmpty()
+                    val time = b.getLong("time", 0L)
+                    val t = if (time > 0) formatMsgTime(time) else ""
+                    out.add(MessageLine(sender, text, t))
+                }
+            }
+
+            // 上限 6 条，避免展开区过高
+            out.take(6)
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    private data class MessageLine(val sender: String, val text: String, val time: String)
+
+    private fun formatMsgTime(millis: Long): String {
+        val now = System.currentTimeMillis()
+        val diffMin = (now - millis) / 60000L
+        return when {
+            diffMin < 1 -> "刚刚"
+            diffMin < 60 -> "$diffMin 分钟前"
+            diffMin < 60 * 24 -> "${diffMin / 60} 小时前"
+            else -> "${diffMin / (60 * 24)} 天前"
+        }
+    }
+
+    /**
+     * 展开区 PopupWindow：半透明填充 + 投影 + 高光，深浅两套同规格（v3.15.91）。
+     * 纯代码构建 LinearLayout + TextView，不依赖 SystemUI 主题（自绘色值）。
+     */
+    private fun buildMessagePopup(
+        ctx: Context,
+        lines: List<MessageLine>,
+        night: Boolean,
+        density: Float,
+    ): PopupWindow {
+        val pad = (16 * density).toInt()
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+            background = GradientDrawable().apply {
+                cornerRadius = 22 * density
+                setColor(if (night) 0xEE1B1F26.toInt() else 0xF2FFFFFF.toInt())
+                setStroke(
+                    (1 * density).toInt(),
+                    if (night) 0x33FFFFFF else 0x33FFFFFF,
+                )
+            }
+            // 投影
+            elevation = 8 * density
+        }
+
+        val titleColor = if (night) ArkTokens.TEXT_PRIMARY_DARK else ArkTokens.TEXT_PRIMARY_LIGHT
+        val subColor = if (night) ArkTokens.TEXT_SECONDARY_DARK else ArkTokens.TEXT_SECONDARY_LIGHT
+
+        for (l in lines) {
+            val label = if (l.sender.isBlank()) l.text else {
+                if (l.text.isBlank()) l.sender else "${l.sender}：${l.text}"
+            }
+            if (label.isBlank()) continue
+            val tv = TextView(ctx).apply {
+                text = label
+                setTextColor(titleColor)
+                textSize = 12f * density
+                maxLines = 1
+                setSingleLine(true)
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setPadding(0, (4 * density).toInt(), 0, (4 * density).toInt())
+            }
+            root.addView(tv)
+        }
+
+        // 底部「查看全部 N 条消息」
+        val total = lines.size
+        val foot = TextView(ctx).apply {
+            text = "查看全部 $total 条消息"
+            setTextColor(subColor)
+            textSize = 11f * density
+            setPadding(0, (8 * density).toInt(), 0, 0)
+        }
+        root.addView(foot)
+
+        val popup = PopupWindow(root, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        popup.isOutsideTouchable = true
+        popup.isFocusable = false
+        popup.isClippingEnabled = false
+        return popup
     }
 
     /**
@@ -1566,20 +1995,21 @@ internal object ArkMiniBarStyleHook {
     }
 
     /**
-     * 空心圆只规范颜色：品牌色进度 + 可见外环 + 一级文字色，形状与进度逻辑完全不动。
+     * 空心圆只规范颜色：中性灰进度 + 可见外环 + 一级文字色，形状与进度逻辑完全不动。
      * 浅色玻璃上设计稿的 TRACK_LIGHT(#D9DEE7) 几乎与背景同色、空心圆轮廓消失，
      * 改用可读的中性灰 TEXT_SECONDARY，保证轮廓清晰（深色调沿用 TRACK_DARK）。
+     * v3.15.91：进度品牌蓝作废、改中性灰占位色（[ArkTokens.PLACEHOLDER_LIGHT/DARK]）。
      * 消息类会把它的 visibility 设成 GONE，这一层配色只对音乐 / 进度类可见。
      */
     private fun applyCircle(root: View, night: Boolean) {
         if (circleId == 0) return
         val circle = root.findViewById<View>(circleId) ?: return
         if (circle.javaClass.name != CIRCLE_CLS) return
-        val brand = if (night) ArkTokens.BRAND_DARK else ArkTokens.BRAND_LIGHT
+        val progress = if (night) ArkTokens.PLACEHOLDER_DARK else ArkTokens.PLACEHOLDER_LIGHT
         // 外环在浅色玻璃上需可见：用中性灰而非近白的 TRACK_LIGHT
         val track = if (night) ArkTokens.TRACK_DARK else ArkTokens.TEXT_SECONDARY_LIGHT
         val text = if (night) ArkTokens.TEXT_PRIMARY_DARK else ArkTokens.TEXT_PRIMARY_LIGHT
-        invokeInt(circle, "setProgressColor", brand)
+        invokeInt(circle, "setProgressColor", progress)
         invokeInt(circle, "setProgressBgColor", track)
         invokeInt(circle, "setTextColor", text)
     }
@@ -1735,10 +2165,9 @@ internal object ArkMiniBarStyleHook {
     private class ArkMiniIconView(
         ctx: Context,
         private val density: Float,
-        private val appIcon: Drawable,
+        private val appIcon: Drawable?,
     ) : View(ctx) {
 
-        private val corner = ArkTokens.RADIUS_CHIP_DP * density
         private val pad = ICON_PAD_DP * density
         private val badgeR = ArkTokens.BADGE_SIZE_DP * density / 2f
 
@@ -1747,23 +2176,27 @@ internal object ArkMiniBarStyleHook {
 
         private val discPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-        }
+        private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
         private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = ArkTokens.BRAND_ON_LIGHT
+            color = ArkTokens.PLACEHOLDER_ON
             textAlign = Paint.Align.CENTER
             typeface = Typeface.DEFAULT_BOLD
             textSize = baseLabelPx
         }
 
-        private val clipPath = Path()
         private val badgeRect = RectF()
         private val metrics = Paint.FontMetrics()
 
         /** 徽标文案；空串 = 不画徽标（取不到条数时不显示 0） */
         private var label: String = ""
+
+        var isNight: Boolean = false
+            set(value) {
+                if (field == value) return
+                field = value
+                invalidate()
+            }
 
         init {
             setWillNotDraw(false)
@@ -1785,23 +2218,28 @@ internal object ArkMiniBarStyleHook {
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
-            // ① 图标：只用 canvas 裁剪，不依赖 ViewOutlineProvider / clipToOutline
-            clipPath.reset()
-            clipPath.addRoundRect(pad, pad, w - pad, h - pad, corner, corner, Path.Direction.CW)
-            val save = canvas.save()
-            canvas.clipPath(clipPath)
-            appIcon.setBounds(
-                pad.toInt(),
-                pad.toInt(),
-                (w - pad).toInt(),
-                (h - pad).toInt(),
-            )
-            appIcon.draw(canvas)
-            canvas.restoreToCount(save)
+            // ① 图标：40×40 恒定槽，等比 contain 直画，不裁切、不 mask 圆角。
+            //    取不到 appIcon 时画中性灰实心占位块（无文字、无描边），槽位仍恒定。
+            if (appIcon == null) {
+                placeholderPaint.color =
+                    if (isNight) ArkTokens.PLACEHOLDER_DARK else ArkTokens.PLACEHOLDER_LIGHT
+                canvas.drawRoundRect(
+                    pad, pad, w - pad, h - pad,
+                    pad, pad, placeholderPaint,
+                )
+            } else {
+                appIcon.setBounds(
+                    pad.toInt(),
+                    pad.toInt(),
+                    (w - pad).toInt(),
+                    (h - pad).toInt(),
+                )
+                appIcon.draw(canvas)
+            }
 
             if (label.isEmpty()) return
 
-            // ② 徽标：**直径恒定**的正圆，锚在图标右上角，圆底 + 内侧白环。
+            // ② 徽标：**直径恒定**的正圆，锚在图标右上角（无描边，v3.15.91 去线）。
             //    两位数不许撑成胶囊（v3.15.48 用户验收：1 和 64 必须是同一个圆）。
             val badgeH = badgeR * 2f
             val right = w - BADGE_EDGE_DP * density
@@ -1811,17 +2249,9 @@ internal object ArkMiniBarStyleHook {
             discPaint.color = ArkTokens.DANGER
             canvas.drawRoundRect(badgeRect, badgeR, badgeR, discPaint)
 
-            val ring = BADGE_RING_DP * density
-            ringPaint.color = ArkTokens.BRAND_ON_LIGHT
-            ringPaint.strokeWidth = ring
-            val inset = ring / 2f
-            badgeRect.inset(inset, inset)
-            val innerR = (badgeR - inset).coerceAtLeast(0f)
-            canvas.drawRoundRect(badgeRect, innerR, innerR, ringPaint)
-
             // ③ 数字：放不下就等比缩字号（不撑宽），下限 8sp；Paint 直接上白色，
             //    不受 SystemUI 主题 / 深色模式影响（v3.15.48 自查：恒为白）
-            val avail = badgeH - 2f * ring - 2f * BADGE_TEXT_PAD_DP * density
+            val avail = badgeH - 2f * BADGE_TEXT_PAD_DP * density
             labelPaint.textSize = baseLabelPx
             val textW = labelPaint.measureText(label)
             if (textW > avail && textW > 0f) {
@@ -1844,8 +2274,6 @@ internal object ArkMiniBarStyleHook {
      */
     private class ArkMiniArrowView(ctx: Context, private val density: Float) : View(ctx) {
 
-        private val discPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-
         private val chevronPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
@@ -1854,6 +2282,9 @@ internal object ArkMiniBarStyleHook {
 
         private val path = Path()
 
+        /** 点击回调（由 ensureArrow 注入），在 onTouchEvent 的 UP 时触发 */
+        var onTap: (() -> Unit)? = null
+
         var isNight: Boolean = false
             set(value) {
                 if (field == value) return
@@ -1861,11 +2292,40 @@ internal object ArkMiniBarStyleHook {
                 invalidate()
             }
 
+        /** v3.15.91：展开态向上箭头 ^，折叠态向下 v */
+        var expanded: Boolean = false
+            set(value) {
+                if (field == value) return
+                field = value
+                invalidate()
+            }
+
         init {
-            // 红线②：不抢点击，事件冒泡到整行（原生点整行就展开）
-            isClickable = false
-            isFocusable = false
+            // v3.15.91：箭头接点击做展开/收起（消息类）；音乐/进度类不会挂这个 View。
+            isClickable = true
+            isFocusable = true
             importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    // 抢事件：阻止 Flyme 通知行父容器拦截，否则整行会把点击吞掉去打开微信
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    onTap?.invoke()
+                    performClick()
+                    return true
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+
+        override fun performClick(): Boolean {
+            super.performClick()
+            return true
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -1873,18 +2333,27 @@ internal object ArkMiniBarStyleHook {
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return
 
-            discPaint.color =
-                if (isNight) ArkTokens.TOUCH_SOFT_DARK else ArkTokens.TOUCH_SOFT_LIGHT
-            canvas.drawCircle(w / 2f, h / 2f, minOf(w, h) / 2f, discPaint)
+            // v3.15.92：去掉白色圆底 —— 设计稿右侧是纯 chevron，不带圆形背景。
+            // 之前画了 TOUCH_SOFT 圆底（用户指出「展开的背景颜色没去除」），这里只保留箭头。
 
             val cx = w / 2f
             val cy = h / 2f
+            // v3.15.92：View 是 44dp 触控热区，chevron 按 MINI_ARROW_DP=22dp 居中绘制，
+            // 视觉图标小于热区，点不准也能命中。
             val half = CHEVRON_HALF_DP * density
             val depth = CHEVRON_DEPTH_DP * density
             path.reset()
-            path.moveTo(cx - half, cy - depth)
-            path.lineTo(cx, cy + depth)
-            path.lineTo(cx + half, cy - depth)
+            if (expanded) {
+                // 向上 ^：尖在上方
+                path.moveTo(cx - half, cy + depth)
+                path.lineTo(cx, cy - depth)
+                path.lineTo(cx + half, cy + depth)
+            } else {
+                // 向下 v：尖在下方
+                path.moveTo(cx - half, cy - depth)
+                path.lineTo(cx, cy + depth)
+                path.lineTo(cx + half, cy - depth)
+            }
             chevronPaint.color = if (isNight) {
                 ArkTokens.TEXT_SECONDARY_DARK
             } else {
@@ -1896,7 +2365,8 @@ internal object ArkMiniBarStyleHook {
     }
 
     /**
-     * 迷你条玻璃：垂直渐变（angle 270 等价 TOP_BOTTOM）+ 全圆角 + 1dp 高光描边。
+     * 迷你条玻璃：垂直渐变（angle 270 等价 TOP_BOTTOM）+ 全圆角。
+     * v3.15.91：全部去线 —— 不再 1dp 高光描边（用户拍板）。
      * 色值全部取自 [ArkTokens]，与 `bg_ark_panel.xml` 的 `@color/ark_glass_*` 同源。
      * 单独一个子类只是为了识别「这层是我们加的」，从而不覆盖系统后设的背景。
      */
@@ -1910,10 +2380,6 @@ internal object ArkMiniBarStyleHook {
         init {
             // 兜底半径：bounds 就绪后由 onBoundsChange 按实际高度取全圆角
             cornerRadius = ArkTokens.RADIUS_PILL_DP * density
-            setStroke(
-                (ArkTokens.STROKE_DP * density).toInt().coerceAtLeast(1),
-                if (night) ArkTokens.HIGHLIGHT_DARK else ArkTokens.HIGHLIGHT_LIGHT,
-            )
         }
 
         /** 设计稿的 RadiusPill = 全圆角；按实测高度取一半，44dp 高时正好 22dp */

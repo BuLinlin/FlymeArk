@@ -74,6 +74,13 @@ internal object ArkTokens {
     const val BRAND_ON_LIGHT = 0xFFFFFFFF.toInt()
     const val BRAND_ON_DARK = 0xFF0B1730.toInt()
 
+    // v3.15.91：迷你条品牌色作废后的中性灰占位（图标兜底 / 进度 / 转向块 / 前景白）。
+    // 注意：BRAND_* 仍是消息胶囊 / 面板 / 导航展开卡链路的令牌（作废范围只限迷你条），
+    // 所以它们保留不删，只在 ArkMiniBarStyleHook 内把迷你条引用切换到下面这组中性色。
+    const val PLACEHOLDER_LIGHT = 0xFF8A9099.toInt()
+    const val PLACEHOLDER_DARK = 0xFFAAB3C2.toInt()
+    const val PLACEHOLDER_ON = 0xFFFFFFFF.toInt()
+
     // v3.15.46：品牌容器色（设计稿 Light.BrandContainer / Dark.BrandContainer）。
     // 本体只作设计稿镜像（XML 侧对应 @color/ark_brand_container），CTA 用的是下面 60% 档。
     const val BRAND_CONTAINER_LIGHT = 0xFFE7EEFF.toInt()
@@ -149,14 +156,17 @@ internal object ArkTokens {
     const val MINI_ICON_GAP_DP = 12
 
     /**
-     * 右侧展开箭头圆底直径。
-     *
-     * v3.15.47 曾取 44dp（= 原生空心圆实测尺寸）；v3.15.48 玻璃收成内嵌胶囊后
-     * 胶囊高度只有 52 - 2×4 = 44dp，44dp 圆会顶满整高，按设计稿「箭头 42px / 条高 54px = 0.78」
-     * 等比折算改成 34dp（44 × 0.78 ≈ 34）。
-     * 触控由整行承担（header 高 52dp > [MIN_TOUCH_DP]），不靠这个圆。
+     * 右侧展开箭头视觉直径（chevron 绘制尺寸）。
+     * v3.15.92：去圆底后纯 chevron，22dp 作为视觉图标尺寸。
      */
-    const val MINI_ARROW_DP = 34
+    const val MINI_ARROW_DP = 22
+
+    /**
+     * 右侧箭头触控热区直径（v3.15.92）。
+     * 视觉 chevron 只有 22dp，但点击热区要 ≥44dp 才符合触控规范 —— 这里把箭头 View
+     * 撑到 44dp，chevron 在内部居中绘制，点不准也能命中。
+     */
+    const val MINI_ARROW_TOUCH_DP = 44
 
     /** 未读徽标直径：设计稿 15px / 图标 38px → 40dp 图标折算 15.8dp */
     const val BADGE_SIZE_DP = 16
@@ -226,6 +236,15 @@ internal object ArkTokens {
     const val TURN_TOP = 0xFF3D77FF.toInt()
     const val TURN_MID = 0xFF2F6BFF.toInt()
     const val TURN_BOTTOM = 0xFF2455D6.toInt()
+
+    /**
+     * 迷你条转向块三档中性灰（v3.15.91）：三档蓝作废、改中性灰，
+     * 同 160°、同 0 / 62% / 100% stop。展开卡 [ArkNavTurnBlockView] 仍用上面的
+     * [TURN_TOP] 系蓝 —— 品牌色作废范围只限迷你条。
+     */
+    const val TURN_NEUTRAL_TOP = 0xFF9AA1AC.toInt()
+    const val TURN_NEUTRAL_MID = 0xFF8A9099.toInt()
+    const val TURN_NEUTRAL_BOTTOM = 0xFF7A8089.toInt()
 
     /** 转向块 52dp 圆角 16dp */
     const val RADIUS_TURN_DP = 16

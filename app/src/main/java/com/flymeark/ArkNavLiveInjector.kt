@@ -520,6 +520,18 @@ internal object ArkNavLiveInjector {
     /** 全程距离单位：`"公里"` / `"米"` */
     private var totalDistUnit = "公里"
 
+    /**
+     * 剩余路程数值（v3.15.92，导航副标题第二段）。
+     *
+     * 骑行 / 步行界面那句「剩余距离X公里」会随行进**递减**，[parseUiTripLine] 每帧把它
+     * 写进来；与 [totalDistValue]（首见即定的全程）分家，两个数各归各位。
+     * 空串 = 本趟还没拿到剩余（驾车模式没有这路数据）→ 副标题回落 [distPair] 的全程值。
+     */
+    private var remainDistValue = ""
+
+    /** 剩余路程单位：`"公里"` / `"米"` */
+    private var remainDistUnit = "公里"
+
     /** 总耗时数值：`"27"` / `"2"` */
     private var totalTimeValue = ""
 
@@ -1097,6 +1109,10 @@ internal object ArkNavLiveInjector {
             val distPair = distPair()
             se.putString(ArkConstants.NAV_KEY_DIST, distPair.first)
             se.putString(ArkConstants.NAV_KEY_DIST_UNIT, distPair.second)
+            // v3.15.92：副标题第二段「剩余路程」。骑行/步行有随行进递减的剩余，驾车回落全程。
+            val remainDist = remainDistPair()
+            se.putString(ArkConstants.NAV_KEY_REMAIN_DIST, remainDist.first)
+            se.putString(ArkConstants.NAV_KEY_REMAIN_DIST_UNIT, remainDist.second)
             // v3.15.65：「耗时」栏是**剩余**耗时（分钟），不再是出发那一刻的全程总耗时。
             val remainPair = remainTimePair()
             se.putString(ArkConstants.NAV_KEY_TIME, remainPair.first)
@@ -2239,6 +2255,19 @@ internal object ArkNavLiveInjector {
         else -> totalDistValue to totalDistUnit
     }
 
+    /**
+     * 「剩余路程」的值 + 单位（v3.15.92，导航副标题第二段，与「剩余耗时」用 `·` 并列）。
+     *
+     * 骑行 / 步行那串「剩余距离X公里」随行进递减，[parseUiTripLine] 每帧写进
+     * [remainDistValue]；驾车模式没有这路数据（只播「全程X公里」），此时回落全程值，
+     * 保证副标题两段并列不缺位。单位保持与 [distPair] 同一族（公里 / 米），不做 `km` 转写
+     * —— 那是 SystemUI 展示层的自由，载荷只给「数值 + 单位」这一套与三格一致的口径。
+     */
+    private fun remainDistPair(): Pair<String, String> = when {
+        remainDistValue.isNotEmpty() -> remainDistValue to remainDistUnit
+        else -> distPair()
+    }
+
     /** 目的地（v3.15.66 起带跨趟兜底）：本趟 > 上一趟 > 空（面板回落「高德地图」） */
     private fun destTextForPayload(): String =
         if (destText.isNotEmpty()) destText else lastDest
@@ -2265,11 +2294,14 @@ internal object ArkNavLiveInjector {
      */
     private fun shadowSigOf(content: String, remainPair: Pair<String, String>): String = try {
         val dist = distPair()
+        val remainDist = remainDistPair()
         listOf(
             content,
             destTextForPayload(),
             dist.first,
             dist.second,
+            remainDist.first,
+            remainDist.second,
             remainPair.first,
             remainPair.second,
             etaText,
@@ -2491,6 +2523,8 @@ internal object ArkNavLiveInjector {
         navStartedAt = 0L
         totalDistValue = ""
         totalDistUnit = "公里"
+        remainDistValue = ""
+        remainDistUnit = "公里"
         totalTimeValue = ""
         totalTimeUnit = "分钟"
         totalMs = 0L
@@ -2533,6 +2567,9 @@ internal object ArkNavLiveInjector {
         textBufTotalsHit = false
         lastUiTripSig = ""
         lastUiRepostAt = 0L
+        // v3.15.90：整行去重指纹必须跟着复位，否则「重开同一条路线」时首帧的
+        // 整行和上一趟末帧一模一样，会被去重挡掉 → 三格整趟不刷新。
+        lastLabelRow = ""
         synchronized(uiTripLock) { uiCandLog.clear() }
         // v3.15.86：取证包的「每趟一次」状态一起复位。
         // [diagBuf] 必须跟着清：它既是去重表也是本趟的证据集，
@@ -3518,10 +3555,58 @@ internal object ArkNavLiveInjector {
     /** 三格拼一行的整串上限（`剩余距离9.2公里预计需要36分钟17:44到达` 是 24 字，留足余量到 60） */
     private const val UI_TRIP_LINE_MAX = 60
 
+    // ---- v3.15.90：步行顶栏「9 个独立 Label」拼回整串 ----
+    //
+    // 真机取证 `VPROBE-LOCALE[3s]`（qa_tmp/logs 一带）：步行顶部那一行不是
+    // `剩余距离…到达` 一整串，而是 9 个 AJX3 Label：
+    //
+    //   9.3 | 公里 | · | 2 | 小时 | 22 | 分 | 20:24 | 到达
+    //
+    // 3.15.88 把每个 Label 的 setText 各自喂给 [parseUiTrip] 单格通道，于是
+    // `dist` / `time` / `eta` 分别来自不同帧、互相错位；`20:24` 与 `到达` 分列两格时
+    // [UI_ETA_RE] 又永远抓不到 ETA。本版改成「回读同父兄弟 → 拼成整行 → 一次写全三格」。
+    //
+    // 下面这一组常量 + [assembleLabelTripLine] 是**纯字符串规则**，不引用任何 Android API，
+    // QA 可以把它们整体复制到脚本里独立验证（见 `qa_tmp/ui_label_row_check.py`）。
+
+    /** 单个 Label 文本的长度上限（三格行的碎片最长也就 `2小时22分·9.3公里` 这种 11 字） */
+    private const val UI_LABEL_PART_MAX = 16
+
+    /** 组装一行至少要几个碎片（一行有 9 个，留足余量到 5） */
+    private const val UI_LABEL_PART_MIN = 5
+
+    /** 时刻锚点往前 / 往后各取几段（往前覆盖距离 + 耗时，往后覆盖「到达」） */
+    private const val UI_LABEL_ROW_BACK = 10
+    private const val UI_LABEL_ROW_FWD = 2
+
+    /** 三格行碎片允许出现的字符（数字 / 时刻 / 单位 / 分隔符 / 到达 / 剩余 / 预计需要） */
+    private const val UI_LABEL_PART_CHARS = "0123456789.:：公里千米米小时分钟分到达剩余预计需要·•,，、"
+
+    /** 从触发 Label 最多向上找几层「同一行容器」 */
+    private const val UI_LABEL_CLIMB_MAX = 3
+
+    /** 每层容器 BFS 的节点上限（绝非无条件遍历整棵 DecorView 树） */
+    private const val UI_LABEL_SCAN_MAX = 64
+
     /**
-     * 高德导航页底部卡片三格的整串描述（**不加 `^` / `$`**）。
+     * 步行顶栏把三格拆成多个 Label 时的分隔符集合（v3.15.90）。
      *
-     * 刻意不锚定：高德以后在这串前面加个「距终点」之类的前缀，一锚就又废了。
+     * `·` 是一个独立 Label，不是空白，原正则的 `\s*` 吃不掉它 —— 所以 [UI_TRIP_LINE_RE]
+     * 在这些位置一律用这一族代替 `\s*`。顺带容忍全角逗号 / 顿号 / 竖线，高德换皮时不至于又废掉。
+     */
+    private const val UI_ROW_SEP = "[·•|,，、\\s]*"
+
+    /**
+     * 高德导航页三格的整串描述（**不加 `^` / `$`**，v3.15.84 建，v3.15.90 放宽前缀）。
+     *
+     * 刻意不锚定：高德以后在这串前面加个「距终点」之类的前缀，一锚就又废了；
+     * 步行顶栏还会混入前后其它 Label 的文本，不锚定正好让 `find` 自己圈出这一行。
+     *
+     * v3.15.90 的两处放宽（**捕获组索引一个没动**，[parseUiTripLine] 因此一行不改）：
+     *  1. `剩余距离` / `预计需要` 改成可选前缀 —— 步行顶栏没有这两个词，
+     *     拼出来直接是 `9.3公里·2小时22分20:24到达`；骑行底部卡片仍带这两个词，照常命中；
+     *  2. 原来三处 `\s*` 换成 [UI_ROW_SEP] —— 吃掉独立成 Label 的 `·`。
+     *
      * 分组：
      *  - g1 / g2：距离数值 + 单位（`9.2` / `公里`）
      *  - g3 / g4：耗时数值 + 单位（`36` / `分钟`，或 `1` / `小时`）
@@ -3529,11 +3614,85 @@ internal object ArkNavLiveInjector {
      *  - g7：到达时刻（`17:44`）
      */
     private val UI_TRIP_LINE_RE = Regex(
-        "剩余距离\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(公里|千米|米)\\s*" +
-            "预计需要\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(小时|分钟|分)" +
-            "(?:\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(分钟|分))?\\s*" +
+        "(?:剩余距离)?\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(公里|千米|米)$UI_ROW_SEP" +
+            "(?:预计需要)?\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(小时|分钟|分)" +
+            "(?:$UI_ROW_SEP($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(分钟|分))?$UI_ROW_SEP" +
             "(\\d{1,2}[:：]\\d{2})\\s*到达"
     )
+
+    /**
+     * 把「同一父容器下按 child 顺序回读到的 AJX3 Label 文本」拼回一行三格描述（v3.15.90）。
+     *
+     * **纯字符串处理**：不引用任何 Android API、不读写任何成员状态，QA 可以直接把这段
+     * 复制进脚本（或按同一规则用 Python 复刻）独立验证。
+     *
+     * ## 原子性从哪来（**这里不做任何跨回调累积**）
+     *
+     * 入参是 [readLabelRow] 在**同一个调用栈里**一次性回读的同父兄弟 `getText()` 快照；
+     * 本函数没有字段、不缓存上一次的文本，跨帧的旧值根本进不来。拼出的整串交给
+     * [parseUiTripLine] **一次**解析并**一次**写全三格，不再由多个 setText 回调分头写字段。
+     *
+     * ## 清洗规则
+     *
+     *  1. 每段 `trim()` 后删掉段内所有空白字符（`9.3 公里` → `9.3公里`）；
+     *  2. 空段 / 超过 [UI_LABEL_PART_MAX] 字的段丢弃（那是别处的说明文案，不是这一行碎片）；
+     *  3. 段里只要有一个字符不在 [UI_LABEL_PART_CHARS] 白名单里，整段丢弃
+     *     —— POI 名、按钮文案（「搜索」「杭州东站」…）全被剔掉，避免把整棵树的
+     *     杂 Label 拼进来撑爆 [UI_TRIP_LINE_MAX]；
+     *  4. 以**最后一个时刻段**（含数字且含 `:` / `：`）为锚，只取它前面
+     *     [UI_LABEL_ROW_BACK] 段 + 后面 [UI_LABEL_ROW_FWD] 段的窗口。三格行的 9 个
+     *     Label 在 child 顺序里连续，`到达` 紧跟时刻，窗口正好圈住这一行；
+     *  5. 窗口内各段**不加分隔符**直接拼（`·` 自己就是一个段，由 [UI_ROW_SEP] 容忍）。
+     *
+     * @param parts 同一父容器下按 child 顺序读到的 Label 文本（允许夹杂其它 Label）
+     * @return 紧凑整串；碎片太少 / 找不到时刻锚 / 超长都返回 null（调用方据此回退旧通道）
+     */
+    private fun assembleLabelTripLine(parts: List<String>): String? {
+        val clean = ArrayList<String>(parts.size)
+        for (p in parts) {
+            val t = p.trim()
+            if (t.isEmpty() || t.length > UI_LABEL_PART_MAX) continue
+            val seg = StringBuilder(t.length)
+            for (c in t) {
+                if (!c.isWhitespace()) seg.append(c)
+            }
+            val compact = seg.toString()
+            if (compact.isEmpty() || compact.length > UI_LABEL_PART_MAX) continue
+            if (!isLabelRowPart(compact)) continue
+            clean.add(compact)
+        }
+        if (clean.size < UI_LABEL_PART_MIN) return null
+
+        // 锚点：最后一个「像 HH:mm」的段（同时含数字与冒号）
+        var clockIdx = -1
+        for (i in clean.indices) {
+            val t = clean[i]
+            var digit = false
+            var colon = false
+            for (c in t) {
+                if (c in '0'..'9') digit = true
+                if (c == ':' || c == '：') colon = true
+            }
+            if (digit && colon) clockIdx = i
+        }
+        if (clockIdx < 0) return null
+
+        val from = (clockIdx - UI_LABEL_ROW_BACK).coerceAtLeast(0)
+        val to = (clockIdx + UI_LABEL_ROW_FWD).coerceAtMost(clean.size)
+        val out = StringBuilder(UI_TRIP_LINE_MAX)
+        for (i in from until to) out.append(clean[i])
+        val line = out.toString()
+        if (line.isEmpty() || line.length > UI_TRIP_LINE_MAX) return null
+        return line
+    }
+
+    /** 这一段是不是「三格行的碎片」：所有字符都必须落在 [UI_LABEL_PART_CHARS] 白名单里 */
+    private fun isLabelRowPart(t: String): Boolean {
+        for (c in t) {
+            if (c !in UI_LABEL_PART_CHARS) return false
+        }
+        return true
+    }
 
     /**
      * 裸 `NN米` 的距离下限（无「剩余 / 全程」前缀时）。
@@ -3583,6 +3742,31 @@ internal object ArkNavLiveInjector {
 
     /** 上一次因界面文案重投影子的时刻（节流用） */
     private var lastUiRepostAt = 0L
+
+    // ---- v3.15.90：步行顶栏「同父兄弟快照」组装通道的状态 ----
+
+    /** [labelRowPending] / [labelRowAnchor] / [labelRowFallback] 的锁（hook 线程与主线程各写一半） */
+    private val labelRowLock = Any()
+
+    /** 本轮刷新是否已经挂过一次扫描（一帧内 9 个 Label 的 setText 只挂一次） */
+    @Volatile
+    private var labelRowPending = false
+
+    /** 触发扫描的那个 Label（弱引用，绝不许拽住界面） */
+    @Volatile
+    private var labelRowAnchor: WeakReference<View>? = null
+
+    /** 组装失败时要回退给旧通道的原文（空串 = 本来就不会进 [rememberText]） */
+    @Volatile
+    private var labelRowFallback = ""
+
+    /** 上一次组装出的整行（去重，同一行不重复解析；[resetNavPayload] 里跟着复位） */
+    @Volatile
+    private var lastLabelRow = ""
+
+    /** 整行组装通道真正解析成功的次数（日志用） */
+    @Volatile
+    private var labelRowHits = 0L
 
     // ---- 导航**之前**看到的最后一组界面数字（路线页 / 方式页） ----
     //
@@ -3717,14 +3901,25 @@ internal object ArkNavLiveInjector {
         if (navState == STATE_ENDING) return true
         var changed = false
 
-        // ---- 距离：首见即定，后续「剩余距离」不覆盖 ----
+        // ---- 距离 ----
+        // ① 全程：首见即定 —— 首趟那一刻剩余 = 全程，之后递减的「剩余距离」绝不许覆盖。
+        // ② 剩余：每帧都写 —— 这句「剩余距离X公里」本身就是**剩余路程**，随行进往下掉，
+        //    正是副标题第二段要的数（v3.15.92），与全程分家写，两数各归各位。
         val dv = uiNum(m.groupValues[1])
-        if (dv != null && dv > 0.0 && totalDistValue.isEmpty()) {
+        if (dv != null && dv > 0.0) {
             var unit = m.groupValues[2]
             if (unit == "千米") unit = "公里"
-            totalDistValue = ArkNavParse.fmtNum(dv)
-            totalDistUnit = unit
-            changed = true
+            val fmt = ArkNavParse.fmtNum(dv)
+            if (totalDistValue.isEmpty()) {
+                totalDistValue = fmt
+                totalDistUnit = unit
+                changed = true
+            }
+            if (fmt != remainDistValue || unit != remainDistUnit) {
+                remainDistValue = fmt
+                remainDistUnit = unit
+                changed = true
+            }
         }
 
         // ---- 耗时 ----
@@ -3969,14 +4164,16 @@ internal object ArkNavLiveInjector {
         try {
             val sig = listOf(
                 totalDistValue, totalDistUnit, totalTimeValue, totalTimeUnit,
+                remainDistValue, remainDistUnit,
                 tripTotalMs.toString(), remainMs.toString(), etaText
             ).joinToString("\u0001")
             if (sig == lastUiTripSig) return
             lastUiTripSig = sig
             val dist = if (totalDistValue.isEmpty()) "--" else "$totalDistValue$totalDistUnit"
+            val remainDist = if (remainDistValue.isEmpty()) "--" else "$remainDistValue$remainDistUnit"
             val time = if (totalTimeValue.isEmpty()) "--" else "$totalTimeValue$totalTimeUnit"
             log(
-                "uiTrip: from='$raw' dist=$dist time=$time " +
+                "uiTrip: from='$raw' dist=$dist remainDist=$remainDist time=$time " +
                     "tripTotal=${tripTotalMs}ms remain=${remainMs}ms " +
                     "eta=${etaText.ifEmpty { "--" }} " +
                     "hit=$uiTripHits setText=$uiScanText cand=$uiScanCand"
@@ -4536,15 +4733,22 @@ internal object ArkNavLiveInjector {
     }
 
     /**
-     * hook AJX3 `Label.setText`，把文字喂给现有解析器（v3.15.88 取数版，不再是探针）。
+     * hook AJX3 `Label.setText`，把文字喂给现有解析器（v3.15.88 取数版，v3.15.90 整行版）。
      *
      * `Label` 继承 `android.view.View` 且自绘，`setText(String)` 是它的**实时更新入口**。
-     * 抓到的串交给 [rememberText] —— 那条链里 `uiTripPrefilter` → [parseUiTrip] →
-     * [parseUiTripLine] 全在，所以步行如果是 `剩余距离…到达` 整串会被 3.15.84 的正则接住，
-     * 如果是 `8.2公里` 单格也会被单格正则接住。
      *
-     * 铁律：这里**只读** —— 只调 [rememberText] 喂解析器，不直接写任何载荷字段；
-     * 写入规则仍全部留在 [parseUiTrip] / [parseUiTripLine]。
+     * v3.15.88 把每个 Label 的文本单独喂给 [rememberText] → [parseUiTrip]。骑行 / 步行
+     * 底部卡片那种 `剩余距离…到达` 整串能被 3.15.84 的 [UI_TRIP_LINE_RE] 接住，但
+     * **步行顶栏是 9 个独立 Label**（`9.3|公里|·|2|小时|22|分|20:24|到达`），
+     * 单格通道会让 `dist` / `time` 来自不同帧、互相错位，`20:24` 与 `到达` 分列又让
+     * [UI_ETA_RE] 永远抓不到 ETA。
+     *
+     * v3.15.90：短碎片改走 [scheduleLabelRowScan] —— 回读**同一父容器**下兄弟 Label
+     * 的当前 `getText()` 拼成整行，交给 [parseUiTripLine] 一次写全三格；其余文案
+     * （长串 / 独立转向文案）仍按 3.15.88 的原样走 [rememberText]，一个字节不改。
+     *
+     * 铁律：这里**只读** —— 不直接写任何载荷字段；写入规则仍全部留在
+     * [parseUiTrip] / [parseUiTripLine]。
      */
     private fun hookAjxLabelText() {
         val cls = labelCls ?: return
@@ -4555,18 +4759,181 @@ internal object ArkNavLiveInjector {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
                             val s = param.args.firstOrNull() as? String ?: return
-                            if (s.length !in 2..60) return
-                            if (!looksLikeNavText(s)) return
-                            rememberText(s)
+                            val view = param.thisObject as? View ?: return
+                            // v3.15.90：短碎片（数字 / 单位 / 时刻 / 到达）→ 回读同父兄弟拼整行。
+                            // 这道闸是零分配字符扫描，挡掉绝大多数 setText 后才允许碰 View 树。
+                            if (s.length in 1..UI_LABEL_PART_MAX && isLabelRowFragment(s)) {
+                                // 不是三格行时要回退到 3.15.88 的旧通道，且保持它的两道闸不变。
+                                val fallback =
+                                    if (s.length in 2..60 && looksLikeNavText(s)) s else ""
+                                scheduleLabelRowScan(view, fallback)
+                                return
+                            }
+                            // 3.15.88 原通道（长串 / 独立转向文案）：一个字节都不改。
+                            if (s.length in 2..60 && looksLikeNavText(s)) rememberText(s)
                         } catch (_: Throwable) {
                         }
                     }
                 }
             )
-            probeRaw("ajx label: hooked Label.setText")
+            probeRaw("ajx label: hooked Label.setText (row-assemble v3.15.90)")
         } catch (t: Throwable) {
             probeRaw("ajx label: hook failed (${t.javaClass.simpleName})")
         }
+    }
+
+    /**
+     * 廉价预筛：这条 Label 文本像不像「三格行的一个碎片」（v3.15.90）。
+     *
+     * 与 [looksLikeNavText] 不是一回事：后者要求「整条里同时有数字 + 量词」，
+     * 而步行那 9 个 Label 是 `9.3` / `公里` / `·` / `到达` 这种**单碎片**，
+     * 用后者一个都过不了。这里只做一次字符扫描，命中 [UI_LABEL_PART_CHARS]
+     * 里任意一个字符就放行。零分配，挡在高德每秒几百次 setText 的最前面 ——
+     * 只有过了这一刀，[scheduleLabelRowScan] 才会去碰 View 树。
+     */
+    private fun isLabelRowFragment(s: CharSequence): Boolean {
+        val n = s.length
+        if (n !in 1..UI_LABEL_PART_MAX) return false
+        for (i in 0 until n) {
+            if (s[i] in UI_LABEL_PART_CHARS) return true
+        }
+        return false
+    }
+
+    /**
+     * 把「本轮刷新」的多次 setText 合并成**一次**整行扫描（v3.15.90）。
+     *
+     * ## 同帧原子性怎么保证
+     *
+     * 步行那一行是 9 个独立 Label，高德一轮刷新会连着调 9 次 setText。若每次回调都
+     * 各自回读兄弟，前几次读到的还是上一帧尚未刷新的值 —— 这正是「跨帧错位」的成因。
+     * 这里用主线程 Handler 把扫描推迟到**当前消息跑完**：一帧内只挂一次
+     * （[labelRowPending]），等这 9 次 setText 全部落地后再回读 View 树，拿到的是
+     * 本轮的完整快照；三格随后由 [parseUiTripLine] 在同一次调用里一起写出。
+     *
+     * **绝不累积文本缓冲**：[labelRowFallback] 只存「组装失败时回退用的一条原文」，
+     * 不存任何历史碎片；真正参与组装的只有 [readLabelRow] 在扫描那一刻从 View 树上
+     * 现读的 `getText()`。跨帧旧值没有载体，因此不可能混进本次组装。
+     *
+     * @param anchor 触发扫描的 Label（用于找同父容器）
+     * @param fallback 组装失败时回退给 [rememberText] 的原文；空串表示原本不会走旧通道
+     */
+    private fun scheduleLabelRowScan(anchor: View, fallback: String) {
+        var scheduled = false
+        synchronized(labelRowLock) {
+            if (!labelRowPending) {
+                labelRowPending = true
+                labelRowAnchor = WeakReference(anchor)
+                labelRowFallback = fallback
+                scheduled = true
+            }
+        }
+        if (!scheduled) return
+        try {
+            Handler(Looper.getMainLooper()).post {
+                val snap: Pair<View?, String> = synchronized(labelRowLock) {
+                    labelRowPending = false
+                    val a = labelRowAnchor?.get()
+                    val f = labelRowFallback
+                    labelRowAnchor = null
+                    labelRowFallback = ""
+                    a to f
+                }
+                try {
+                    val target = snap.first
+                    val line = if (target != null) readLabelRow(target) else null
+                    if (line == null) {
+                        if (snap.second.isNotEmpty()) rememberText(snap.second)
+                    } else if (line != lastLabelRow) {
+                        lastLabelRow = line
+                        // 只在导航中启用整行通道：导航前的 uiPre* 快照仍由 3.15.82 的
+                        // 单格通道负责，不能让它被整行通道抢走（否则换方式搬运的闸会失灵）。
+                        val handled = navActive && parseUiTripLine(
+                            line, SystemClock.elapsedRealtime()
+                        )
+                        if (handled) {
+                            labelRowHits++
+                            log("uiLabelRow: line='$line' hit=$labelRowHits")
+                        } else if (snap.second.isNotEmpty()) {
+                            rememberText(snap.second)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+            synchronized(labelRowLock) { labelRowPending = false }
+        }
+    }
+
+    /**
+     * 回读触发 Label 所在「同一行容器」下所有兄弟 Label 的**当前** `getText()`（v3.15.90）。
+     *
+     * 从 anchor 的 parent 起最多上溯 [UI_LABEL_CLIMB_MAX] 层，每层做一次**限节点数**的
+     * BFS（[UI_LABEL_SCAN_MAX]），按 child 顺序收集 Label 后代的文本。取第一个能
+     * [assembleLabelTripLine] 成整行的容器，避免把整棵 DecorView 树都翻一遍。
+     *
+     * 这是**同步快照**：一次调用栈里读完就拼，中间不跨帧、不缓存、不累积缓冲。
+     */
+    private fun readLabelRow(anchor: View): String? {
+        val cls = labelCls ?: return null
+        var container: View? = try {
+            anchor.parent as? View
+        } catch (_: Throwable) {
+            null
+        }
+        var level = 0
+        while (container != null && level < UI_LABEL_CLIMB_MAX) {
+            val parts = collectLabelTexts(container, cls)
+            if (parts.size >= UI_LABEL_PART_MIN) {
+                val line = assembleLabelTripLine(parts)
+                if (line != null) return line
+            }
+            val current = container
+            container = try {
+                current.parent as? View
+            } catch (_: Throwable) {
+                null
+            }
+            level++
+        }
+        return null
+    }
+
+    /** 限节点数的 BFS，按 child 顺序收集 Label 后代的 `getText()`（全 try/catch，宿主进程不许崩） */
+    private fun collectLabelTexts(root: View, cls: Class<*>): List<String> {
+        val out = ArrayList<String>(UI_LABEL_SCAN_MAX / 4)
+        val queue = ArrayDeque<View>()
+        queue.addLast(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < UI_LABEL_SCAN_MAX) {
+            val v = queue.removeFirst()
+            visited++
+            if (cls.isInstance(v)) {
+                val t = try {
+                    XposedHelpers.callMethod(v, "getText")?.toString().orEmpty()
+                } catch (_: Throwable) {
+                    ""
+                }
+                if (t.isNotEmpty()) out.add(t)
+            }
+            if (v is ViewGroup) {
+                val cn = try {
+                    v.childCount
+                } catch (_: Throwable) {
+                    0
+                }
+                for (i in 0 until cn) {
+                    val c = try {
+                        v.getChildAt(i)
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    if (c != null) queue.addLast(c)
+                }
+            }
+        }
+        return out
     }
 
     /**
