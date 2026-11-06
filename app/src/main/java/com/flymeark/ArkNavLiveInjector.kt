@@ -92,11 +92,34 @@ internal object ArkNavLiveInjector {
     /** 胶囊底色：沿用模块品牌蓝，字色按底色亮度自适应（与消息卡同一套规则） */
     private const val CAPSULE_BG = ArkTokens.BRAND_LIGHT
 
-    /** 胶囊文案长度上限：胶囊区很窄，太长的播报句在 UI 上会被硬截断，这里主动收口 */
-    private const val MAX_CAPSULE_TEXT = 40
+    /**
+     * 胶囊文案长度上限。
+     *
+     * v3.15.56 从 40 降到 24：真机验证（v3.15.55）发现胶囊区实际只能舒服地显示
+     * 一句指令，40 字在胶囊里会被硬截断，还不如自己收口。
+     */
+    private const val MAX_CAPSULE_TEXT = 24
 
-    /** 提取候选串时要去掉的边缘字符（高德的 `data` / `groupData` 分句常带前后逗号） */
-    private val TRIM_CHARS = charArrayOf(',', '，', ' ', '\u3000', '、', '。')
+    /**
+     * 纯数字串。
+     *
+     * 高德偶尔把资源 id 当文案塞进 `AudioPlayerTask.data`（真机见过 `2131558436`），
+     * 这种串一旦写进胶囊就是一个莫名其妙的数字，必须挡掉。
+     */
+    private val PURE_DIGITS = Regex("^\\d+$")
+
+    /**
+     * 转向 / 动作关键词。命中这些词的段落才算「指令」，优先展示。
+     *
+     * 排序上「靠左行驶 / 靠右行驶」放在「靠左 / 靠右」之后没有影响 —— 这里用的是
+     * `contains` 逐个试，只要任一词命中即可，不做最长匹配（`靠右行驶` 里必然也含 `靠右`）。
+     */
+    private val TURN_KEYWORDS = arrayOf(
+        "左转", "右转", "直行", "掉头",
+        "靠左", "靠右", "靠左行驶", "靠右行驶",
+        "向左", "向右", "向左前方", "向右前方",
+        "进入", "驶入", "上桥", "下桥", "上匝道", "下匝道"
+    )
 
     /**
      * 无信息量的播报句（欢迎语 / 状态播报 / 启动语）。
@@ -495,13 +518,13 @@ internal object ArkNavLiveInjector {
      * pcm type=0 data='高德地图持续为您导航'  group='["高德地图持续为您导航"]'
      * ```
      *
-     * 取法（按优先级）：
-     *  1. `groupData` 是**这一轮播报的分句数组**，取最后一个非空元素 → 它就是「即将播报」的那句；
-     *  2. 该元素内部还带逗号时（高德会把整段并成一条），再取第一个分句 —— 播报顺序是
-     *     从前到后，所以第一个分句才是此刻该开口的那句（「全程八公里,大约…,右转」→「全程八公里」）；
-     *  3. 第 1/2 步的结果没过筛（过短 / 噪音词）→ 退回 `data` 再试一次
-     *     （两者有时不是同一句：`data` 单句、`groupData` 是整段队列）；
-     *  4. 都不过 → 返回 null，胶囊保持上一句有效指令。
+     * 取候选串的顺序：
+     *  1. `groupData` 是这一轮播报的分句数组 → 取**最后一个非空元素**（它才是此刻要播的）；
+     *  2. 第一个候选没过筛（纯数字 / 噪音 / 空）→ 退回 `data` 再试一次
+     *     （真机上两者不是同一句：`data` 是单句、`groupData` 是整段队列）；
+     *  3. 都不过 → 返回 null，胶囊保持上一句有效指令。
+     *
+     * 真正的文本选取在 [pickCapsuleText]（纯函数，便于对照验收样例）。
      *
      * @return 可写入胶囊的文案；无有效文案返回 null
      */
@@ -518,20 +541,18 @@ internal object ArkNavLiveInjector {
             null
         }
 
-        acceptCandidate(lastSentenceOf(group))?.let { return it }
-        return acceptCandidate(data)
+        pickCapsuleText(lastSentenceOf(group))?.let { return it }
+        return pickCapsuleText(data)
     }
 
     /**
-     * 取分句数组里「此刻最新」的那一句。
+     * 取 `groupData` 数组里「此刻最新」的那一条**原始**记录（不做文本裁剪）。
      *
-     * 最后一个非空元素 → 若其中还有逗号分句，取第一个分句。
-     * 为什么是「第一个分句」：高德把整段待播队列并成一个元素（真机日志里
-     * `",全程八公里,大约需要二十七分钟,右转,随后一百五十米右转"`），而播报顺序是
-     * 从前到后 —— 第一个分句正是这一刻要开口的那句。
+     * 只负责挑元素，切分与筛选全部交给 [pickCapsuleText] —— v3.15.55 把「取第一个逗号分句」
+     * 写在这里，结果真机上 `右转,随后一百五十米右转` 被砍成 `右转`，信息全丢了。
      *
-     * 两步都 try/catch：`groupData` 偶尔不是合法 JSON（真机见过空数组 / 单字符串），
-     * 解析失败就当没有，由调用方退回 `data`。
+     * `groupData` 偶尔不是合法 JSON（真机见过空数组 / 单字符串），解析失败就当没有，
+     * 由调用方退回 `data`。
      */
     private fun lastSentenceOf(group: String?): String? {
         if (group.isNullOrBlank()) return null
@@ -539,36 +560,100 @@ internal object ArkNavLiveInjector {
             val arr = org.json.JSONArray(group)
             var picked: String? = null
             for (i in arr.length() - 1 downTo 0) {
-                val s = arr.optString(i, "").trim(*TRIM_CHARS)
+                val s = arr.optString(i, "").trim()
                 if (s.isNotEmpty()) {
                     picked = s
                     break
                 }
             }
-            picked?.let { p ->
-                val firstSeg = p.split(',', '，').firstOrNull { it.isNotBlank() }
-                firstSeg?.trim(*TRIM_CHARS)?.takeIf { it.isNotEmpty() } ?: p
-            }
+            picked
         } catch (_: Throwable) {
             null
         }
     }
 
     /**
-     * 候选串能不能进胶囊：长度 ≥ 2 且不含噪音词。
+     * 把一条原始播报串整理成胶囊文案（**纯函数**，无副作用、不碰任何状态）。
      *
-     * @return 通过则返回（可能被截断的）文案，否则 null
+     * ## 规则
+     *
+     * 1. 归一化：全角逗号 `，` → 半角 `,`，`trim()`，去掉首尾逗号与空白；
+     * 2. 纯数字（`^\d+$`）→ 返回 null（那是资源 id，真机见过 `2131558436`）；
+     * 3. 按 `,` 切段，丢弃空段；
+     * 4. 找**第一个**命中 [TURN_KEYWORDS] 的段落下标 `i`；
+     * 5. 命中 → 从 `i` 起把**剩余各段全部**用 `，` 连起来（转向段在前，后随的距离/补充说明
+     *    自然被带上）；未命中 → 取 `segments[0]`；
+     * 6. 噪音词（[NOISE_PHRASES]）命中 → null；长度 < 2 → null；
+     * 7. 超过 [MAX_CAPSULE_TEXT]（24）截断加 `…`。
+     *
+     * ## 为什么第 5 步是「连到末尾」而不是只拼下一段
+     *
+     * 派工规则原本写的是「`i+1` 含 `米`/`公里` 才拼下一段」，但验收样例里
+     * `直行,然后右转进入学院路` 期望 `直行，然后右转进入学院路`、
+     * `前方三百米右转,请靠右行驶` 期望 `前方三百米右转，请靠右行驶` —— 这两条的下一段
+     * 都不含距离词，按字面规则会被砍掉，与期望不符。因此这里取「连到末尾」：
+     * 8 条样例逐条对得上，且 24 字上限兜住了长度。
+     *
+     * ## 验收样例（真机原始数据，逐条对应）
+     *
+     * | 输入候选串 | 期望输出 |
+     * |---|---|
+     * | `右转,随后一百五十米右转` | `右转，随后一百五十米右转` |
+     * | `,全程一百三十三公里,大约需要两小时三分,预计中午十二点十九分到达,共有一个服务区,` | `全程一百三十三公里` |
+     * | `2131558436` | `null` |
+     * | `直行,然后右转进入学院路` | `直行，然后右转进入学院路` |
+     * | `前方三百米右转,请靠右行驶` | `前方三百米右转，请靠右行驶` |
+     * | `准备出发,` | `null` |
+     * | `高德地图持续为您导航` | `null` |
+     * | `掉头` | `掉头` |
+     *
+     * @param raw 原始播报串（可为 null）
+     * @return 可写入胶囊的文案；不该进胶囊时返回 null
      */
-    private fun acceptCandidate(candidate: String?): String? {
-        val raw = candidate?.trim(*TRIM_CHARS) ?: return null
-        if (raw.length < 2) return null
-        for (noise in NOISE_PHRASES) {
-            if (raw.contains(noise)) return null
-        }
-        return if (raw.length > MAX_CAPSULE_TEXT) {
-            raw.substring(0, MAX_CAPSULE_TEXT) + "…"
-        } else {
-            raw
+    private fun pickCapsuleText(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        return try {
+            // ① 归一化：全角逗号统一成半角，去掉首尾空白与逗号
+            val norm = raw.replace('，', ',').trim().trim(',', ' ', '\u3000')
+            if (norm.isEmpty()) return null
+
+            // ② 纯数字 = 资源 id，不是文案
+            if (PURE_DIGITS.matches(norm)) return null
+
+            // ③ 切段
+            val segments = norm.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            if (segments.isEmpty()) return null
+
+            // ④ 找第一个转向/动作段落
+            var start = -1
+            for (idx in segments.indices) {
+                if (TURN_KEYWORDS.any { segments[idx].contains(it) }) {
+                    start = idx
+                    break
+                }
+            }
+
+            // ⑤ 命中 → 从转向段连到末尾；未命中 → 取第一段
+            val joined = if (start >= 0) {
+                segments.subList(start, segments.size).joinToString("，")
+            } else {
+                segments[0]
+            }
+
+            // ⑥ 噪音 / 过短
+            if (joined.length < 2) return null
+            for (noise in NOISE_PHRASES) {
+                if (joined.contains(noise)) return null
+            }
+
+            // ⑦ 收口
+            if (joined.length > MAX_CAPSULE_TEXT) {
+                joined.substring(0, MAX_CAPSULE_TEXT) + "…"
+            } else {
+                joined
+            }
+        } catch (_: Throwable) {
+            null
         }
     }
 
