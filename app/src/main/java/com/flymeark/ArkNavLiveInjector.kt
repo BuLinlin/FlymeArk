@@ -1380,16 +1380,27 @@ internal object ArkNavLiveInjector {
      * 记录本帧识别到的交通方式（v3.15.81），与上一次不同则立即清掉跨趟兜底 ——
      * 换了交通方式，路线量级必然不同，旧值绝不能当兜底。
      *
+     * 真机实证（16:38:46）：切步行时高德源通知正文是 `正在为您步行导航>>`（id 99910002），
+     * 而**驾车**那趟的正文是 `正在导航`（没有任何方式词）。所以「上一趟方式未知
+     * （空串）→ 这一趟显式声明了方式」也必须当作**可能换了方式**处理，否则这条最关键的
+     * 切换会漏判（`"" != "walk"` 但 `""` 是未知而非驾车）。
+     *
+     * 反向安全：同一方式重开时（walk → walk，或驾车那趟永远识别不出方式）prev 与 mode
+     * 相同或本帧识别不到，都不会误清 —— 「重开同一路线」的兜底因此保留。
+     *
      * @return true 表示本帧**确认**发生了交通方式变化
      */
     private fun noteTravelMode(text: String?): Boolean {
         val mode = detectTravelMode(text) ?: return false
-        if (travelMode.isNotEmpty() && travelMode != mode) {
-            clearTripFallback("mode $travelMode -> $mode")
-            travelMode = mode
+        val prev = travelMode
+        // 有历史兜底值才值得判「未知 → 已知」；没有任何兜底时清了也没意义
+        val changed = (prev.isNotEmpty() && prev != mode) ||
+            (prev.isEmpty() && lastTripTotalMs != 0L)
+        travelMode = mode
+        if (changed) {
+            clearTripFallback("mode ${prev.ifEmpty { "unknown" }} -> $mode")
             return true
         }
-        travelMode = mode
         return false
     }
 
