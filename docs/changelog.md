@@ -36,23 +36,34 @@ v3.15.62 埋的 `NAV EXTRAS DUMP` 有三个盲区，本版逐个补齐。
 字段名，各 ROM 不一致），按 `服务名:action` 去重。日志格式：
 
 ```
-NAV SVC INTENT DUMP: svc=<simpleName> action=<action> | extras: <flatten 深度2，截 800>
+NAV SVC INTENT DUMP: svc=<simpleName> action=<action> | extras: <flatten 深度2，截 800>            ← 主额度
+NAV SVC INTENT DUMP: svc=<simpleName> action=<action> | extras: <none> (noextra 1/2)             ← 弱额度
+NAV SVC INTENT DUMP: svc=<simpleName> action=<action> | extras: <v> (reserve 1/4)                ← 预留额度
 ```
 
-首轮自测后按 QA 复查修订了三处（否则这轮取证会白跑）：
+首轮自测 + 两轮 QA 回归后定稿的口径是**三套额度**（目的只有一个：只测一次也别白测）：
 
-- **双额度**：老口径是「action 和 extras 都为空才丢」，但高德进程里大量 Service 是
-  「有 action、无 extras」（push / 统计 / SDK 各一路），每来一个就吃掉 1/8 额度并打一行
-  `extras: <none>` —— 8 条很可能在导航 Service 起来**之前**就被占满。现在 **8 条主额度只给
-  带 extras 的 Intent**；无 extras 的另给 **2 条弱额度**，且只放 action 像导航的
-  （`nav/navi/route/guide/tbt/drive/simulat`），用完静默。两套额度用**独立的去重集**，
-  弱线索那一行 `<none>` 不会把「同一个 `svc:action` 之后带着 extras 再来一次」去重掉。
-  弱行标记：`| extras: <none> (noextra 1/2)`。
+- **主额度 8** —— 只给**带 extras** 的 Intent。带 extras 就 claim，`svc:action` 去重，
+  **主额度一满（8/8）立刻打且只打一次** `NAV SVC INTENT DUMP: cap reached (8)`
+  （与弱额度满没满无关；触发点在前置闸门和认领被拒两处共用一个幂等出口）。
+- **弱额度 2** —— `extras == null` 且 action 像导航
+  （`nav/navi/route/guide/tbt/drive/simulat`）才放，用完**静默**（不打 cap 提示）。
+  目的：保留「这个 Service 起过、但参数不在 Intent 里」这条结论。行末标记
+  `| extras: <none> (noextra 1/2)`。
+- **预留额度 4** —— 主额度被噪声（push / 统计 / SDK Service）占满后，**内容像目的地**的 Intent
+  仍有 4 次落日志机会。判定用 `looksLikeDest(extras)`：key 命中
+  `destination/dest/poiname/poi/endname/toname/target/终点`，或**某个字符串值本身能过
+  `sanitizeDest()`**（2..16 字、含中文、不含噪声词 —— 地名就是这个形状，长文本一律过不了），
+  或递归进子 Bundle（≤2 层）。**不用 action 关键词判定**：`NONAV`、`canvas` 都含 `nav`，
+  实测会误命中。行末标记 `| extras: <v> (reserve 1/4)`；4 次也用完再打一次
+  `NAV SVC INTENT DUMP: reserve exhausted (4)`。
+- **去重集各自独立**（8 / 2 / 4）：弱线索那一行 `<none>` 不会把「同一个 `svc:action` 之后
+  带着 extras 再来一次」的主日志去重掉；主额度已打过的 key 也不会重复消耗预留额度。
 - **服务名映射**：`ServiceArgsData` / `BindServiceData` 按 AOSP 只有 `token` / `intent` /
   `flags` / `startId`，**不含 Service 实例**，所以 `svc=` 原本恒为 `?`（去重键也退化成
   `?:action`）。新增 `hookServiceCreates()`：`handleCreateService` 的 **before** hook 里只读
   字段、记 `token(IBinder) → 服务全类名`（服务名取 `info.name`，退化为 `Service` 实例类名），
-  存进容量 32 的 `LinkedHashMap`（超了淘汰最早一条），Service 派发时用 token 反查。
+  存进容量 32 的 `LinkedHashMap`（**FIFO** 淘汰最早插入的一条），Service 派发时用 token 反查。
   **before hook 里绝不调 `param.setResult`** —— 那会跳过原方法，Service 就起不来了。
 - **日志体积**：数组只展开前 24 个元素（多出的 `…(+N)`），嵌套层拼装带长度闸（边拼边停，
   不再先拼巨大串再截）。

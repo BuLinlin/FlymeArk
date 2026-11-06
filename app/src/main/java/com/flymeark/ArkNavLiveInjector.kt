@@ -1738,14 +1738,22 @@ internal object ArkNavLiveInjector {
     //  R2 **服务名映射**：`ServiceArgsData` / `BindServiceData` 按 AOSP 只有 `token` / `intent` /
     //     `flags` / `startId`，**不含 Service 实例**，所以 `svc=` 恒为 `?`，去重键退化成 `?:action`，
     //     日志也丢掉服务名这个最关键的定位信息。现在 hook `handleCreateService`（before），把
-    //     `token(IBinder) → 服务全类名` 记进 [svcNameCache]（容量 [SVC_NAME_CACHE_MAX]，LRU 式淘汰），
-    //     Service 派发时用 `data` 里的 token 反查。
+    //     `token(IBinder) → 服务全类名` 记进 [svcNameCache]（容量 [SVC_NAME_CACHE_MAX]，**FIFO** 淘汰 ——
+    //     `LinkedHashMap` 没开 accessOrder，是插入序，不是 LRU），Service 派发时用 `data` 里的 token 反查。
+    //
+    //  R5 **目的地预留额度**（QA 回归）：主额度是「先来先占」，带 extras 的 push / 统计 / SDK Service
+    //     一样能吃掉 8 格 —— 真机上导航那条照样可能抓不到。**action 关键词过滤不可靠**
+    //     （`NONAV` / `canvas` 都含 `nav`，实测误命中），所以改成**按内容判定**：主额度被占满后，
+    //     `looksLikeDest(extras)` 为真的 Intent 还有 [SVC_INTENT_RESERVE] = 4 次预留机会。
 
     /** 已 dump 过的 `serviceClassName:action` 组合（主额度去重） */
     private val svcIntentSeen = HashSet<String>(8)
 
     /** 已 dump 过的 `serviceClassName:action` 组合（弱额度去重，与主额度隔离） */
     private val svcIntentWeakSeen = HashSet<String>(4)
+
+    /** 已 dump 过的 `serviceClassName:action` 组合（预留额度去重，与主 / 弱都隔离） */
+    private val svcIntentReserveSeen = HashSet<String>(4)
 
     /** 已 dump 次数（主额度：带 extras 的 Intent） */
     private var svcIntentDumps = 0
@@ -1759,11 +1767,20 @@ internal object ArkNavLiveInjector {
     /** 弱额度上限 */
     private const val SVC_INTENT_NOEXTRA_BUDGET = 2
 
+    /** 已 dump 次数（预留额度：主额度满后，内容像目的地的 Intent） */
+    private var svcIntentReserveDumps = 0
+
+    /** 预留额度上限 */
+    private const val SVC_INTENT_RESERVE = 4
+
     /** action 像导航 Service 的关键词（弱额度只放这些；不区分大小写） */
     private val NAV_SVC_ACTION_RE = Regex("(?i)(nav|navi|route|guide|tbt|drive|simulat)")
 
     /** 「cap reached」提示是否已打过（只打一次，只针对主额度） */
     private var svcIntentCapLogged = false
+
+    /** 「reserve exhausted」提示是否已打过（只打一次） */
+    private var svcIntentReserveCapLogged = false
 
     /** 额度 / 去重集的统一锁（Service 派发可能跨线程，计数器用同一把锁才自洽） */
     private val svcIntentLock = Any()
@@ -1977,10 +1994,10 @@ internal object ArkNavLiveInjector {
             // 服务名只解析一次（反射 + 查表），日志与去重键共用
             val svcName = serviceNameOf(data)
 
-            // 闸门③：无 extras 的导航类只走弱额度
+            // 闸门③：无 extras 的导航类只走弱额度（claim 返回序号，领取与取号在同一把锁里完成）
             if (extras == null) {
-                if (!svcIntentClaimWeak("$svcName:$action")) return
-                val seq = synchronized(svcIntentLock) { svcIntentNoExtraDumps }
+                val seq = svcIntentClaimWeak("$svcName:$action")
+                if (seq <= 0) return
                 log(
                     "NAV SVC INTENT DUMP: svc=${svcName.substringAfterLast('.')} " +
                         "action=$action | extras: <none> (noextra $seq/$SVC_INTENT_NOEXTRA_BUDGET)"
@@ -1988,8 +2005,16 @@ internal object ArkNavLiveInjector {
                 return
             }
 
-            // 闸门④：主额度 + 同一 `服务名:action` 只 dump 一次
-            if (!svcIntentClaim("$svcName:$action")) return
+            // 闸门④：三级领取
+            //  ① 主额度 8（逻辑不变）→ ② 主额度用尽时，「内容像目的地」的走预留 4 → ③ 都不行就丢
+            var mark = ""
+            if (!svcIntentClaim("$svcName:$action")) {
+                // 主额度已满 / 该 key 已 dump 过；只有**内容像目的地**的才配动用预留额度
+                if (!looksLikeDest(extras)) return
+                val rseq = svcIntentClaimReserved("$svcName:$action")
+                if (rseq <= 0) return
+                mark = " (reserve $rseq/$SVC_INTENT_RESERVE)"
+            }
 
             val flat = flattenExtras(extras, 0, EXTRAS_MAX_DEPTH).let {
                 if (it.length > SVC_INTENT_EXTRAS_MAX_LEN) {
@@ -2000,31 +2025,53 @@ internal object ArkNavLiveInjector {
             }
             log(
                 "NAV SVC INTENT DUMP: svc=${svcName.substringAfterLast('.')} " +
-                    "action=${action ?: "?"} | extras: $flat"
+                    "action=${action ?: "?"} | extras: $flat$mark"
             )
         } catch (_: Throwable) {
             // 宿主进程：异常必须在这里消失
         }
     }
 
-    /** 两套额度是否都还有剩（只读判断，不打日志；都没有就完全跳过后续反射） */
+    /**
+     * 三套额度是否都还有剩（只读判断，不打日志；都没有就完全跳过后续反射）。
+     *
+     * **必须把预留额度也算进来**：预留是在「主额度领取失败」之后才领取的，若这里因为
+     * 主 + 弱都满就提前 return，预留额度永远走不到 —— 那就是 E6 那个 bug 的翻版。
+     */
     private fun svcIntentAnyBudgetLeft(): Boolean = synchronized(svcIntentLock) {
-        svcIntentDumps < SVC_INTENT_MAX_DUMP || svcIntentNoExtraDumps < SVC_INTENT_NOEXTRA_BUDGET
+        if (svcIntentDumps < SVC_INTENT_MAX_DUMP) return@synchronized true
+        noteCapReachedLocked()
+        svcIntentNoExtraDumps < SVC_INTENT_NOEXTRA_BUDGET || svcIntentReserveDumps < SVC_INTENT_RESERVE
+    }
+
+    /**
+     * 打一次 `cap reached (8)`（调用方必须已持有 [svcIntentLock]）。
+     *
+     * 这个提示的可靠出口有两个：① 前置闸门发现主额度已满；② 主额度认领被拒。
+     * 两处都调、由 [svcIntentCapLogged] 保证全局只打一次 —— 单靠 ② 会被 ① 的提前
+     * return 挡掉（E6 实测就是这么漏的）。
+     */
+    private fun noteCapReachedLocked() {
+        if (svcIntentCapLogged) return
+        svcIntentCapLogged = true
+        log("NAV SVC INTENT DUMP: cap reached ($SVC_INTENT_MAX_DUMP)")
+    }
+
+    /** 打一次 `reserve exhausted (4)`（调用方必须已持有 [svcIntentLock]） */
+    private fun noteReserveExhaustedLocked() {
+        if (svcIntentReserveCapLogged) return
+        svcIntentReserveCapLogged = true
+        log("NAV SVC INTENT DUMP: reserve exhausted ($SVC_INTENT_RESERVE)")
     }
 
     /**
      * 认领一个 `serviceClassName:action` 组合（主额度）；已认领过或主额度用尽返回 false。
      *
-     * 主额度用尽的那一刻打一次 `cap reached (8)`（`svcIntentCapLogged` 保证只打一次）。
-     * 提示放在这里而不是放在前置闸门里，是因为前置闸门可能因为「弱额度也满了」而提前返回 ——
-     * 那样这条提示就永远打不出来。
+     * 主额度用尽时顺带打一次 `cap reached (8)`（[noteCapReachedLocked] 幂等）。
      */
     private fun svcIntentClaim(key: String): Boolean = synchronized(svcIntentLock) {
         if (svcIntentDumps >= SVC_INTENT_MAX_DUMP) {
-            if (!svcIntentCapLogged) {
-                svcIntentCapLogged = true
-                log("NAV SVC INTENT DUMP: cap reached ($SVC_INTENT_MAX_DUMP)")
-            }
+            noteCapReachedLocked()
             return@synchronized false
         }
         if (!svcIntentSeen.add(key)) return@synchronized false
@@ -2033,15 +2080,92 @@ internal object ArkNavLiveInjector {
     }
 
     /**
-     * 认领一个 `serviceClassName:action` 组合（弱额度）：已认领过或弱额度用尽返回 false。
+     * 认领一个 `serviceClassName:action` 组合（弱额度）。
      *
-     * 弱额度用尽**静默**（不打 `cap reached`）—— 那是给主额度用的提示，弱线索没拿到不值得刷一行日志。
+     * 「领取 + 取序号」在**同一把锁**里一次完成，直接把序号返回给调用方拼日志 ——
+     * 老写法是先 claim 再单独加锁读计数，并发下 `noextra n/2` 的 n 会重复。
+     *
+     * @return 1..[SVC_INTENT_NOEXTRA_BUDGET] = 领到的序号；0 = 没领到（额度用尽 / 重复）
      */
-    private fun svcIntentClaimWeak(key: String): Boolean = synchronized(svcIntentLock) {
-        if (svcIntentNoExtraDumps >= SVC_INTENT_NOEXTRA_BUDGET) return@synchronized false
-        if (!svcIntentWeakSeen.add(key)) return@synchronized false
+    private fun svcIntentClaimWeak(key: String): Int = synchronized(svcIntentLock) {
+        if (svcIntentNoExtraDumps >= SVC_INTENT_NOEXTRA_BUDGET) return@synchronized 0
+        if (!svcIntentWeakSeen.add(key)) return@synchronized 0
         svcIntentNoExtraDumps++
-        true
+        svcIntentNoExtraDumps
+    }
+
+    /**
+     * 认领一个 `serviceClassName:action` 组合（预留额度，只给 [looksLikeDest] 为真的 Intent）。
+     *
+     * 主额度已经 dump 过的 key **不再**走预留：那条日志已经在，不该再花预留额度重复一遍
+     * （同一个导航 Service 反复启动时很容易踩到）。
+     *
+     * @return 1..[SVC_INTENT_RESERVE] = 领到的序号；0 = 额度用尽（已打 `reserve exhausted`）；
+     *         负数 = 重复 / 已在主额度打过，静默丢弃
+     */
+    private fun svcIntentClaimReserved(key: String): Int = synchronized(svcIntentLock) {
+        if (svcIntentSeen.contains(key)) return@synchronized -1
+        if (svcIntentReserveDumps >= SVC_INTENT_RESERVE) {
+            noteReserveExhaustedLocked()
+            return@synchronized 0
+        }
+        if (!svcIntentReserveSeen.add(key)) return@synchronized -1
+        svcIntentReserveDumps++
+        svcIntentReserveDumps
+    }
+
+    /**
+     * 一份 extras 里是否「有东西像目的地」—— 决定它配不配动用预留额度。
+     *
+     * 判定（任一成立即 true）：
+     *  1. 某个 key 小写后命中 [DEST_KEY_HINTS] 任一片段（`dest` / `poi` / `终点` …），且取到的值
+     *     能过 [sanitizeDest]；
+     *  2. 某个 `CharSequence` / 数组元素的值本身能过 [sanitizeDest] —— 这条最有用：地名就是
+     *     「2..16 字、含中文、不含 [DEST_NOISE]」的短串，[sanitizeDest] 的长度闸同时也挡住了
+     *     长文本误判（例如整段播报、JSON、URL 一律不可能通过）；
+     *  3. 递归进子 Bundle（`depth < DEST_MAX_DEPTH`，与 [findDestInBundle] 同口径）。
+     *
+     * 全程 `try/catch`，任何异常返回 false（这里跑在宿主进程里，宁可漏判也不许抛）。
+     */
+    @Suppress("DEPRECATION") // Bundle.get(String) 是遍历任意类型值的唯一泛型取法
+    private fun looksLikeDest(extras: Bundle, depth: Int = 0): Boolean {
+        try {
+            for (k in extras.keySet()) {
+                val v = try {
+                    extras.get(k)
+                } catch (_: Throwable) {
+                    null
+                }
+                // ① key 本身像目的地 → 值也像才算（避免 destId=0 之类命中）
+                val lk = try {
+                    k.lowercase(Locale.ROOT)
+                } catch (_: Throwable) {
+                    k
+                }
+                if (DEST_KEY_HINTS.any { lk.contains(it) }) {
+                    val s = when (v) {
+                        is CharSequence -> v.toString()
+                        is Array<*> -> v.firstOrNull()?.toString()
+                        else -> null
+                    }
+                    if (sanitizeDest(s.orEmpty()) != null) return true
+                }
+                // ② 值本身像目的地
+                when (v) {
+                    is CharSequence -> if (sanitizeDest(v.toString()) != null) return true
+                    is Array<*> -> {
+                        for (e in v.take(EXTRAS_ARRAY_MAX_ELEMS)) {
+                            if (e is CharSequence && sanitizeDest(e.toString()) != null) return true
+                        }
+                    }
+                    is Bundle -> if (depth < DEST_MAX_DEPTH && looksLikeDest(v, depth + 1)) return true
+                    else -> {
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return false
     }
 
     /**
