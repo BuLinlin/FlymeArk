@@ -1,16 +1,19 @@
 package com.flymeark
 
 import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.view.ViewOutlineProvider
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.AbsoluteSizeSpan
@@ -37,11 +40,19 @@ import android.widget.TextView
  * 影子通知的 extras：高德进程写 `ArkConstants.NAV_KEY_*` → SystemUI 原样搬进 Intent
  * → 这里读。所以本类只读 Intent，**完全不碰通知**（本进程也没那个权限）。
  *
+ * v3.15.65 起多了一条**实时**通道：面板打开期间 SystemUI 每看到影子更新一帧，
+ * 就把同一份载荷广播过来（[ArkConstants.ACTION_NAV_PANEL_UPDATE]，`onResume` 注册 /
+ * `onStop` 注销、`RECEIVER_NOT_EXPORTED`）。第一次仍走 Intent，广播只负责「之后」。
+ *
  * ## 三条产品取舍（设计稿没有、但必须这么做的）
  *
- * 1. 三栏标签是「耗时 / 全程 / 到达」而不是「剩余时间 / 剩余距离 / 预计到达」——
- *    高德不给实时剩余值，只有起点播报里的总量（见 `docs/live-nav-research.md` §7）；
- * 2. 进度条是**时间口径**（已用时间 / 总耗时），不是距离口径；
+ * 1. 三栏标签是「剩余耗时 / 总里程 / 实时到达」（v3.15.65 改）；
+ *    v3.15.61 ~ v3.15.64 是「耗时 / 全程 / 到达」的全量口径 —— 用户实测反馈
+ *    「开出去十分钟了还显示出发时的总耗时」，因为高德只播一次总量。
+ *    现在「剩余」由高德进程按每次播报重算（`NAV_KEY_REMAIN_MS`），
+ *    「到达」也随剩余实时刷新（播报明确给过就让它赢）；
+ * 2. 进度条是**时间口径**的**锚点**进度（`(总耗时 - 剩余) / 总耗时`），
+ *    两帧之间**冻结** —— 面板绝不自己按秒往前推（那样进度和「剩余耗时」必然互相打脸）；
  * 3. 右下角按钮是「回到导航」而不是「结束导航」——
  *    外部 App 无法结束别人的导航，硬做一个点了没反应的「结束导航」更糟。
  *
@@ -99,7 +110,7 @@ class ArkNavPanelActivity : Activity() {
     private var nightMode = false
     private var closing = false
 
-    // ---- 载荷（从 Intent 读，见类注释）
+    // ---- 载荷（首次从 Intent 读，之后从广播读；见类注释）
     private var instrText = ""
     private var subText = ""
     private var destText = ""
@@ -109,9 +120,39 @@ class ArkNavPanelActivity : Activity() {
     private var timeUnit = ""
     private var etaValue = ""
     private var turnCode = ArkConstants.NAV_TURN_STRAIGHT
-    private var startedAt = 0L
     private var totalMs = 0L
+
+    /** 剩余毫秒；`< 0` = 本趟还没有锚点 → 只画轨不画球（见 [ArkConstants.NAV_KEY_REMAIN_MS]） */
+    private var remainMs = -1L
     private var appPkg = ArkConstants.NAV_LIVE_PKG
+
+    /** 上一次渲染的载荷指纹（去抖用；见 [applyPayload]） */
+    private var lastPayloadSig: String? = null
+
+    /** 动态广播是否已注册（`onResume` / `onStop` 必须成对，靠它防重复注册 / 重复注销） */
+    private var updateReceiverRegistered = false
+
+    /**
+     * 导航实时刷新（v3.15.65）。
+     *
+     * SystemUI 侧每看到导航影子更新一帧就广播一次（[ArkConstants.ACTION_NAV_PANEL_UPDATE]），
+     * 这里只管把 extras 交给 [applyPayload]。
+     *
+     * 注意：这是**跨进程**广播（SystemUI → 本进程），但注册时用的是
+     * `RECEIVER_NOT_EXPORTED` —— 只有系统（system uid）与本 App 自己能发进来，
+     * 别的第三方 App 发不进来（也没有任何 App 有理由发这个 action）。
+     */
+    private val navUpdateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            try {
+                if (intent?.action != ArkConstants.ACTION_NAV_PANEL_UPDATE) return
+                val b = intent.extras ?: return
+                applyPayload(b)
+            } catch (_: Throwable) {
+                // 面板只是展示层，任何异常都不许崩给用户看
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -226,30 +267,95 @@ class ArkNavPanelActivity : Activity() {
     }
 
     /**
-     * 读载荷。所有字段都可能是空串（高德刚进导航、播报还没来），
-     * 空串一律走「占位 / 隐藏」分支，绝不留半张空白卡。
+     * 读载荷（**首次投递**，走 Intent）。
+     *
+     * 与实时广播共用 [applyPayload] —— 两处各解析一遍字段，必然会出现「点开有目的地、
+     * 一推送就变成高德地图」这种静态错位。
+     *
+     * @param i 启动 / 复用本面板的 Intent；null 表示没有（什么都不做）
      */
     private fun readIntent(i: Intent?) {
         if (i == null) return
-        instrText = i.getStringExtra(ArkConstants.NAV_KEY_INSTR).orEmpty().trim()
-        subText = i.getStringExtra(ArkConstants.NAV_KEY_SUB).orEmpty().trim()
-        destText = i.getStringExtra(ArkConstants.NAV_KEY_DEST).orEmpty().trim()
-        distValue = i.getStringExtra(ArkConstants.NAV_KEY_DIST).orEmpty().trim()
-        distUnit = i.getStringExtra(ArkConstants.NAV_KEY_DIST_UNIT).orEmpty().trim()
-        timeValue = i.getStringExtra(ArkConstants.NAV_KEY_TIME).orEmpty().trim()
-        timeUnit = i.getStringExtra(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty().trim()
-        etaValue = i.getStringExtra(ArkConstants.NAV_KEY_ETA).orEmpty().trim()
-        startedAt = i.getLongExtra(ArkConstants.NAV_KEY_STARTED, 0L)
-        totalMs = i.getLongExtra(ArkConstants.NAV_KEY_TOTAL_MS, 0L)
-        turnCode = i.getIntExtra(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT)
-        appPkg = i.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)
-            ?.takeIf { it.isNotBlank() } ?: ArkConstants.NAV_LIVE_PKG
-        if (i.hasExtra(ArkConstants.EXTRA_PANEL_NIGHT)) {
-            nightMode = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode)
+        try {
+            // 启动专用字段（App 包名 / 夜间模式）只在这里认，广播里没有这两个 key
+            appPkg = i.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)
+                ?.takeIf { it.isNotBlank() } ?: ArkConstants.NAV_LIVE_PKG
+            if (i.hasExtra(ArkConstants.EXTRA_PANEL_NIGHT)) {
+                nightMode = i.getBooleanExtra(ArkConstants.EXTRA_PANEL_NIGHT, nightMode)
+            }
+            val b = i.extras ?: return
+            applyPayload(b)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 把一份 `NAV_KEY_*` 载荷写进控件（Intent 与实时广播的唯一入口）。
+     *
+     * 三件事按顺序做：
+     *  1. **先算指纹**（用户看得见的字段），与上一帧一致就直接返回 —— SystemUI 一次播报
+     *     可能连着重绘好几帧，不去抖的话文字会「闪一下又回来」；
+     *  2. 赋值 → 重绘文本；
+     *  3. 重算进度（锚点口径，见 [updateProgress]）。
+     *
+     * 配色只在**首帧**与**夜间模式变化**时重刷：`applyPalette()` 里连 Spannable 都要重拼，
+     * 每帧做一次纯属浪费（它自己也调 [renderValues]）。
+     *
+     * @param b 只含 `NAV_KEY_*` 的载荷
+     */
+    private fun applyPayload(b: Bundle) {
+        val nextInstr = b.getString(ArkConstants.NAV_KEY_INSTR).orEmpty().trim()
+        val nextSub = b.getString(ArkConstants.NAV_KEY_SUB).orEmpty().trim()
+        val nextDest = b.getString(ArkConstants.NAV_KEY_DEST).orEmpty().trim()
+        val nextDistValue = b.getString(ArkConstants.NAV_KEY_DIST).orEmpty().trim()
+        val nextDistUnit = b.getString(ArkConstants.NAV_KEY_DIST_UNIT).orEmpty().trim()
+        val nextTimeValue = b.getString(ArkConstants.NAV_KEY_TIME).orEmpty().trim()
+        val nextTimeUnit = b.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty().trim()
+        val nextEta = b.getString(ArkConstants.NAV_KEY_ETA).orEmpty().trim()
+        val nextTotal = b.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L)
+        val nextRemain = b.getLong(ArkConstants.NAV_KEY_REMAIN_MS, -1L)
+        val nextTurn = b.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT)
+        // 广播里没有启动参数；首次 Intent 已经设过，这里只在真的带了值时才改
+        b.getString(ArkConstants.EXTRA_PANEL_APP_PKG)?.takeIf { it.isNotBlank() }
+            ?.let { appPkg = it }
+        val nightChanged = if (b.containsKey(ArkConstants.EXTRA_PANEL_NIGHT)) {
+            val n = b.getBoolean(ArkConstants.EXTRA_PANEL_NIGHT, nightMode)
+            val changed = n != nightMode
+            nightMode = n
+            changed
+        } else {
+            false
         }
 
+        // ① 指纹去抖（不含 anchor_at：它是纯取证字段，每帧都会变，算进来等于没去抖）
+        val sig = listOf(
+            nextInstr, nextSub, nextDest, nextDistValue, nextDistUnit,
+            nextTimeValue, nextTimeUnit, nextEta,
+            nextTotal.toString(), nextRemain.toString(), nextTurn.toString()
+        ).joinToString("\u0001")
+        if (sig == lastPayloadSig && !nightChanged) return
+        val firstRender = lastPayloadSig == null
+        lastPayloadSig = sig
+
+        // ② 赋值 + 重绘
+        instrText = nextInstr
+        subText = nextSub
+        destText = nextDest
+        distValue = nextDistValue
+        distUnit = nextDistUnit
+        timeValue = nextTimeValue
+        timeUnit = nextTimeUnit
+        etaValue = nextEta
+        totalMs = nextTotal
+        remainMs = nextRemain
+        turnCode = nextTurn
+
         renderContent()
-        applyPalette()
+        if (firstRender || nightChanged) {
+            applyPalette()      // 内部会再 renderValues 一次（单位色在 Spannable 里）
+        }
+
+        // ③ 锚点进度：只在**收到新载荷**时更新
         updateProgress()
     }
 
@@ -280,13 +386,36 @@ class ArkNavPanelActivity : Activity() {
         } else {
             ArkTokens.SUBTLE_TEXT_DARK
         }
-        timeValueView.text = valueSpan(timeValue, timeUnit, subtle)
+        val timePair = formatRemainTime(timeValue, timeUnit)
+        timeValueView.text = valueSpan(timePair.first, timePair.second, subtle)
         distValueView.text = valueSpan(distValue, distUnit, subtle)
         etaValueView.text = valueSpan(etaValue, "", subtle)
 
         timeLabelView.text = getString(R.string.ark_nav_time_label)
         distLabelView.text = getString(R.string.ark_nav_dist_label)
         etaLabelView.text = getString(R.string.ark_nav_eta_label)
+    }
+
+    /**
+     * 「剩余耗时」的展示折叠（v3.15.65）。
+     *
+     * 载荷里的 `NAV_KEY_TIME` **恒为分钟**（单一语义，见 `ArkNavLiveInjector.remainTimePair`），
+     * 长途就会出现「133 分钟」这种读不动的数字，所以在这里折成 `2 小时 13` + `分`。
+     *
+     * 只在**展示层**折：载荷口径不动，日志 / 取证 / 将来别的读法都还是分钟。
+     * 单位与数值分开返回，是为了让 [valueSpan] 仍然能把单位排成 11sp 的弱化小字。
+     *
+     * @param value 载荷里的分钟数（可能为空 / 非数字）
+     * @param unit  载荷里的单位（`分钟` / `小时` / 空）
+     * @return 展示用（数值, 单位）；不需要折叠时原样返回
+     */
+    private fun formatRemainTime(value: String, unit: String): Pair<String, String> {
+        if (unit != "分钟") return value to unit
+        val minutes = value.toLongOrNull() ?: return value to unit
+        if (minutes < 60L) return value to unit
+        val h = minutes / 60L
+        val m = minutes % 60L
+        return if (m == 0L) h.toString() to "小时" else "$h 小时 $m" to "分"
     }
 
     /**
@@ -377,24 +506,33 @@ class ArkNavPanelActivity : Activity() {
     )
 
     // ------------------------------------------------------------------
-    // 进度（时间口径）
+    // 进度（时间口径 · 锚点式，v3.15.65）
     // ------------------------------------------------------------------
 
+    /**
+     * 画进度条：`(总耗时 - 剩余) / 总耗时`，**只认载荷里的剩余值**。
+     *
+     * ## 为什么不再「按秒自己往前走」
+     *
+     * v3.15.61 ~ v3.15.64 是 `(elapsedRealtime() - 出发时刻) / 总耗时`，每秒重算一次。
+     * 用户实测的问题就在这里：**进度条自己在跑，而「耗时」栏是出发时的总量、一动不动**，
+     * 两套口径互相打脸；而且高德只播一次总量，真到了「还剩 5 分钟」时进度条还停在一半。
+     *
+     * 现在剩余值由高德进程在**每次播报**时重算（`NAV_KEY_REMAIN_MS`），面板两帧之间
+     * 完全冻结 —— 高德没有实时剩余数据时，宁可不动，也不要编一个假进度出来。
+     *
+     * `remainMs < 0` = 本趟还没有锚点（没拿到出发播报 / 没拿到总耗时）→
+     * `setProgress(0f, false)`：只画轨和终点白球，不画球（画个 0% 的球会让人以为刚出发）。
+     */
     private fun updateProgress() {
-        if (startedAt <= 0L || totalMs <= 0L) {
+        if (totalMs <= 0L || remainMs < 0L) {
             progressView.setProgress(0f, false)
             return
         }
-        val elapsed = SystemClock.elapsedRealtime() - startedAt
-        val f = if (elapsed <= 0L) 0f else elapsed.toFloat() / totalMs.toFloat()
-        progressView.setProgress(f, true)
-    }
-
-    private val ticker = object : Runnable {
-        override fun run() {
-            updateProgress()
-            handler.postDelayed(this, TICK_MS)
-        }
+        // remainMs > totalMs（改道后剩余变长）时算出负数 → 钳到 0；
+        // remainMs = 0（到达）→ 1.0。两端都必须钳，否则 ArkNavProgressView 会收到越界值。
+        val fraction = (totalMs - remainMs).toFloat() / totalMs.toFloat()
+        progressView.setProgress(fraction.coerceIn(0f, 1f), true)
     }
 
     // ------------------------------------------------------------------
@@ -478,31 +616,64 @@ class ArkNavPanelActivity : Activity() {
     override fun onResume() {
         super.onResume()
         publishVisibility(true)
-        handler.removeCallbacks(ticker)
-        handler.post(ticker)
+        registerUpdateReceiver()
     }
 
     override fun onStop() {
         super.onStop()
-        handler.removeCallbacks(ticker)
+        unregisterUpdateReceiver()
         publishVisibility(false)
         if (!isChangingConfigurations) finish()
     }
 
     override fun onDestroy() {
+        unregisterUpdateReceiver()
         publishVisibility(false)
         handler.removeCallbacksAndMessages(null)
         if (this::morph.isInitialized) morph.stop()
         super.onDestroy()
     }
 
+    /**
+     * 注册导航实时刷新广播（v3.15.65）。
+     *
+     * 只在**可见**期间注册（`onResume` → `onStop`）：面板不在前台时没人需要刷新，
+     * 而常驻注册会让本进程的广播队列一直命中，纯耗电。
+     *
+     * `RECEIVER_NOT_EXPORTED`（API 33+ 必须显式给导出标记，否则直接抛
+     * `SecurityException`）：这条通道只有 SystemUI 与本 App 自己用，别的 App 发不进来。
+     * API 32 及以下没有这个标记，走两参重载即可（动态注册默认只收「同 App + 系统」）。
+     */
+    private fun registerUpdateReceiver() {
+        if (updateReceiverRegistered) return
+        try {
+            val filter = IntentFilter(ArkConstants.ACTION_NAV_PANEL_UPDATE)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(navUpdateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(navUpdateReceiver, filter)
+            }
+            updateReceiverRegistered = true
+        } catch (_: Throwable) {
+            // 注册失败只是「没有实时刷新」，静态载荷照旧显示，不该让面板崩
+            updateReceiverRegistered = false
+        }
+    }
+
+    /** 注销实时刷新广播（与 [registerUpdateReceiver] 严格成对） */
+    private fun unregisterUpdateReceiver() {
+        if (!updateReceiverRegistered) return
+        updateReceiverRegistered = false
+        try {
+            unregisterReceiver(navUpdateReceiver)
+        } catch (_: Throwable) {
+            // 已经因为进程/窗口销毁被系统注销过：吞掉，别在 onStop 里崩
+        }
+    }
+
     @Deprecated("Activity 级别返回键处理")
     override fun onBackPressed() {
         dismiss()
-    }
-
-    private companion object {
-        /** 进度的刷新节奏：1s 一次足够（分母是几十分钟量级），也不影响锁屏功耗 */
-        const val TICK_MS = 1_000L
     }
 }

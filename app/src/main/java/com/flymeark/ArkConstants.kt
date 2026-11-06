@@ -352,6 +352,29 @@ object ArkConstants {
     /** 导航展开卡：总耗时毫秒（Long，进度条分母；0 表示没有 → 只画轨不画球） */
     const val NAV_KEY_TOTAL_MS = "flymeark.nav.total_ms"
 
+    /**
+     * 导航展开卡：**剩余**毫秒（Long，v3.15.65 锚点进度）。
+     *
+     * - `>= 0`：真实剩余时长。由 [ArkNavLiveInjector] 在**每一次播报**时按
+     *   `max(0, 总耗时 - 已用时间)` 重算一次，算出来的时刻见 [NAV_KEY_ANCHOR_AT]；
+     * - `< 0`（实现取 -1）：本趟还没有锚点（没拿到出发播报 / 没拿到总耗时）→
+     *   面板只画轨、不画球。
+     *
+     * 面板**只认这个值**画进度，绝不自己拿 `elapsedRealtime() - 出发时刻` 推算 ——
+     * 那样两帧之间会自己往前走，而高德并不给我们实时剩余（见
+     * `docs/live-nav-research.md` §7）。v3.15.65 之前就是这么写的，用户实测
+     * 「进度条自己跑、数字不动」，两套口径必然对不上。
+     */
+    const val NAV_KEY_REMAIN_MS = "flymeark.nav.remain_ms"
+
+    /**
+     * 导航展开卡：锚点时刻（Long，`elapsedRealtime`）。
+     *
+     * = [NAV_KEY_REMAIN_MS] 是**哪一刻**算出来的，只增不改。当前只用于日志取证；
+     * 面板**刻意不读**它（读了就又回到「自己插值往前跑」的老路）。
+     */
+    const val NAV_KEY_ANCHOR_AT = "flymeark.nav.anchor_at"
+
     /** 导航展开卡：转向类型（Int，0 直行 / 1 左转 / 2 右转 / 3 掉头 / 4 到达） */
     const val NAV_KEY_TURN = "flymeark.nav.turn"
 
@@ -360,6 +383,22 @@ object ArkConstants {
 
     /** 导航展开卡里对外的 App 展示名（拿不到目的地时的回落文案之一） */
     const val NAV_LABEL = "高德地图"
+
+    /**
+     * SystemUI → 模块进程：导航展开卡**实时刷新**（v3.15.65）。
+     *
+     * 面板一打开就只读一次 Intent，而高德在导航中每几秒就播一句（`remain_ms` 随之变小），
+     * 所以 SystemUI 侧每看到导航影子通知更新一帧，就把同一份 `NAV_KEY_*` 载荷广播过来
+     * （见 `ArkLiveExpandHook.pushNavPanelUpdate`）。
+     *
+     * 收件人只有一个：正在显示的 [NAV_PANEL_ACTIVITY]。面板在 `onResume` 动态注册、
+     * `onStop` 注销，并且用 `RECEIVER_NOT_EXPORTED` —— 这条通道**只在本进程内可见**，
+     * 别的 App 既发不进来也收不到。
+     *
+     * 为什么不用 `startActivity` 复投 Intent：那会把面板反复推到前台、重跑一遍展开动画，
+     * 用户的观感是「卡片自己闪」。
+     */
+    const val ACTION_NAV_PANEL_UPDATE = "com.flymeark.NAV_PANEL_UPDATE"
 
     /** 转向码常量（与 [NAV_KEY_TURN] 一一对应） */
     const val NAV_TURN_STRAIGHT = 0

@@ -19,17 +19,19 @@
 
     <!--
         v3.15.61：导航展开卡。
-        三栏标签只有「总量口径」可用 —— 高德不给我们实时的剩余距离 / 剩余时间
-        （见 docs/live-nav-research.md §7），所以标签写成 耗时 / 全程 / 到达，
-        而不是设计稿的 剩余时间 / 剩余距离 / 预计到达。
+        v3.15.65 起三栏改成「剩余耗时 / 总里程 / 实时到达」：
+        v3.15.61 ~ v3.15.64 写的是总量口径（耗时 / 全程 / 到达）—— 高德只播一次总量，
+        用户实测「开出去十分钟还显示出发时的总耗时」。现在剩余值由高德进程按每次播报
+        重算（NAV_KEY_REMAIN_MS），到达时刻也随剩余实时刷新，所以标签要跟着改，
+        否则用户会拿「剩余」去对「耗时」这个名字。
     -->
     <string name="ark_nav_live">导航中</string>
     <string name="ark_nav_default_instr">正在导航</string>
     <string name="ark_nav_back">回到导航</string>
     <string name="ark_nav_source">高德地图</string>
-    <string name="ark_nav_time_label">耗时</string>
-    <string name="ark_nav_dist_label">全程</string>
-    <string name="ark_nav_eta_label">到达</string>
+    <string name="ark_nav_time_label">剩余耗时</string>
+    <string name="ark_nav_dist_label">总里程</string>
+    <string name="ark_nav_eta_label">实时到达</string>
     <string name="ark_nav_placeholder">--</string>
     <string name="ark_nav_collapse">收起</string>
     <string name="ark_nav_turn">转向指示</string>

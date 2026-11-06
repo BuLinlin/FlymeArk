@@ -131,6 +131,16 @@ internal object ArkLiveExpandHook {
     @Volatile
     private var lastPushKey: String? = null
 
+    /**
+     * 上次广播给导航面板的载荷指纹（v3.15.65）。
+     *
+     * 同一帧实况视图可能被 SystemUI 连着重绘好几次（一次播报 → 通知更新 → 多次 layout），
+     * 载荷一模一样时不必再发广播 —— 面板那边虽然也做了去抖，但没必要的跨进程唤醒
+     * 一次都不要。**面板重新打开时置空**（见 [setPanelVisible]），保证第一帧一定推。
+     */
+    @Volatile
+    private var lastNavPushSig: String? = null
+
     private var lastPushAt = 0L
 
     /**
@@ -515,7 +525,11 @@ internal object ArkLiveExpandHook {
      */
     fun setPanelVisible(visible: Boolean) {
         panelVisible = visible
-        if (visible) lastPushKey = null // 重新打开时强制推一次完整信息（含封面）
+        if (visible) {
+            lastPushKey = null   // 重新打开时强制推一次完整信息（含封面）
+            // v3.15.65：导航面板同理 —— 第一帧更新必须发得出去，不能被上一轮的指纹挡住
+            lastNavPushSig = null
+        }
         val ctrl = ctrlRef?.get()
         if (ctrl == null) {
             XposedBridge.log("$TAG: panel visible=$visible (no controller yet)")
@@ -532,15 +546,20 @@ internal object ArkLiveExpandHook {
      */
     fun onLiveViewUpdated() {
         if (!panelVisible) return
-        val v = capsuleRef?.get() ?: return
+        val v = capsuleRef?.get()
         try {
             // 淡出动画还在跑（animation != null）时不要硬压成 0，否则会「闪一下再消失」；
             // 只有原生刷新把 alpha 直接拉回来（没有动画在跑）时才需要再压一次。
-            if (v.animation == null && v.alpha > 0.05f) {
+            if (v != null && v.animation == null && v.alpha > 0.05f) {
                 v.alpha = 0f
             }
         } catch (_: Throwable) {
         }
+        // v3.15.65：实况视图每重绘一次都是「影子通知刚更新过」的信号 ——
+        // 导航面板开着时顺手把最新载荷推过去（面板没开 / 当前显示的不是导航 → 内部直接返回）。
+        // 放在这里而不是 hook onNotificationPosted：那个入口在 [ArkLiveShadowHook] 里，
+        // 且那套 hook 只关心「隐藏行 / 撤影子」，不该再担载荷搬运。
+        pushNavPanelUpdate()
     }
 
     /**
@@ -2167,18 +2186,20 @@ internal object ArkLiveExpandHook {
         // 「回到导航」的兜底目标（拉不到 Launcher Intent 时才用，见面板 openNavigation）
         val clickIntent = try { n?.contentIntent } catch (_: Throwable) { null }
 
-        val instr = ex?.getString(ArkConstants.NAV_KEY_INSTR).orEmpty()
-        val sub = ex?.getString(ArkConstants.NAV_KEY_SUB).orEmpty()
-        val dest = ex?.getString(ArkConstants.NAV_KEY_DEST).orEmpty()
-        val dist = ex?.getString(ArkConstants.NAV_KEY_DIST).orEmpty()
-        val distUnit = ex?.getString(ArkConstants.NAV_KEY_DIST_UNIT).orEmpty()
-        val timeValue = ex?.getString(ArkConstants.NAV_KEY_TIME).orEmpty()
-        val timeUnit = ex?.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty()
-        val eta = ex?.getString(ArkConstants.NAV_KEY_ETA).orEmpty()
-        val started = ex?.getLong(ArkConstants.NAV_KEY_STARTED, 0L) ?: 0L
-        val totalMs = ex?.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L) ?: 0L
-        val turn = ex?.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT)
-            ?: ArkConstants.NAV_TURN_STRAIGHT
+        // 载荷字段的**唯一**拼装点（与 pushNavPanelUpdate 共用，见 navPayloadOf 注释）
+        val payload = navPayloadOf(ex)
+        val instr = payload.getString(ArkConstants.NAV_KEY_INSTR).orEmpty()
+        val sub = payload.getString(ArkConstants.NAV_KEY_SUB).orEmpty()
+        val dest = payload.getString(ArkConstants.NAV_KEY_DEST).orEmpty()
+        val dist = payload.getString(ArkConstants.NAV_KEY_DIST).orEmpty()
+        val distUnit = payload.getString(ArkConstants.NAV_KEY_DIST_UNIT).orEmpty()
+        val timeValue = payload.getString(ArkConstants.NAV_KEY_TIME).orEmpty()
+        val timeUnit = payload.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty()
+        val eta = payload.getString(ArkConstants.NAV_KEY_ETA).orEmpty()
+        val started = payload.getLong(ArkConstants.NAV_KEY_STARTED, 0L)
+        val totalMs = payload.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L)
+        val remainMs = payload.getLong(ArkConstants.NAV_KEY_REMAIN_MS, -1L)
+        val turn = payload.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT)
 
         val intent = Intent().apply {
             setClassName(ArkConstants.APP_PKG, ArkConstants.NAV_PANEL_ACTIVITY)
@@ -2187,17 +2208,7 @@ internal object ArkLiveExpandHook {
                     Intent.FLAG_ACTIVITY_CLEAR_TOP or
                     Intent.FLAG_ACTIVITY_NO_ANIMATION
             )
-            putExtra(ArkConstants.NAV_KEY_INSTR, instr)
-            putExtra(ArkConstants.NAV_KEY_SUB, sub)
-            putExtra(ArkConstants.NAV_KEY_DEST, dest)
-            putExtra(ArkConstants.NAV_KEY_DIST, dist)
-            putExtra(ArkConstants.NAV_KEY_DIST_UNIT, distUnit)
-            putExtra(ArkConstants.NAV_KEY_TIME, timeValue)
-            putExtra(ArkConstants.NAV_KEY_TIME_UNIT, timeUnit)
-            putExtra(ArkConstants.NAV_KEY_ETA, eta)
-            putExtra(ArkConstants.NAV_KEY_STARTED, started)
-            putExtra(ArkConstants.NAV_KEY_TOTAL_MS, totalMs)
-            putExtra(ArkConstants.NAV_KEY_TURN, turn)
+            putExtras(payload)
             putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, pkg)
             putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
             clickIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
@@ -2214,13 +2225,155 @@ internal object ArkLiveExpandHook {
             ctx.startActivity(intent)
             lastLaunchAt = now
             clickHandledAt = now
+            // 打开这一帧就是「上次推过的内容」，实时通道不必再重复推一遍同样的载荷
+            lastNavPushSig = navSigOf(payload)
             XposedBridge.log(
                 "$TAG: nav panel launched, instr='$instr' sub='$sub' dest='$dest' " +
                     "dist='$dist$distUnit' time='$timeValue$timeUnit' eta='$eta' " +
-                    "turn=$turn started=$started totalMs=$totalMs"
+                    "turn=$turn started=$started totalMs=$totalMs remainMs=$remainMs"
             )
         } catch (t: Throwable) {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG nav startActivity failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 把影子通知 extras 里的 `NAV_KEY_*` 原样收进一个 Bundle（v3.15.65）。
+     *
+     * **这是载荷字段唯一的拼装点**：[launchNavPanel]（冷启动整包投递）与
+     * [pushNavPanelUpdate]（面板打开后的实时增量）都从这里取。
+     * 两处各写一遍必然会出现「实时推送少了 `remain_ms`」这种静默错位 ——
+     * 编译期发现不了，只能靠用户看卡片不对。
+     *
+     * 缺失的字段一律给「安全默认」：字符串空串、Long 默认 0（`remain_ms` 给 -1 = 无锚点）、
+     * Int 默认直行转向。面板对空串本来就有占位分支，所以这里不用 `containsKey` 判断。
+     *
+     * @param ex 影子通知的顶层 extras（高德进程写的）
+     * @return 只含 `NAV_KEY_*` 的 Bundle（不含 App 包名 / 夜间模式这类「启动参数」）
+     */
+    private fun navPayloadOf(ex: Bundle?): Bundle {
+        val b = Bundle()
+        b.putString(
+            ArkConstants.NAV_KEY_INSTR, ex?.getString(ArkConstants.NAV_KEY_INSTR).orEmpty()
+        )
+        b.putString(ArkConstants.NAV_KEY_SUB, ex?.getString(ArkConstants.NAV_KEY_SUB).orEmpty())
+        b.putString(ArkConstants.NAV_KEY_DEST, ex?.getString(ArkConstants.NAV_KEY_DEST).orEmpty())
+        b.putString(ArkConstants.NAV_KEY_DIST, ex?.getString(ArkConstants.NAV_KEY_DIST).orEmpty())
+        b.putString(
+            ArkConstants.NAV_KEY_DIST_UNIT, ex?.getString(ArkConstants.NAV_KEY_DIST_UNIT).orEmpty()
+        )
+        b.putString(ArkConstants.NAV_KEY_TIME, ex?.getString(ArkConstants.NAV_KEY_TIME).orEmpty())
+        b.putString(
+            ArkConstants.NAV_KEY_TIME_UNIT, ex?.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty()
+        )
+        b.putString(ArkConstants.NAV_KEY_ETA, ex?.getString(ArkConstants.NAV_KEY_ETA).orEmpty())
+        b.putLong(ArkConstants.NAV_KEY_STARTED, ex?.getLong(ArkConstants.NAV_KEY_STARTED, 0L) ?: 0L)
+        b.putLong(
+            ArkConstants.NAV_KEY_TOTAL_MS, ex?.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L) ?: 0L
+        )
+        // -1 = 本趟还没有锚点（与 ArkNavLiveInjector.UNKNOWN_REMAIN_MS 对齐）
+        b.putLong(
+            ArkConstants.NAV_KEY_REMAIN_MS, ex?.getLong(ArkConstants.NAV_KEY_REMAIN_MS, -1L) ?: -1L
+        )
+        b.putLong(
+            ArkConstants.NAV_KEY_ANCHOR_AT, ex?.getLong(ArkConstants.NAV_KEY_ANCHOR_AT, 0L) ?: 0L
+        )
+        b.putInt(
+            ArkConstants.NAV_KEY_TURN,
+            ex?.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT)
+                ?: ArkConstants.NAV_TURN_STRAIGHT
+        )
+        return b
+    }
+
+    /**
+     * 载荷指纹（判断「这一帧和上一帧是不是同一份」）。
+     *
+     * 只取**用户看得见**的字段：缺了任何一个都会导致该变的时候没变，
+     * 但把 `anchor_at` 这种纯取证字段算进来又会让每帧都「看起来变了」。
+     */
+    private fun navSigOf(p: Bundle): String = try {
+        listOf(
+            p.getString(ArkConstants.NAV_KEY_INSTR).orEmpty(),
+            p.getString(ArkConstants.NAV_KEY_SUB).orEmpty(),
+            p.getString(ArkConstants.NAV_KEY_DEST).orEmpty(),
+            p.getString(ArkConstants.NAV_KEY_DIST).orEmpty(),
+            p.getString(ArkConstants.NAV_KEY_DIST_UNIT).orEmpty(),
+            p.getString(ArkConstants.NAV_KEY_TIME).orEmpty(),
+            p.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty(),
+            p.getString(ArkConstants.NAV_KEY_ETA).orEmpty(),
+            p.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L).toString(),
+            p.getLong(ArkConstants.NAV_KEY_REMAIN_MS, -1L).toString(),
+            p.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT).toString()
+        ).joinToString("\u0001")
+    } catch (_: Throwable) {
+        ""
+    }
+
+    /**
+     * 面板打开期间，把导航影子的**最新**载荷实时广播给面板（v3.15.65）。
+     *
+     * 调用点：[onLiveViewUpdated]（实况视图每次重绘 = 影子刚更新过）。
+     *
+     * 五道闸，缺一条都会出问题：
+     *  1. `panelVisible` —— 面板没开就别发（没人收，纯耗电）；
+     *  2. 当前实况显示的**必须是导航**（胶囊可能已被微信 / 音乐抢走，那时导航载荷是旧数据）；
+     *  3. 影子通知必须存在（导航结束被撤掉后不能再推空载荷）；
+     *  4. 指纹去重 —— 同一帧重绘多次只发一次；
+     *  5. 全程 try/catch —— 这是 SystemUI 进程，任何异常都不能往外抛。
+     *
+     * 为什么不 `startActivity` 复投 Intent：会把面板反复推到前台、重跑展开动画。
+     */
+    private fun pushNavPanelUpdate() {
+        try {
+            if (!panelVisible) return
+            val ctrl = ctrlRef?.get() ?: return
+            // 闸 ②：当前实况渲染的是哪个包（拿不到就当作「是导航」，别把功能卡死）
+            val shownPkg = try {
+                val info = XposedHelpers.getObjectField(ctrl, "mDisplayNotificationInfo")
+                    ?: XposedHelpers.getObjectField(ctrl, "mLyricsInofo")
+                info?.let { XposedHelpers.callMethod(it, "getPackageName") as? String }
+            } catch (_: Throwable) {
+                null
+            }
+            if (shownPkg != null && !ArkConstants.isNavLiveApp(shownPkg)) return
+            val pkg = ArkConstants.NAV_LIVE_PKG
+            // 闸 ③：影子在不在
+            val sbn = latestNavShadowSbn(pkg) ?: return
+            val n = try {
+                XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            val ex: Bundle? = try {
+                n.extras
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            val ctx = try {
+                XposedHelpers.getObjectField(ctrl, "mContext") as? Context
+            } catch (_: Throwable) {
+                null
+            } ?: return
+
+            val payload = navPayloadOf(ex)
+            // 闸 ④：同帧去重
+            val sig = navSigOf(payload)
+            if (sig == lastNavPushSig) return
+            lastNavPushSig = sig
+
+            ctx.sendBroadcast(
+                Intent(ArkConstants.ACTION_NAV_PANEL_UPDATE)
+                    .setPackage(ArkConstants.APP_PKG)
+                    .putExtras(payload)
+            )
+            XposedBridge.log(
+                "$TAG: nav panel update pushed, instr='${
+                    payload.getString(ArkConstants.NAV_KEY_INSTR).orEmpty()
+                }' remainMs=${payload.getLong(ArkConstants.NAV_KEY_REMAIN_MS, -1L)}"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: pushNavPanelUpdate failed: ${t.message}")
         }
     }
 

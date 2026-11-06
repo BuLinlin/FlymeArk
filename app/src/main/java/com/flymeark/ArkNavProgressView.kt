@@ -13,11 +13,12 @@ import kotlin.math.max
  *
  * ## 口径：**时间**，不是距离
  *
- * 高德不给我们实时剩余距离（导航通知的 `android.text` 永远是占位值 `正在导航`，
- * 语音播报里也只有起点那一次「全程」总量），所以进度只能按
- * `已用时间 / 总耗时` 估算，见 `ArkNavPanelActivity.tick()`。
- * 拿不到 `总耗时` 时（[setProgress] 的 `available=false`）只画轨和终点白球，
- * **不画球**——画个 0% 的球会让人以为刚出发。
+ * 高德不给我们实时剩余距离（导航通知的 `android.text` 永远是占位值 `正在导航`），
+ * 所以进度只能按时间口径算：`(总耗时 - 剩余) / 总耗时`。
+ * v3.15.65 起剩余值由高德进程按**每次播报**重算（`ArkConstants.NAV_KEY_REMAIN_MS`），
+ * 面板只在收到新载荷时更新一次、两帧之间冻结（见 `ArkNavPanelActivity.updateProgress`）——
+ * 不再「按秒自己往前走」。拿不到剩余值时（[setProgress] 的 `available=false`）
+ * 只画轨和终点白球，**不画球**——画个 0% 的球会让人以为刚出发。
  *
  * ## 为什么自绘
  *
