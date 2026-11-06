@@ -188,6 +188,11 @@ internal object ArkLiveShadowHook {
                     if (tag == ArkMessageLiveInjector.SHADOW_TAG) return
                     if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) return
                     clearShadowNotification(param.thisObject, pkg)
+                    // 导航的原通知没了 = 导航结束，顺手通知导航注入器「别再更新胶囊」。
+                    // 注意：这里在 SystemUI 进程，改的是本进程那份 ArkNavLiveInjector 的状态，
+                    // 跨不到高德进程；真正兜住「胶囊复活」的是高德侧的
+                    // navNotificationAlive() 判定（见 ArkNavLiveInjector.updateShadowContent）。
+                    if (ArkConstants.isNavLiveApp(pkg)) ArkNavLiveInjector.onNavEnded()
                 } catch (t: Throwable) {
                     XposedBridge.log(
                         "[${ArkConstants.LOG_TAG}] $TAG removal sync error: ${Log.getStackTraceString(t)}"

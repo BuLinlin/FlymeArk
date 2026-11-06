@@ -2,6 +2,117 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.55 胶囊文案跟随语音播报实时更新（探针转正）
+
+### 0. 关键结论：导航播报的明文在 `AudioPlayerTask` 里
+
+v3.15.54 的探针 6 在真机抓到了明文（用户提供，已证实）：
+
+```
+probe ttspcm: pcm type=7 data='又见到你啦！真高兴啊！'
+  group='["又见到你啦！真高兴啊！","准备出发,",",全程八公里,大约需要二十七分钟,右转,随后一百五十米右转"]'
+probe ttspcm: pcm type=0 data='准备出发,'
+probe ttspcm: pcm type=0 data='高德地图持续为您导航'  group='["高德地图持续为您导航"]'
+```
+
+由此确定三件事：
+
+| 事实 | 含义 |
+|---|---|
+| `taskType` 0/7 = TTS 合成 | `data` / `groupData` 就是**明文中文**，不是 PCM/base64 |
+| `groupData` 是本轮播报的**分句 JSON 数组** | 最后一个非空元素 = 即将播报的那句 |
+| 入口是 `JNIPlayer` 实现类的 `playPCMStart(AudioPlayerTask)` | 探针 6 早就挂在这里，直接复用即可 |
+
+「前方三百米右转」这类导航指令走的是同一条路，所以**胶囊从此不必再显示占位值**
+`高德地图 · 正在导航`，可以显示真实指令。
+
+### 1. 功能链路
+
+```
+高德发导航通知 (Service.startForeground)
+        └─→ 发影子通知（占位文案）        → navActive = true
+高德播报 (playPCMStart)
+        └─→ extractNaviText()             → updateShadowContent() → 覆盖 capsuleContent
+导航结束（源通知被移除）
+        ├─→ SystemUI 侧撤影子（既有逻辑，未改）
+        └─→ 下次播报时 navNotificationAlive() 发现源通知没了 → 停止更新，不复活胶囊
+```
+
+### 2. `extractNaviText(task)` 的取法
+
+1. `groupData` → `JSONArray` → **最后一个非空元素**；
+2. 该元素内部还有逗号分句时（高德会把整段并成一条）→ 取**第一个分句**
+   （播报顺序从前到后，第一个分句才是此刻最新指令：
+   `全程八公里,大约需要二十七分钟,右转` → `全程八公里`）；
+3. `groupData` 缺失 / 非法 JSON → 退回 `data`；
+4. `trim` 掉前后 `, ， 空格 、 。`（高德的分句常带尾部逗号，如 `准备出发,`）；
+5. 长度 < 2 或命中噪音词 → 返回 null（丢弃，胶囊保持上一句有效指令）。
+
+噪音词：`真高兴`、`又见到你`、`准备出发`、`持续为您导航`、`开启导航`、`欢迎使用`。
+超过 40 字截断加 `…`（胶囊区很窄，主动收口好过被 UI 硬截）。
+
+### 3. 三道闸，防止「导航结束后胶囊复活」
+
+1. `navActive` —— 没在导航不凭空造胶囊；
+2. `content != lastNaviText` —— 同一句反复播（高德会重播）不重复刷通知；
+3. `navNotificationAlive()` —— `NotificationManager.getActiveNotifications()` 里
+   还有没有 id ∈ {99910001/2/3} 或带 `com.autonavi.minimap.navigating` 的那条。
+   没了就是导航结束，**此时再来一条播报绝不能把胶囊复活**。
+   拿不到列表时返回 true（宁可多更新一帧，也别把功能提前关掉）。
+
+第 3 条是本版最容易写错的地方：`navActive` 只有高德进程知道，而 SystemUI 侧
+`ArkLiveShadowHook` 撤影子是**另一个进程**，跨不过来。
+
+### 4. 静音保证（更新文案绝不能响 / 震）
+
+- 通道：`IMPORTANCE_LOW` + `setSound(null,null)` + `enableVibration(false)` + `setShowBadge(false)`；
+- Builder：`setOnlyAlertOnce(true)` + **`setDefaults(0)`** 清掉 DEFAULT_SOUND/VIBRATE/LIGHTS。
+  只靠 `onlyAlertOnce` 压不住「重新 build 一条通知」的提醒，必须显式清 defaults。
+
+### 5. 删掉的证伪探针（4 个，减少高德进程里的无用开销）
+
+| 探针 | 删掉的理由 |
+|---|---|
+| 1 `fj5.notifyNaviInfo` | hook 成功但真实导航中**零触发**（高德不走 AJX 漏斗） |
+| 2 `ModuleRoute.notifyNaviInfo` | 同上，零触发 |
+| 3 `GStatusObserver.onTbtStatusChanged` | 抽象接口，ART 无 code，**hook 不了** |
+| 4 `NaviManager.registerEventReceiver` / `unregisterEventReceiver` | hook 成功但**零事件**，手机端不用 eyrie TBT |
+| 5 `NaviManager.queryData` | 零触发 |
+
+连带删除：`hookReceiverMethods`、`recvHooked`、`recvCount`、`RECV_MAX_LOG`、
+`recvNonSerialSeen`。**保留** `probe/probeRaw/dumpFields/findCls` 工具函数
+（`dumpFields` 目前无调用点，加 `@Suppress("unused")` 留着下次排查用）。
+
+### 6. 一处 `ArkLiveShadowHook` 改动
+
+`installRemovalSync` 里清完影子后加一行 `ArkNavLiveInjector.onNavEnded()`。
+**如实说明**：这一行在 SystemUI 进程执行，改的是 SystemUI 那份对象，
+跨不到高德进程 —— 它是个「语义落点」，不是实际生效的关断手段；
+真正拦住胶囊复活的是第 3 条的 `navNotificationAlive()`。
+将来若加跨进程通道（ContentProvider / 广播），从这里接即可。
+
+### 7. 本版没碰的文件
+
+`ArkMessageLiveInjector` / `ArkLiveShowFixHook` / `ArkLiveSwipeDismissHook` /
+`ArkMiniBarStyleHook` / `ArkLiveExpandHook` 一行未改；迷你条、消息卡、音乐卡视觉全冻结。
+除上面第 6 条那一行外，`ArkLiveShadowHook` 的判定逻辑也没改。
+
+### 未验证（功能测试由用户做）
+
+- 播报文案是否真的把胶囊改掉了（本版只保证「拿到文案就覆盖」，端到端没跑过）；
+- 「胶囊被占位文案盖回去」这个问题**写代码时就发现并处理了**：高德导航中会秒级刷新导航通知，
+  每次都会走 `postShadow`。若那里一律用 `title · text`，用户看到的就是胶囊在
+  「前方三百米右转」和「正在导航」之间乱跳。处理方式：同一轮导航内（两次命中间隔
+  < 90s）且 `lastNaviText` 非空时，`postShadow` 直接沿用播报文案，不再用占位值；
+  间隔超过 90s 视为新一轮导航，丢掉上一轮的旧指令。
+  **仍待真机确认**的是这个 90s 阈值是否合适（若用户中途休息超过 90 秒再继续导航，
+  胶囊会先回到占位文案，属可接受行为）；
+- `getActiveNotifications()` 在 Flyme 上对同包多进程是否可见（理论上可见，未实测）；
+- 播报频率过高时（每秒一句）通知刷新会不会让胶囊闪烁 —— `updateShadowContent`
+  已做同句去重，但没有做最短间隔节流；若真机上闪烁明显，加一个 800ms~1s 的最小间隔即可。
+
+版本 `versionCode 78 / 3.15.55`（debug 变体已装机，release 签名同 debug key）。
+
 ## 2026-11-06 · v3.15.54 语音播报任务探针（JNIPlayer / AudioPlayerTask）
 
 ### 0. v3.15.53 的实测结论（用户真机验证）
