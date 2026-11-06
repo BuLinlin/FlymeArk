@@ -2,6 +2,63 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.63 导航目的地取证加固（纯探针，行为不变）
+
+**这是一版取证版本：用户可见行为完全不变**（胶囊、迷你条、展开卡、消息 / 音乐分支一行未动）。
+唯一目的：把 v3.15.62「目的地名拿不到」这个问题的取证补全，拿到下一轮定位所需的日志。
+
+v3.15.62 埋的 `NAV EXTRAS DUMP` 有三个盲区，本版逐个补齐。
+
+### 1. `dumpNavExtras()` 递归化
+
+老版本遇到嵌套 `Bundle` 只打 `Bundle{key1,key2}`，**不打里面的值** —— 目的地若藏在子 Bundle
+里，日志等于白打。本版抽出 `flattenExtras(extras, depth, maxDepth)`，子 Bundle 递归展开到
+**深度 2**（顶层 = 0），格式 `k={子k1=v1, 子k2=v2}`；`Array<*>` 仍用 `joinToString("|")`。
+
+三层截断防刷屏：单值 80 字符（沿用）、整行 1500 字符（超了加 `…(truncated)`）、
+`depth` 到上限后子 Bundle 只写 `Bundle{depth-limit}` 不再递归（防自引用 Bundle 死循环）。
+
+### 2. `guessDest()` 递归
+
+老的只在顶层 extras key 里找 `DEST_KEY_HINTS`，子 Bundle 里的 key 看不到。本版抽出
+`findDestInBundle(b, depth)`：先扫当前层 key → 再递归子 Bundle（上限 2 层）→ 都没有才退回
+原有的 tickerText / `EXTRA_SUB_TEXT` 等三级顺序（顺序没变）。命中时新增一行
+`NAV DEST HIT: <text> (from=<key> depth=<n>)`，事后能确认是哪条 key 命中的；未命中不打日志。
+
+### 3. 新增「Service 启动 Intent」探针（本轮最关键的增量）
+
+高德用 `Service.startForeground` 发导航通知，但**启动那个 Service 的 Intent** 里通常带路线
+参数（含终点 POI 名）—— 这条通道比通知 extras 更可能有货，此前完全没取。
+
+新增 `hookServiceIntents()`，在 `android.app.ActivityThread` 上挂 `handleServiceArgs` /
+`handleBindService` 两个 after hook（隐藏类用 `Class.forName` 取，不 import）。从
+`ServiceArgsData` / `BindServiceData` 里**反射找第一个 `instanceof Intent` 的字段**（不硬编码
+字段名，各 ROM 不一致），按 `服务名:action` 去重，**总 dump 上限 8 次**，达到上限后打一次
+`NAV SVC INTENT DUMP: cap reached (8)` 就不再打。日志格式：
+
+```
+NAV SVC INTENT DUMP: svc=<simpleName> action=<action> | extras: <flatten 深度2，截 800>
+```
+
+全程 `try/catch` 包死，任何一行失败都静默 —— 宿主是高德，探针抛异常会被用户当成「高德崩了」。
+
+### 4. 怎么用这版日志
+
+开一次导航，抓 LSPosed 日志里这三类行：
+
+```
+NAV EXTRAS DUMP: ...        ← 通知 extras 全量（含子 Bundle 的值）
+NAV SVC INTENT DUMP: ...    ← 启动导航 Service 的 Intent extras
+NAV DEST HIT: ...           ← 命中了哪条 key（有就说明已经抓到了）
+```
+
+三条都没有地名，才需要走 `docs/live-nav-research.md` 的下一层路径。
+部署方式不变：`am force-stop com.android.systemui`，不要整机重启。
+
+版本 `versionCode 86 / 3.15.63`。
+
+---
+
 ## 2026-11-06 · v3.15.62 导航卡 / 迷你条首轮实测修订
 
 依据用户第一轮实拍（展开卡 + 迷你条截图）与 LSPosed 日志，改 5 处。

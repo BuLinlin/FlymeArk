@@ -4,7 +4,9 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Service
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.drawable.Icon
 import android.os.Bundle
@@ -1056,55 +1058,214 @@ internal object ArkNavLiveInjector {
         "正在为您", "下车", "车道", "限速", "摄像头", "点击", "查看", "米后", "转"
     )
 
+    // ---------------------------------------------------------------- 取证：通知 extras / 目的地
+    //
+    // v3.15.62 的目的地问题（展开卡状态行该显示目的地，三个来源全查空）：
+    // 播报里没有「前往/目的地/终点」，通知 title/text 是固定占位，`last_route.xml` 只有经纬度。
+    //
+    // v3.15.63 补齐 v3.15.62 那版探针的三个盲区：
+    //  ① 嵌套 `Bundle` 只打了里面的 key、**没打值** —— 目的地若藏在子 Bundle 里，日志等于白打；
+    //  ② `guessDest()` 只看顶层 key，子 Bundle 里的 key 看不到；
+    //  ③ **启动 Service 的 Intent extras** 完全没取（见 [hookServiceIntents]）——
+    //     高德导航是 `Service.startForeground` 起的，启动它的 Intent 里通常带路线参数
+    //     （含终点 POI 名），这条通道比通知 extras 更可能有货。
+    //
+    // 三个日志入口的前缀固定，开发/用户靠 grep 定位，**不要改**：
+    //   `NAV EXTRAS DUMP:` / `NAV SVC INTENT DUMP:` / `NAV DEST HIT:`
+
+    /** 嵌套 Bundle 展开深度：顶层 = 0，最多再展开两层子 Bundle */
+    private const val EXTRAS_MAX_DEPTH = 2
+
+    /** 整个 flatten 结果的长度上限（防一条通知把 logcat 刷爆） */
+    private const val EXTRAS_FLAT_MAX_LEN = 1500
+
+    /** 单个值的长度上限（沿用 v3.15.62 的 80） */
+    private const val EXTRAS_VALUE_MAX_LEN = 80
+
+    /** Service 启动 Intent 的 extras 日志长度上限 */
+    private const val SVC_INTENT_EXTRAS_MAX_LEN = 800
+
+    /** 顶层 key 之间的分隔符（沿用 v3.15.62 的 `" ; "`） */
+    private const val EXTRAS_SEP_TOP = " ; "
+
+    /** 子 Bundle 内部 key 之间的分隔符（`k={子k1=v1, 子k2=v2}`） */
+    private const val EXTRAS_SEP_NESTED = ", "
+
     /**
-     * 每趟导航打一次原通知 extras 全量取证。
+     * 递归展开一个 Bundle 的全部 key/值，拼成一行可 grep 的字符串。
      *
-     * v3.15.62 的目的地问题：播报和 title/text 都没有 POI 名，必须先看清楚
-     * 高德到底把它放在哪个字段（或压根没放在通知里）。这一条日志是下一轮
-     * 精确定位的依据，不要删。
+     * 输出格式（与 v3.15.62 的单层版同源，只是子 Bundle 从「只打 key」变成「连值一起打」）：
+     * ```
+     * key1=value1 ; key2={sub1=v1, sub2=v2} ; key3=String
+     * ```
+     *
+     * 取值规则沿用 v3.15.62 的 `when`（`CharSequence` / `Array<*>` / `Bundle` /
+     * `Number`·`Boolean` / 其余打 `javaClass.simpleName`），新增的只有递归本身。
+     *
+     * **防自引用**：`depth >= maxDepth` 时子 Bundle 只输出 `Bundle{depth-limit}`，不再递归 ——
+     * 异常数据里出现 Bundle 自引用也不会把宿主（高德）进程拖死。
+     *
+     * @param extras   要展开的 Bundle（顶层传原通知 extras）
+     * @param depth    当前层号（顶层 = 0）
+     * @param maxDepth 允许展开的最大层号
+     * @return 一行字符串；任何异常都返回已拼好的部分，**绝不抛出**
      */
     @Suppress("DEPRECATION") // Bundle.get(String) 是全量 dump 唯一能用的泛型取法
+    private fun flattenExtras(extras: Bundle, depth: Int, maxDepth: Int): String =
+        flattenExtras(extras, depth, maxDepth, EXTRAS_SEP_TOP)
+
+    /** [flattenExtras] 的实现体：`sep` 用于区分顶层 `" ; "` 与嵌套 `", "` */
+    @Suppress("DEPRECATION")
+    private fun flattenExtras(extras: Bundle, depth: Int, maxDepth: Int, sep: String): String {
+        val sb = StringBuilder()
+        try {
+            for (k in extras.keySet()) {
+                if (sb.isNotEmpty()) sb.append(sep)
+                sb.append(k).append('=')
+                val v = try {
+                    extras.get(k)
+                } catch (_: Throwable) {
+                    null
+                }
+                sb.append(flattenValue(v, depth, maxDepth))
+            }
+        } catch (_: Throwable) {
+        }
+        return sb.toString()
+    }
+
+    /**
+     * 单个值 → 日志里的字符串形式（[flattenExtras] 的递归单元）。
+     *
+     * 只有 `Bundle` / `Array<*>` 会继续递归，其余都是叶子：
+     *  - `CharSequence` → 原文（截 [EXTRAS_VALUE_MAX_LEN] = 80 字符）；
+     *  - `Number` / `Boolean` → `toString()`；
+     *  - 其余 → `javaClass.simpleName`（Bitmap / PendingIntent / Icon 之类看类型就够）。
+     *
+     * 数组内部同样推进一层深度 —— `Object[]` 里塞 Bundle（甚至自引用）也不会无限递归。
+     */
+    private fun flattenValue(v: Any?, depth: Int, maxDepth: Int): String = try {
+        when {
+            v == null -> "null"
+            v is Bundle -> if (depth >= maxDepth) {
+                "Bundle{depth-limit}"
+            } else {
+                "{" + flattenExtras(v, depth + 1, maxDepth, EXTRAS_SEP_NESTED) + "}"
+            }
+            v is Array<*> -> if (depth >= maxDepth) {
+                "Array{${v.size}}"
+            } else {
+                v.joinToString("|") {
+                    flattenValue(it, depth + 1, maxDepth).take(EXTRAS_VALUE_MAX_LEN)
+                }
+            }
+            v is CharSequence -> v.toString().take(EXTRAS_VALUE_MAX_LEN)
+            v is Number || v is Boolean -> v.toString()
+            else -> v.javaClass.simpleName ?: "?"
+        }
+    } catch (_: Throwable) {
+        "?"
+    }
+
+    /**
+     * 每趟导航打一次原通知 extras 全量取证（v3.15.62 引入，v3.15.63 递归化）。
+     *
+     * 这一次 dump 是下一轮精确定位目的地的唯一依据，**不要删**；
+     * 日志前缀 `NAV EXTRAS DUMP:` 一字不改（用户靠 grep 这行）。
+     *
+     * 一次性语义由 [extrasDumped] 保证（每趟导航一次），重置点在 [resetNavPayload]。
+     */
+    @Suppress("DEPRECATION")
     private fun dumpNavExtras(extras: Bundle, src: Notification) {
         if (extrasDumped) return
         extrasDumped = true
         try {
-            val sb = StringBuilder()
-            for (k in extras.keySet()) {
-                val v = extras.get(k)
-                val s = when (v) {
-                    is CharSequence -> v.toString()
-                    is Array<*> -> v.joinToString("|") { it?.toString().orEmpty() }
-                    is Bundle -> "Bundle{" + v.keySet().joinToString(",") + "}"
-                    is Number, is Boolean -> v.toString()
-                    else -> v?.javaClass?.simpleName ?: "null"
-                }
-                sb.append(k).append('=').append(s.take(80)).append(" ; ")
+            val flat = flattenExtras(extras, 0, EXTRAS_MAX_DEPTH)
+            val body = if (flat.length > EXTRAS_FLAT_MAX_LEN) {
+                flat.take(EXTRAS_FLAT_MAX_LEN) + "…(truncated)"
+            } else {
+                flat
             }
             val ticker = try {
                 src.tickerText?.toString()
             } catch (_: Throwable) {
                 null
             }
-            log("NAV EXTRAS DUMP: $sb | ticker='${ticker.orEmpty()}'")
+            log("NAV EXTRAS DUMP: $body | ticker='${ticker.orEmpty()}'")
         } catch (_: Throwable) {
         }
+    }
+
+    /** 目的地递归查找的深度上限（与 [EXTRAS_MAX_DEPTH] 同口径：顶层 = 0） */
+    private const val DEST_MAX_DEPTH = 2
+
+    /**
+     * 在 Bundle（含嵌套子 Bundle）里找一个「像地名」的值。
+     *
+     * 顺序（v3.15.63 规定，不可交换）：
+     *  1. 先扫**当前层**全部 key，命中 [DEST_KEY_HINTS] 任一片段 → 取 `CharSequence` /
+     *     数组首个 → [sanitizeDest] 通过就返回；
+     *  2. 再遍历当前层的嵌套 Bundle 递归（只在 `depth < DEST_MAX_DEPTH` 时下探）；
+     *  3. 当前层与子层都没有 → 返回 null，由 [guessDest] 继续走 ticker / 补充文案。
+     *
+     * 命中时额外打一行 `NAV DEST HIT: <text> (from=<key> depth=<n>)`，事后能确认是哪条 key
+     * 命中的；未命中**不打日志**（否则每帧都是一行噪声，导航中通知是秒级刷新的）。
+     *
+     * @param b     待查 Bundle
+     * @param depth 当前层号（顶层 = 0）
+     * @return 通过 [sanitizeDest] 的地名；没有返回 null
+     */
+    @Suppress("DEPRECATION") // 按 key 取任意类型值的唯一泛型取法
+    private fun findDestInBundle(b: Bundle, depth: Int): String? {
+        // ① 当前层：命中「像地名」的 key 片段就直接取
+        try {
+            for (k in b.keySet()) {
+                val lk = try {
+                    k.lowercase(Locale.ROOT)
+                } catch (_: Throwable) {
+                    k
+                }
+                if (!DEST_KEY_HINTS.any { lk.contains(it) }) continue
+                val v = try {
+                    b.get(k)
+                } catch (_: Throwable) {
+                    null
+                }
+                val s = when (v) {
+                    is CharSequence -> v.toString()
+                    is Array<*> -> v.firstOrNull()?.toString()
+                    else -> null
+                }
+                sanitizeDest(s.orEmpty())?.let { hit ->
+                    log("NAV DEST HIT: $hit (from=$k depth=$depth)")
+                    return hit
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        // ② 子 Bundle（深度上限内才下探，防自引用）
+        if (depth < DEST_MAX_DEPTH) {
+            try {
+                for (k in b.keySet()) {
+                    val child = try {
+                        b.get(k) as? Bundle
+                    } catch (_: Throwable) {
+                        null
+                    } ?: continue
+                    findDestInBundle(child, depth + 1)?.let { return it }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return null
     }
 
     /** 从原通知里找一个「像地名」的值；找不到返回 null（面板回落「高德地图」）。 */
     @Suppress("DEPRECATION") // 同上：按 key 取任意类型的值
     private fun guessDest(extras: Bundle, src: Notification): String? {
-        // ① 明确的「目的地类」key
-        for (k in extras.keySet()) {
-            val lk = k.lowercase(Locale.ROOT)
-            if (!DEST_KEY_HINTS.any { lk.contains(it) }) continue
-            val v = extras.get(k)
-            val s = when (v) {
-                is CharSequence -> v.toString()
-                is Array<*> -> v.firstOrNull()?.toString()
-                else -> null
-            }
-            sanitizeDest(s.orEmpty())?.let { return it }
-        }
+        // ① 明确的「目的地类」key（v3.15.63：递归进子 Bundle）
+        findDestInBundle(extras, 0)?.let { return it }
         // ② tickerText
         try {
             sanitizeDest(src.tickerText?.toString().orEmpty())?.let { return it }
@@ -1504,6 +1665,182 @@ internal object ArkNavLiveInjector {
         XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG: $msg")
     }
 
+    // ---------------------------------------------------------------- 取证：Service 启动 Intent
+    //
+    // v3.15.63 新增，本轮最关键的增量。
+    //
+    // 事实链：高德用 `Service.startForeground` 发导航通知（id 99910001/2/3，title/text 固定
+    // 占位），导航通知里没有目的地；TTS 播报里也没有。剩下唯一「本该有地名」的地方就是
+    // **启动那个 Service 的 Intent** —— 路线参数（起点/终点 POI）通常随 Intent extras 传进
+    // 导航 Service。所以这里 hook `ActivityThread` 的两个 Service 派发入口把它取出来。
+    //
+    // 为什么要用 `Class.forName` 而不是 import `android.app.ActivityThread`：它是隐藏类，
+    // 编译期不可见（会直接编译失败），只能在运行期取。
+    //
+    // 三条硬约束（违反任何一条都可能被用户感知为「高德崩了」）：
+    //  1. 每个回调整体包 `try/catch (_: Throwable)`，**绝不把异常抛进宿主进程**；
+    //  2. 必须有**总 dump 次数上限**（[SVC_INTENT_MAX_DUMP]），高德后台 Service 启动很频繁；
+    //  3. 过滤（cap / action / extras / 去重）全部排在 [flattenExtras] **之前**，
+    //     不能对每个 SDK Service 启动都做字符串拼接。
+
+    /** 已 dump 过的 `serviceClassName:action` 组合（去重） */
+    private val svcIntentSeen = HashSet<String>(8)
+
+    /** 已 dump 次数 */
+    private var svcIntentDumps = 0
+
+    /** Service Intent dump 总次数上限 */
+    private const val SVC_INTENT_MAX_DUMP = 8
+
+    /** 「cap reached」提示是否已打过（只打一次） */
+    private var svcIntentCapLogged = false
+
+    /**
+     * 注册 Service 启动 Intent 的取证探针。
+     *
+     * 挂两个入口（都是单参数，参数是 `ActivityThread$XxxData`）：
+     *  - `handleServiceArgs`（`ServiceArgsData`）—— `startService` / `startForegroundService`；
+     *  - `handleBindService`（`BindServiceData`）—— `bindService`。
+     *
+     * 用 `hookAllMethods` 而不是 `findAndHookMethod`：ActivityThread 上这些方法名在部分 ROM
+     * 有重载，逐个按签名找容易漏。回调里用 `args.size != 1` 过滤。
+     */
+    private fun hookServiceIntents() {
+        try {
+            val atCls = Class.forName("android.app.ActivityThread")
+            hookServiceIntentMethod(atCls, "handleServiceArgs")
+            hookServiceIntentMethod(atCls, "handleBindService")
+        } catch (t: Throwable) {
+            // 取不到 ActivityThread（极少数 ROM）就直接放弃，不影响导航胶囊本身
+            probeRaw("svc intent: ActivityThread unavailable (${t.javaClass.simpleName})")
+        }
+    }
+
+    /** 在 `ActivityThread` 的某个 Service 入口上挂 after hook（失败只记日志） */
+    private fun hookServiceIntentMethod(atCls: Class<*>, methodName: String) {
+        try {
+            XposedBridge.hookAllMethods(
+                atCls, methodName,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        dumpServiceIntent(param)
+                    }
+                }
+            )
+            probeRaw("svc intent: hooked ActivityThread.$methodName")
+        } catch (t: Throwable) {
+            probeRaw("svc intent: hook $methodName failed (${t.javaClass.simpleName})")
+        }
+    }
+
+    /**
+     * 从一次 Service 派发里取出启动 Intent，dump 其 extras。
+     *
+     * 字段名不硬编码（各 ROM 的 `ServiceArgsData` / `BindServiceData` 字段名不同）：
+     * 用 [firstFieldOfType] 找**第一个 `instanceof Intent` 的字段**；Service 名同理找
+     * 第一个 `instanceof Service` 的字段，取不到写 `?`。
+     *
+     * 全部失败路径都静默 —— 宿主是高德，探针绝不能让它崩。
+     */
+    private fun dumpServiceIntent(param: XC_MethodHook.MethodHookParam) {
+        try {
+            val args = param.args
+            if (args == null || args.size != 1) return
+            val data = args[0] ?: return
+
+            // 闸门①：总次数上限。**放在最前面** —— 达到上限后连反射都不做
+            if (!svcIntentHasBudget()) return
+
+            val intent = firstFieldOfType(data, Intent::class.java) as? Intent ?: return
+            val action = try {
+                intent.action
+            } catch (_: Throwable) {
+                null
+            }
+            val extras = try {
+                intent.extras
+            } catch (_: Throwable) {
+                null
+            }
+            // 闸门②：既无 action 又无 extras 的 Service 启动与本问题无关，直接丢
+            if (action == null && extras == null) return
+
+            val svcName = try {
+                firstFieldOfType(data, Service::class.java)?.javaClass?.name ?: "?"
+            } catch (_: Throwable) {
+                "?"
+            }
+            // 闸门③：同一 `服务名:action` 只 dump 一次
+            if (!svcIntentClaim("$svcName:$action")) return
+
+            val flat = if (extras == null) {
+                "<none>"
+            } else {
+                flattenExtras(extras, 0, EXTRAS_MAX_DEPTH).let {
+                    if (it.length > SVC_INTENT_EXTRAS_MAX_LEN) {
+                        it.take(SVC_INTENT_EXTRAS_MAX_LEN) + "…"
+                    } else {
+                        it
+                    }
+                }
+            }
+            log(
+                "NAV SVC INTENT DUMP: svc=${svcName.substringAfterLast('.')} " +
+                    "action=${action ?: "?"} | extras: $flat"
+            )
+        } catch (_: Throwable) {
+            // 宿主进程：异常必须在这里消失
+        }
+    }
+
+    /** 还有 dump 额度吗；额度用尽时打一次 `cap reached` 提示后返回 false */
+    private fun svcIntentHasBudget(): Boolean = synchronized(svcIntentSeen) {
+        if (svcIntentDumps < SVC_INTENT_MAX_DUMP) return@synchronized true
+        if (!svcIntentCapLogged) {
+            svcIntentCapLogged = true
+            log("NAV SVC INTENT DUMP: cap reached ($SVC_INTENT_MAX_DUMP)")
+        }
+        false
+    }
+
+    /** 认领一个 `serviceClassName:action` 组合；已认领过或额度用尽返回 false */
+    private fun svcIntentClaim(key: String): Boolean = synchronized(svcIntentSeen) {
+        if (svcIntentDumps >= SVC_INTENT_MAX_DUMP) return@synchronized false
+        if (!svcIntentSeen.add(key)) return@synchronized false
+        svcIntentDumps++
+        true
+    }
+
+    /**
+     * 反射找一个对象里**第一个**指定类型的实例字段值（沿类继承链向上找，跳过 static）。
+     *
+     * 为什么不硬编码字段名：`ActivityThread$ServiceArgsData` / `$BindServiceData` 的字段名
+     * 在 AOSP 与各 ROM 之间不一致（`args` / `intent` / `info`），按类型找才稳。
+     *
+     * @return 命中的字段值；没有返回 null（任何反射异常都吞掉）
+     */
+    private fun firstFieldOfType(obj: Any?, type: Class<*>): Any? {
+        if (obj == null) return null
+        try {
+            var c: Class<*>? = obj.javaClass
+            var guard = 0
+            while (c != null && guard++ < 8) {
+                for (f in c.declaredFields) {
+                    try {
+                        if (Modifier.isStatic(f.modifiers)) continue
+                        f.isAccessible = true
+                        val v = f.get(obj)
+                        if (v != null && type.isInstance(v)) return v
+                    } catch (_: Throwable) {
+                    }
+                }
+                c = c.superclass
+            }
+        } catch (_: Throwable) {
+        }
+        return null
+    }
+
     // ---------------------------------------------------------------- 安装
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
@@ -1581,6 +1918,11 @@ internal object ArkNavLiveInjector {
                 )
             }
         }
+
+        // v3.15.63：取证探针 —— 启动导航 Service 的 Intent extras（路线参数里通常带终点
+        // POI 名）。与 startForeground hook 装在同一处：两者都指向「高德怎么起导航」这条链路。
+        // 内部已全程 try/catch，失败不影响上面的功能 hook。
+        hookServiceIntents()
 
         // 不在 App 侧 hook cancel：高德 cancel 的通知不一定是导航那条，一律清影子会让胶囊
         // 在高德刷新通知的间隙里闪没。销毁同步统一放 SystemUI 的 onNotificationRemoved。
