@@ -590,6 +590,8 @@ internal object ArkNavLiveInjector {
         reason: String,
         notifId: Int?
     ) {
+        // v3.15.74：我们自己重投高德那条通知时不要递归回来
+        if (selfNotify) return
         // v3.15.66（R2）：这里只挡「同一次退出之后 1.5 秒内的重投」。
         //
         // 旧实现是 5 秒静默窗一刀切，真机上把 14:13:35 那次**骑行导航的新首帧**也吞了
@@ -773,6 +775,21 @@ internal object ArkNavLiveInjector {
             return
         }
         if (!publishShadow(nm, shadow)) return
+
+        // v3.15.74：改写**高德自己那条**通知的标题。
+        //
+        // 真机 `dumpsys notification` 实证：
+        //   · 我们的影子 flymeark_live_nav → android.title='全程十公里'（改对了）
+        //   · 高德自己的 99910001        → android.title='高德地图'
+        //   · 屏幕上那条实况导航条显示的是**后者**
+        //
+        // 也就是说 Flyme 把高德那条 `category=navigation` 的通知原生渲染成了实况条，
+        // 我们发的影子是另一条、排在后面。在 SystemUI 侧改 TextView 改不动，
+        // 因为改的根本不是那条。
+        //
+        // 所以这里直接把高德那条的 contentTitle 换成指令再重投一次 —— 它自己每几秒
+        // 会把标题刷回「高德地图」，所以每帧都要改。
+        rewriteSourceTitle(nm, src, notifId, content)
         // v3.15.65：这一帧就是「上次投递过的载荷」，让后续播报的去重基准对齐，
         // 否则第一条播报会无谓地重投一次（内容一模一样）
         lastShadowSig = shadowSigOf(content, remainTimePair())
@@ -823,15 +840,27 @@ internal object ArkNavLiveInjector {
     @Suppress("DEPRECATION")
     private fun buildShadow(content: String, requireLargeIcon: Boolean = true): Notification? {
         val ctx = lastCtx ?: return null
-        val title = lastTitle ?: return null
+        // 素材完整性守卫：没有源通知标题说明还没抓到高德那条通知，什么都不发
+        lastTitle ?: return null
         val largeIcon = lastNaviIcon
         if (requireLargeIcon && largeIcon == null) return null
         val smallIcon = lastSmallIcon ?: return null
         return try {
             val b = Notification.Builder(ctx, NAV_SHADOW_CHANNEL)
                 .setSmallIcon(smallIcon)
-                .setContentTitle(title)
-                .setContentText(lastBody ?: title)
+                // v3.15.73：**标题就是指令**，不再用源通知的固定「高德地图」。
+                //
+                // 这是这套东西最关键的一改。迷你条那行字是系统直接从
+                // `contentTitle` 画到 `title_header_live` 上的，我们在 SystemUI 侧
+                // 用反射去改那个 TextView 一直改不动 —— 真机 dump 证明同一个 header
+                // 会切成 `title_header_live_public`（锁屏/加密态），那时
+                // `findViewById(titleId)` 直接返回 null，写了个寂寞；而且系统每次
+                // 重新绑定都会把我们写的覆盖回去。
+                //
+                // 微信/QQ 那条从来不用折腾标题，就是因为它的标题本来就是内容。
+                // 导航同理：把指令放进 `contentTitle`，系统自己画，零反射。
+                .setContentTitle(content)
+                .setContentText(lastBody ?: "")
                 .setOnlyAlertOnce(true)
                 .setDefaults(0)
                 .setShowWhen(false)
@@ -917,6 +946,49 @@ internal object ArkNavLiveInjector {
     } catch (t: Throwable) {
         log("skip reason=notify_failed ${t.message}")
         false
+    }
+
+    /**
+     * 自己在重投高德那条通知 —— 用来打断 「notify → 我们再改写 → 再 notify」的递归。
+     */
+    @Volatile
+    private var selfNotify = false
+
+    /**
+     * 把**高德自己那条**导航通知的标题改写成指令，并重投一次（v3.15.74）。
+     *
+     * 为什么必须改它：Flyme 把 `category=navigation` 的通知原生渲染成实况导航条，
+     * 屏幕上那条是它，不是我们发的影子。影子负责带载荷（`NAV_KEY_*`），
+     * 但**显示的字来自高德这条的 contentTitle**。
+     *
+     * 幂等：标题已经是目标值就直接返回 —— 既省一次重投，也顺带打断递归
+     * （重投会再次进入本函数，那时标题已相等 → 立即返回）。
+     */
+    private fun rewriteSourceTitle(
+        nm: NotificationManager,
+        src: Notification,
+        notifId: Int?,
+        content: String,
+    ) {
+        val id = notifId ?: return
+        if (content.isBlank()) return
+        try {
+            val ex = src.extras ?: return
+            val cur = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+            if (cur == content) return
+            ex.putCharSequence(Notification.EXTRA_TITLE, content)
+            // 正文原本是「正在导航」，留着会在下面多出一行，清掉
+            ex.putCharSequence(Notification.EXTRA_TEXT, "")
+            selfNotify = true
+            try {
+                nm.notify(id, src)
+            } finally {
+                selfNotify = false
+            }
+            log("src title -> '$content'")
+        } catch (t: Throwable) {
+            log("src rewrite failed: ${t.message}")
+        }
     }
 
     // ---------------------------------------------------------------- 播报 → 胶囊

@@ -150,6 +150,9 @@ internal object ArkMiniBarStyleHook {
     /** 「这不是我们的导航影子」只提示一次，避免高德其它实况刷新时刷屏 */
     private var navGhostLogged = false
 
+    /** 导航子树 dump 剩余次数（启动后前 3 次，用于定位系统标题控件） */
+    private var navDumpLeft = 3
+
     @Volatile
     private var idsReady = false
 
@@ -313,19 +316,23 @@ internal object ArkMiniBarStyleHook {
     ) {
         val parent = header as? ViewGroup ?: return
         val parsed = navPayloadOf(row)
-        // v3.15.70：present=false 说明这条实况根本不是我们的导航影子（高德同包名下的
-        // 其它实况通知）。此时绝不能拿上一趟的载荷去画 —— 否则会把上一趟的指令 /
-        // 剩余时间 / 甚至偏航红画到一条跟导航无关的通知上。
-        val existing = header.getTag(KEY_NAV) as? ArkMiniNavView
-        if (!parsed.present) {
-            if (!navGhostLogged) {
-                navGhostLogged = true
-                XposedBridge.log("[$TAG] nav bar skipped: not our shadow")
-            }
-            existing?.visibility = View.GONE
-            return
+        // v3.15.72：把 header 整棵子树 dump 出来（前 3 次）。
+        // 导航条此前是「哑」的，只能靠用户截图猜；这条一次性把「系统到底用哪个
+        // TextView 画那行字 / 有没有第二个标题控件」固化下来。
+        if (navDumpLeft > 0) {
+            navDumpLeft--
+            XposedBridge.log(
+                "[$TAG] navDump(${3 - navDumpLeft}/3): fromShadow=${parsed.present} " +
+                    "instr='${parsed.instr.take(24)}' remain=${parsed.remainMs} " +
+                    "total=${parsed.totalMs} turn=${parsed.turn} yawed=${parsed.yawed}\n" +
+                    dumpSubtree(header)
+            )
         }
-        existing?.visibility = View.VISIBLE
+        // v3.15.71：不是我们的影子（高德原生导航通知 / 其它实况）就**什么都不画**，
+        // 保持系统原样。v3.15.70 会把它 GONE 掉，反而比不画更糟：那一行本来就是
+        // 系统唯一显示出来的导航条，藏掉等于整条没了。
+        if (!parsed.present) return
+        (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.VISIBLE
         // present=true 但三字段全空 = 反射只读到一部分（正常帧 instr 必非空，见 buildShadow），
         // 此时沿用上一次成功的载荷，语义等同「两次播报之间冻结」。
         val usable = parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L
@@ -336,7 +343,7 @@ internal object ArkMiniBarStyleHook {
             lastGoodNav ?: parsed
         }
 
-        var overlay = existing
+        var overlay = header.getTag(KEY_NAV) as? ArkMiniNavView
         if (overlay == null) {
             overlay = ArkMiniNavView(header.context, density, appIconOf(header.context, pkg))
             overlay.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -362,6 +369,25 @@ internal object ArkMiniBarStyleHook {
             if (tv != null) {
                 if (tv.text?.toString() != p.instr) tv.text = p.instr
                 tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, 13f * density)
+            }
+        }
+        // v3.15.73：同一个 header 会切成 `*_public` 子节点（锁屏 / 内容加密态，
+        // 真机 dump 见过 `title_header_live_public` + `content_header_live_public`='已加密'）。
+        // 那时上面按 id 找 `title_header_live` 会返回 null —— 字号就退回系统默认 20sp。
+        // 这里按资源名再兜一次，只调字号，**不碰文案**：文案已经由影子通知的
+        // contentTitle 带过来了（见 ArkNavLiveInjector.buildShadow 的 v3.15.73 注释）。
+        if (titleId != 0) {
+            try {
+                val publicId = Resources.getSystem().getIdentifier(
+                    "title_header_live_public", "id", "android"
+                )
+                if (publicId != 0) {
+                    (header.findViewById<View>(publicId) as? TextView)?.setTextSize(
+                        TypedValue.COMPLEX_UNIT_PX, 13f * density
+                    )
+                }
+            } catch (_: Throwable) {
+                // 该 ROM 没有这个变体就跳过
             }
         }
 
@@ -411,10 +437,50 @@ internal object ArkMiniBarStyleHook {
             timeText = ex.getString(ArkConstants.NAV_KEY_TIME).orEmpty(),
             timeUnit = ex.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty(),
             yawed = ex.getBoolean(ArkConstants.NAV_KEY_YAWED, false),
-            present = true,
+            // v3.15.71 修正：v3.15.70 这里无条件写 true，导致高德**原生**那条通知
+            // （extras 里没有 NAV_KEY_*）也被当成了我们的影子，于是在上面画出一个
+            // 空壳：默认直行箭头 + 空进度轨 + 没有时间值，标题还是系统的「高德地图」。
+            // 正确判据是「这个键到底在不在」，而不是「读出来是不是空串」。
+            present = ex.containsKey(ArkConstants.NAV_KEY_INSTR),
         )
     } catch (_: Throwable) {
         NavMiniPayload()
+    }
+
+    /**
+     * 诊断用：把 header 子树里每个 View 的类名 / id 名 / 文案 / 字号 / 可见性 / 位置拼出来
+     * （v3.15.72，只在启动后前 3 次导航样式化时调用）。
+     *
+     * 目的：搞清楚系统到底用哪个控件画「高德地图」那行字 —— 是 `title_header_live`
+     * 还是别的兄弟节点，以及我们覆盖之后有没有被系统改回去。
+     */
+    private fun dumpSubtree(header: View): String = try {
+        val sb = StringBuilder()
+        fun walk(v: View, depth: Int) {
+            if (depth > 4) return
+            val pad = "  ".repeat(depth)
+            val idName = try {
+                if (v.id == View.NO_ID) "no-id"
+                else v.resources.getResourceName(v.id).substringAfterLast('/')
+            } catch (_: Throwable) {
+                v.id.toString()
+            }
+            sb.append('\n').append(pad).append(v.javaClass.simpleName).append('#').append(idName)
+            sb.append(" vis=").append(v.visibility)
+            sb.append(" ").append(v.left).append(',').append(v.top)
+            sb.append(' ').append(v.width).append('x').append(v.height)
+            if (v is TextView) {
+                sb.append(" size=").append(String.format("%.1f", v.textSize / v.resources.displayMetrics.density))
+                sb.append(" txt='").append(v.text?.toString()?.take(20)).append('\'')
+            }
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) walk(v.getChildAt(i), depth + 1)
+            }
+        }
+        walk(header, 0)
+        sb.toString()
+    } catch (_: Throwable) {
+        "?"
     }
 
     /**
