@@ -107,8 +107,11 @@ probe tts: loadClass watcher failed ...
 - **探针 6 是否真能拦到播报任务**（构建期无法验证，需跑一段真实导航听播报）；
 - `AudioPlayerTask.data` 到底是不是中文文案（也可能是 PCM 的 base64 或空串）；
 - `taskType` 的语义（0/6/7 各代表什么）需要靠真机日志反推；
-- 若高德把 TTS 放在独立进程（`:tts` 之类）而作用域只勾了主包，探针会完全静默 ——
-  届时看 `pidof com.autonavi.minimap` 是不是多进程即可判断。
+- 若 `AudioPlayerTask.data` 拿到的不是文案而是空串，说明这批播报全是预录 `.spx`，
+  `ttsf` 那条日志里的文件名就是唯一可用的线索（只能判断「说了哪一类」，没有中文）；
+- 已核对 `ArkEntry` **没有按进程名过滤**，而 LSPosed 作用域本身就是「包名」，
+  所以高德即使另开 `:tts` 之类子进程，本探针照样会在那个进程里装上 ——
+  若真机日志依旧全静默，就排除了「装错进程」这一种可能。
 
 版本 `versionCode 77 / 3.15.54`（debug 变体已装机，release 签名同 debug key）。
 
