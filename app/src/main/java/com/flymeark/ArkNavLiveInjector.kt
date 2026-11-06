@@ -4,13 +4,16 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.drawable.Icon
 import android.os.Bundle
+import android.os.SystemClock
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.lang.reflect.Modifier
 
 /**
  * v3.15.51：高德地图导航实况胶囊 —— 复用「影子通知」通道。
@@ -127,28 +130,51 @@ internal object ArkNavLiveInjector {
 
     // ---------------------------------------------------------------- Context
 
-    private fun appContext(): android.content.Context? = try {
+    private fun appContext(): Context? = try {
         XposedHelpers.callStaticMethod(
             Class.forName("android.app.AndroidAppHelper"), "currentApplication"
-        ) as? android.content.Context
+        ) as? Context
     } catch (_: Throwable) {
         null
     }
 
     /**
-     * 取可用 Context。**优先用 NotificationManager 实例自带的 `mContext`** ——
+     * 取可用 Context。
+     *
+     * 两个来源都用得上：
+     *  - `NotificationManager.notify` 的 this = NotificationManager，Context 在私有字段 `mContext`；
+     *  - `Service.startForeground` 的 this = Service，**它本身就是 Context**（ContextWrapper），
+     *    没有 `mContext` 字段 —— 这一条是 v3.15.52 补 startForeground hook 时踩的。
+     *
      * 微信/QQ 上实测 `currentApplication()` 在 notify 期间仍可能返回 null（v3.15.24 日志），
-     * `mContext` 是构造时就持有的，任何时机都可用。
+     * 所以实例自带的 Context 优先，最后才退 `AndroidAppHelper.currentApplication()`。
      */
-    private fun contextOf(nm: Any?): android.content.Context? {
+    private fun contextOf(any: Any?): Context? {
+        if (any is Context) return any
         try {
-            if (nm != null) {
-                val c = XposedHelpers.getObjectField(nm, "mContext") as? android.content.Context
+            if (any != null) {
+                val c = XposedHelpers.getObjectField(any, "mContext") as? Context
                 if (c != null) return c
             }
         } catch (_: Throwable) {
         }
         return appContext()
+    }
+
+    /** 解析出 (NotificationManager, Context)；startForeground 场景下从 Service 的 Context 取 NM */
+    private fun resolveNm(any: Any?): Pair<NotificationManager, Context>? {
+        val direct = any as? NotificationManager
+        if (direct != null) {
+            val ctx = contextOf(any) ?: return null
+            return direct to ctx
+        }
+        val ctx = contextOf(any) ?: return null
+        val nm = try {
+            ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        return nm to ctx
     }
 
     // ---------------------------------------------------------------- 影子发布
@@ -160,12 +186,12 @@ internal object ArkNavLiveInjector {
         reason: String,
         notifId: Int?
     ) {
-        val nm = nmAny as? NotificationManager
-        val ctx = contextOf(nmAny)
-        if (nm == null || ctx == null) {
-            log("skip reason=no_context_or_nm (nm=${nm != null})")
+        val resolved = resolveNm(nmAny)
+        if (resolved == null) {
+            log("skip reason=no_context_or_nm")
             return
         }
+        val (nm, ctx) = resolved
 
         val extras = try {
             src.extras
@@ -382,8 +408,206 @@ internal object ArkNavLiveInjector {
             }
         }
 
+        // v3.15.52：高德在 SDK>=30 走 `Service.startForeground(...)` 发这条常驻导航通知，
+        // **根本不经过 NotificationManager.notify**。v3.15.51 实测：日志里只有 installing，
+        // 没有任何 hit —— 胶囊因此从未出现。这里补上两个重载。
+        // 注意 `startForeground` 的 this 是 Service（本身就是 Context），
+        // postShadow → resolveNm 会从它拿 NotificationManager。
+        ArkHooks.quiet("$TAG startForeground") {
+            val svcClass = XposedHelpers.findClass("android.app.Service", lpp.classLoader)
+            ArkHooks.quiet("$TAG startForeground(int,Notification)") {
+                XposedHelpers.findAndHookMethod(
+                    svcClass, "startForeground",
+                    Int::class.javaPrimitiveType, Notification::class.java, notifyHook
+                )
+            }
+            ArkHooks.quiet("$TAG startForeground(int,Notification,int)") {
+                XposedHelpers.findAndHookMethod(
+                    svcClass, "startForeground",
+                    Int::class.javaPrimitiveType, Notification::class.java,
+                    Int::class.javaPrimitiveType, notifyHook
+                )
+            }
+        }
+
         // 不在 App 侧 hook cancel：高德 cancel 的通知不一定是导航那条，一律清影子会让胶囊
         // 在高德刷新通知的间隙里闪没。销毁同步统一放 SystemUI 的 onNotificationRemoved。
+
+        installProbes(lpp.classLoader)
+    }
+
+    // ---------------------------------------------------------------- 探针（log-only）
+    //
+    // v3.15.52：只为定位「真正的导航数据在哪」。三个探针全部 try/catch 包死，
+    // 类找不到只打一行日志，绝不让高德崩（主力应用，崩了要挨骂）。
+
+    /** 探针节流：同 key 内容没变化就直接跳过；有变化也最多 1500ms 一条 */
+    private const val PROBE_MIN_INTERVAL_MS = 1500L
+
+    private val probeLastAt = HashMap<String, Long>(4)
+    private val probeLastMsg = HashMap<String, String>(4)
+
+    private fun probe(key: String, msg: String) {
+        try {
+            val now = SystemClock.elapsedRealtime()
+            synchronized(probeLastAt) {
+                // 内容没变 → 不刷屏
+                if (probeLastMsg[key] == msg) return
+                val last = probeLastAt[key] ?: 0L
+                if (now - last < PROBE_MIN_INTERVAL_MS) return
+                probeLastAt[key] = now
+                probeLastMsg[key] = msg
+            }
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] probe $key: $msg")
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 一次性状态日志（安装结果 / 找不到 / hook 失败） */
+    private fun probeRaw(msg: String) {
+        XposedBridge.log("[${ArkConstants.LOG_TAG}] probe $msg")
+    }
+
+    /** 反射 dump 一个对象的全部实例字段（字段名是混淆的，遍历才不会因改名挂掉） */
+    private fun dumpFields(obj: Any?): String {
+        if (obj == null) return "null"
+        return try {
+            val sb = StringBuilder("{")
+            var first = true
+            for (f in obj.javaClass.declaredFields) {
+                if (Modifier.isStatic(f.modifiers)) continue
+                try {
+                    f.isAccessible = true
+                    val v = f.get(obj)
+                    if (!first) sb.append(", ")
+                    first = false
+                    sb.append(f.name).append('=').append(v)
+                } catch (_: Throwable) {
+                }
+            }
+            sb.append('}')
+            sb.toString()
+        } catch (_: Throwable) {
+            // Kotlin 里 `String` 是 kotlin.String，没有 valueOf，用 java.lang.String
+            java.lang.String.valueOf(obj)
+        }
+    }
+
+    /** 依次按几个候选名找类（默认包类 jadx 会显示成 defpackage.xxx，真名是 xxx） */
+    private fun findCls(cl: ClassLoader, vararg names: String): Class<*>? {
+        for (n in names) {
+            try {
+                return XposedHelpers.findClass(n, cl)
+            } catch (_: Throwable) {
+            }
+            try {
+                return Class.forName(n, false, cl)
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
+    private fun installProbes(cl: ClassLoader) {
+        // ---- 探针 1：fj5.notifyNaviInfo(ej5) —— 所有导航信息更新的唯一漏斗
+        try {
+            val c = findCls(cl, "fj5", "defpackage.fj5")
+            if (c == null) {
+                probeRaw("fj5: not found")
+            } else {
+                val set = XposedBridge.hookAllMethods(
+                    c, "notifyNaviInfo",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            try {
+                                probe("fj5", dumpFields(param.args.getOrNull(0)))
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                )
+                if (set.isEmpty()) {
+                    probeRaw("fj5: method notifyNaviInfo not found in ${c.name}")
+                } else {
+                    probeRaw("fj5: hooked ${c.name}.notifyNaviInfo x${set.size}")
+                }
+            }
+        } catch (t: Throwable) {
+            probeRaw("fj5: hook failed ${t.message}")
+        }
+
+        // ---- 探针 2：ModuleRoute.notifyNaviInfo(JSONObject) —— AJX 页面下来的原始载荷
+        try {
+            val c = findCls(cl, "com.autonavi.bundle.routecommon.ajx.ModuleRoute")
+            if (c == null) {
+                probeRaw("routeJson: ModuleRoute not found")
+            } else {
+                val set = XposedBridge.hookAllMethods(
+                    c, "notifyNaviInfo",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            try {
+                                val a = param.args.getOrNull(0)
+                                probe(
+                                    "routeJson",
+                                    if (a is org.json.JSONObject) a.toString() else dumpFields(a)
+                                )
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                )
+                if (set.isEmpty()) {
+                    probeRaw("routeJson: method notifyNaviInfo not found in ${c.name}")
+                } else {
+                    probeRaw("routeJson: hooked ${c.name}.notifyNaviInfo x${set.size}")
+                }
+            }
+        } catch (t: Throwable) {
+            probeRaw("routeJson: hook failed ${t.message}")
+        }
+
+        // ---- 探针 3：GStatusObserver.onTbtStatusChanged(int,int) —— native TBT 状态回调
+        // 注意：这是一个**抽象接口**，dex 里没有任何 class_def 实现它（很可能是 lambda /
+        // JNI 侧注册的匿名实现），所以直接 hook 接口方法大概率失败。失败也照实打日志，
+        // 不吞、不假装成功。
+        try {
+            val c = findCls(cl, "com.autonavi.jni.ae.guide.observer.GStatusObserver")
+            if (c == null) {
+                probeRaw("tbt: not found")
+            } else {
+                val set = try {
+                    XposedBridge.hookAllMethods(
+                        c, "onTbtStatusChanged",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                try {
+                                    val i = param.args.getOrNull(0)
+                                    val i2 = param.args.getOrNull(1)
+                                    probe("tbt", "i=$i i2=$i2")
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
+                    )
+                } catch (t: Throwable) {
+                    probeRaw(
+                        "tbt: ${c.name} is ${if (c.isInterface) "interface" else "class"}, " +
+                            "cannot hook: ${t.message}"
+                    )
+                    null
+                }
+                if (set != null) {
+                    if (set.isEmpty()) {
+                        probeRaw("tbt: method onTbtStatusChanged not found in ${c.name}")
+                    } else {
+                        probeRaw("tbt: hooked ${c.name}.onTbtStatusChanged x${set.size}")
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            probeRaw("tbt: hook failed ${t.message}")
+        }
     }
 
     private fun isNavigating(n: Notification): Boolean = try {

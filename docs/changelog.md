@@ -2,6 +2,80 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.52 修 startForeground 漏 hook + 埋 3 个导航数据探针
+
+> v3.15.51 实测失败：胶囊从未出现，日志里只有 `navInject: installing`，零 `hit`。
+
+### ① 为什么 v3.15.51 一次都没触发
+
+真机 dump 到的高德导航通知：
+
+```
+id=99910001  channel=ROUTE_CHANNEL_ID
+flags=ONGOING_EVENT|NO_CLEAR|FOREGROUND_SERVICE
+extras: android.title="高德地图"  android.text="正在导航"
+        android.largeIcon=Icon(typ=BITMAP size=147x147)
+        com.autonavi.minimap.navigating=true
+```
+
+高德在 SDK>=30 走 `Service.startForeground(...)` 发这条常驻通知，**不经过
+`NotificationManager.notify`**，所以 v3.15.51 hook 的两个 notify 重载根本不会被调用。
+
+### ② 补 `Service.startForeground` 两个重载
+
+`ArkNavLiveInjector.install()` 里新增（与 notify 共用同一份 `notifyHook`、同一套
+`matchReason` / `postShadow`）：
+
+- `android.app.Service.startForeground(int, Notification)`
+- `android.app.Service.startForeground(int, Notification, int)`（API 29+）
+
+配套修了一个隐性 bug：`startForeground` 的 `this` 是 **Service**（本身就是 Context），
+没有 `NotificationManager` 那个 `mContext` 字段，原来的 `contextOf()` 会拿不到 Context。
+现在 `contextOf()` 先判 `any is Context`，再由 `resolveNm()` 从 Context 取
+`NOTIFICATION_SERVICE`。
+
+本版胶囊文案仍是占位值（`高德地图 · 正在导航`）+ 转向箭头，**目的只是验证渲染链路**
+（胶囊出不出现 / 点回高德 / 结束时消失）。
+
+### ③ 三个 log-only 探针（只在 `com.autonavi.minimap` 进程装）
+
+| 探针 | 目标 | 找类方式 |
+|---|---|---|
+| `probe fj5` | `fj5.notifyNaviInfo(ej5)` —— 所有导航信息更新的唯一漏斗 | `XposedHelpers.findClass("fj5", cl)`，失败退 `Class.forName("fj5")`；jadx 里的 `defpackage.fj5` 只是别名 |
+| `probe routeJson` | `com.autonavi.bundle.routecommon.ajx.ModuleRoute.notifyNaviInfo(JSONObject)` | 同名类，直接 `toString()` 打 JSON |
+| `probe tbt` | `com.autonavi.jni.ae.guide.observer.GStatusObserver.onTbtStatusChanged(int,int)` | 同名接口 |
+
+实现要点：
+
+- 全部用 `XposedBridge.hookAllMethods(cls, "<name>", hook)`，**不绑定参数类型** —— 参数类
+  `ej5` 是混淆名，签名一变就挂；按方法名挂所有重载最稳。
+- `ej5` 的字段名是混淆的（`f13969a`/`b`/`c`/`d`/`e`），所以**遍历 `declaredFields` dump**
+  `name=value`，不硬编码字段名。
+- 节流：同 key **内容没变化直接不打印**；有变化也最多 **1500ms 一条**
+  （`SystemClock.elapsedRealtime()`）。
+- 每个探针整段 `try/catch`，类找不到只打 `probe xxx: not found`，**不允许让高德崩**。
+- 已知：`GStatusObserver` 是抽象接口，dex 里**没有任何 class_def 实现它**（很可能是
+  lambda / JNI 注册的匿名实现），所以这条探针大概率打
+  `probe tbt: ... cannot hook`。失败也如实记录，不伪造成功。
+
+日志样例：
+
+```
+[FlymeArk] probe fj5: hooked fj5.notifyNaviInfo x1
+[FlymeArk] probe routeJson: hooked com.autonavi.bundle.routecommon.ajx.ModuleRoute.notifyNaviInfo x1
+[FlymeArk] probe tbt: com.autonavi.jni.ae.guide.observer.GStatusObserver is interface, cannot hook: ...
+[FlymeArk] probe fj5: {f13969a=navi, b=右转, c=进入学院路, d=1, e=12}
+[FlymeArk] probe routeJson: {"bizType":"navi","title":"右转","content":"进入学院路","status":1,"icon":12}
+```
+
+### 未验证（本轮不上机）
+
+- `startForeground` hook 是否真能拦到（`android.app.Service` 是 boot 类，理论上必中）；
+- 高德实际调用的是哪个重载（2 参还是 3 参）；
+- 三个探针的类/方法名在**运行时**是否与静态分析一致（R8 混淆在 dex 内固定，理论上一致）。
+
+版本 `versionCode 75 / 3.15.52`。
+
 ## 2026-11-05 · v3.15.51 高德地图导航实况胶囊（影子通知通道）
 
 > 新增 `ArkNavLiveInjector`，把高德的**常驻导航通知**补成一条实况影子通知。
