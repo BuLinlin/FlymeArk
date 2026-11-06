@@ -95,10 +95,11 @@ internal object ArkNavLiveInjector {
     /**
      * 胶囊文案长度上限。
      *
-     * v3.15.56 从 40 降到 24：真机验证（v3.15.55）发现胶囊区实际只能舒服地显示
-     * 一句指令，40 字在胶囊里会被硬截断，还不如自己收口。
+     * 演进：40（v3.15.55）→ 24（v3.15.56）→ **28**（v3.15.57）。
+     * 24 是真机试出来的「不截断就放不下」的上限，但实测会把 `七十米后左转，随后六十米右转`
+     * （13 字）之外的正常长句也切掉，28 是折中值。
      */
-    private const val MAX_CAPSULE_TEXT = 24
+    private const val MAX_CAPSULE_TEXT = 28
 
     /**
      * 纯数字串。
@@ -122,14 +123,32 @@ internal object ArkNavLiveInjector {
     )
 
     /**
-     * 无信息量的播报句（欢迎语 / 状态播报 / 启动语）。
+     * 无信息量的播报句（欢迎语 / 状态播报 / 骑行跑步提示）。
      *
      * 这些句子在导航里确实会播，但把它们塞进胶囊等于把「前方三百米右转」挤掉，
      * 所以直接丢弃，宁可胶囊保持上一句有效指令。
+     *
+     * v3.15.57 追加：真机里胶囊曾显示 `请移动到室外开阔地带`（骑行模式提示，出现 3 次），
+     * 以及步行模式的 `请步行到室外开阔地带`、`以手机朝向为准`（都需要用户动作，不是导航指令）。
+     *
+     * **噪声词对整串做 `contains` 判断**（不是只对拼好的结果判断）——
+     * `以手机朝向为准,路在右边,请向右走` 里最后一段含「向右」，如果只看结果就会被当成指令。
      */
     private val NOISE_PHRASES = arrayOf(
-        "真高兴", "又见到你", "准备出发", "持续为您导航", "开启导航", "欢迎使用"
+        "真高兴", "又见到你", "准备出发", "持续为您导航", "开启导航", "欢迎使用",
+        "室外开阔", "开阔地带", "以手机朝向为准", "一路顺风", "祝您"
     )
+
+    /**
+     * 结束语。命中不仅要丢掉文案，还要把 `navActive` 关掉。
+     *
+     * 原因（真机 v3.15.56 观测）：导航结束后高德仍会播 `这次的旅途结束了呐，下次再会！`。
+     * 此时影子已被 SystemUI 撤掉，若还允许 `updateShadowContent` 跑，就会**把胶囊复活**，
+     * 屏幕上冒出一个没有意义的「旅途结束」。所以这类句子必须当作「导航结束」信号处理。
+     *
+     * 注意这些词**不在** [NOISE_PHRASES] 里 —— 两者处理方式不同（这里要副作用）。
+     */
+    private val END_PHRASES = arrayOf("旅途结束", "下次再会", "期待与您再次", "导航结束啦")
 
     // ---------------------------------------------------------------- 播报 → 胶囊 的实时状态
     //
@@ -522,9 +541,12 @@ internal object ArkNavLiveInjector {
      *  1. `groupData` 是这一轮播报的分句数组 → 取**最后一个非空元素**（它才是此刻要播的）；
      *  2. 第一个候选没过筛（纯数字 / 噪音 / 空）→ 退回 `data` 再试一次
      *     （真机上两者不是同一句：`data` 是单句、`groupData` 是整段队列）；
-     *  3. 都不过 → 返回 null，胶囊保持上一句有效指令。
+     *  3. 中途命中**结束语**（[END_PHRASES]）→ 立刻把 `navActive` 关掉再返回 null ——
+     *     导航结束了，后面的播报不许再复活胶囊；
+     *  4. 都不过 → 返回 null，胶囊保持上一句有效指令。
      *
-     * 真正的文本选取在 [pickCapsuleText]（纯函数，便于对照验收样例）。
+     * 文本选取在 [pickCapsuleText]（纯函数），结束语的副作用只在这里做 ——
+     * 这样纯函数保持可推演，副作用点只有一个、看得见。
      *
      * @return 可写入胶囊的文案；无有效文案返回 null
      */
@@ -541,8 +563,42 @@ internal object ArkNavLiveInjector {
             null
         }
 
-        pickCapsuleText(lastSentenceOf(group))?.let { return it }
-        return pickCapsuleText(data)
+        for (candidate in listOfNotNull(lastSentenceOf(group), data)) {
+            if (isFarewell(candidate)) {
+                endNavForFarewell()
+                return null
+            }
+            pickCapsuleText(candidate)?.let { return it }
+        }
+        return null
+    }
+
+    /** 是不是结束语（`这次的旅途结束了呐，下次再会！` 之类） */
+    private fun isFarewell(raw: String?): Boolean {
+        if (raw.isNullOrBlank()) return false
+        return try {
+            END_PHRASES.any { raw.contains(it) }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * 结束语 → 直接判定导航结束。
+     *
+     * 为什么不能只丢文案：真机 v3.15.56 观测到导航结束后高德仍会播
+     * `这次的旅途结束了呐，下次再会！`，此时影子已被 SystemUI 撤掉，
+     * 若 `navActive` 还是 true，`updateShadowContent` 会重新 post 一条影子，
+     * 屏幕上就冒出一个没有意义的胶囊。所以这里主动落闸。
+     */
+    private fun endNavForFarewell() {
+        try {
+            if (!navActive) return
+            navActive = false
+            lastNaviText = ""
+            log("nav ended (farewell)")
+        } catch (_: Throwable) {
+        }
     }
 
     /**
@@ -578,21 +634,31 @@ internal object ArkNavLiveInjector {
      * ## 规则
      *
      * 1. 归一化：全角逗号 `，` → 半角 `,`，`trim()`，去掉首尾逗号与空白；
-     * 2. 纯数字（`^\d+$`）→ 返回 null（那是资源 id，真机见过 `2131558436`）；
-     * 3. 按 `,` 切段，丢弃空段；
-     * 4. 找**第一个**命中 [TURN_KEYWORDS] 的段落下标 `i`；
-     * 5. 命中 → 从 `i` 起把**剩余各段全部**用 `，` 连起来（转向段在前，后随的距离/补充说明
-     *    自然被带上）；未命中 → 取 `segments[0]`；
-     * 6. 噪音词（[NOISE_PHRASES]）命中 → null；长度 < 2 → null；
-     * 7. 超过 [MAX_CAPSULE_TEXT]（24）截断加 `…`。
+     * 2. 纯数字（`^\d+$`）→ null（资源 id，真机见过 `2131558436`）；
+     * 3. **整串**命中 [NOISE_PHRASES] → null（必须查整串，不能只查结果，见下）；
+     * 4. 按 `,` 切段，丢弃空段；
+     * 5. 找**第一个**命中 [TURN_KEYWORDS] 的段落下标 `i` → 以它为起点；
+     *    一个都没命中 → 取 `segments[0]`；
+     * 6. 从 `i` 往后**逐个**判断要不要接上（[shouldFollow]），第一个不满足就停；
+     * 7. 结果再查一次噪音词 / 长度 < 2 → null；
+     * 8. 超过 [MAX_CAPSULE_TEXT]（28）截断加 `…`。
      *
-     * ## 为什么第 5 步是「连到末尾」而不是只拼下一段
+     * ## 为什么第 6 步不是「连到末尾」（v3.15.57 修的就是这个）
      *
-     * 派工规则原本写的是「`i+1` 含 `米`/`公里` 才拼下一段」，但验收样例里
-     * `直行,然后右转进入学院路` 期望 `直行，然后右转进入学院路`、
-     * `前方三百米右转,请靠右行驶` 期望 `前方三百米右转，请靠右行驶` —— 这两条的下一段
-     * 都不含距离词，按字面规则会被砍掉，与期望不符。因此这里取「连到末尾」：
-     * 8 条样例逐条对得上，且 24 字上限兜住了长度。
+     * v3.15.56 是 `segments.subList(i, size).joinToString`，真机上
+     * `您已偏航,七十米后左转,随后六十米右转,新路线预计多三点三公里`
+     * 被拼成 `七十米后左转，随后六十米右转，新路线预计多三点三…` ——
+     * **绕路提示挤掉了转向指令的额度**。现在只接「有效段」：
+     *
+     * - 含转向/动作关键词 → 接（`随后六十米右转`）；
+     * - 或既含距离词（`米`/`公里`）又含承接词（`后`/`随后`/`然后`/`再`）→ 接（`八十米后`）；
+     * - 否则 **break**（`新路线预计多三点三公里` 只有距离没有承接词 → 停）。
+     *
+     * ## 为什么第 3 步要查整串
+     *
+     * `以手机朝向为准,路在右边,请向右走` 的最后一段含「向右」，只看最终结果会把它
+     * 当成指令显示出来；而整串命中噪音词「以手机朝向为准」才是真相 —— 这是步行模式
+     * 让用户校准朝向的提示，不是导航指令。
      *
      * ## 验收样例（真机原始数据，逐条对应）
      *
@@ -606,6 +672,15 @@ internal object ArkNavLiveInjector {
      * | `准备出发,` | `null` |
      * | `高德地图持续为您导航` | `null` |
      * | `掉头` | `掉头` |
+     * | `您已偏航,七十米后左转,随后六十米右转,新路线预计多三点三公里` | `七十米后左转，随后六十米右转` |
+     * | `请移动到室外开阔地带` | `null` |
+     * | `请步行到室外开阔地带` | `null` |
+     * | `以手机朝向为准,路在右边,请向右走` | `null` |
+     * | `沿当前道路,向东出发,八十米后向右前方骑行` | `八十米后向右前方骑行` |
+     * | `直达目的地全程二十八公里` | `直达目的地全程二十八公里`（28 字内不截断） |
+     *
+     * 结束语（`这次的旅途结束了呐，下次再会！`）在这里也返回 null，但**额外的副作用
+     * `navActive = false` 由 [extractNaviText] 负责**，纯函数不碰状态。
      *
      * @param raw 原始播报串（可为 null）
      * @return 可写入胶囊的文案；不该进胶囊时返回 null
@@ -620,33 +695,39 @@ internal object ArkNavLiveInjector {
             // ② 纯数字 = 资源 id，不是文案
             if (PURE_DIGITS.matches(norm)) return null
 
-            // ③ 切段
+            // ③ 整串噪音（见 KDoc「为什么第 3 步要查整串」）
+            for (noise in NOISE_PHRASES) {
+                if (norm.contains(noise)) return null
+            }
+
+            // ④ 切段
             val segments = norm.split(',').map { it.trim() }.filter { it.isNotEmpty() }
             if (segments.isEmpty()) return null
 
-            // ④ 找第一个转向/动作段落
-            var start = -1
+            // ⑤ 找第一个转向/动作段落；找不到就退回第一段
+            var start = 0
             for (idx in segments.indices) {
-                if (TURN_KEYWORDS.any { segments[idx].contains(it) }) {
+                if (isTurnSegment(segments[idx])) {
                     start = idx
                     break
                 }
             }
 
-            // ⑤ 命中 → 从转向段连到末尾；未命中 → 取第一段
-            val joined = if (start >= 0) {
-                segments.subList(start, segments.size).joinToString("，")
-            } else {
-                segments[0]
+            // ⑥ 从起点往后只接「有效段」，第一个不满足就停
+            val sb = StringBuilder(segments[start])
+            for (j in start + 1 until segments.size) {
+                if (!shouldFollow(segments[j])) break
+                sb.append('，').append(segments[j])
             }
+            val joined = sb.toString()
 
-            // ⑥ 噪音 / 过短
+            // ⑦ 再过一遍结果：噪音 / 过短
             if (joined.length < 2) return null
             for (noise in NOISE_PHRASES) {
                 if (joined.contains(noise)) return null
             }
 
-            // ⑦ 收口
+            // ⑧ 收口
             if (joined.length > MAX_CAPSULE_TEXT) {
                 joined.substring(0, MAX_CAPSULE_TEXT) + "…"
             } else {
@@ -655,6 +736,34 @@ internal object ArkNavLiveInjector {
         } catch (_: Throwable) {
             null
         }
+    }
+
+    /** 这一段是不是转向/动作指令 */
+    private fun isTurnSegment(s: String): Boolean = try {
+        TURN_KEYWORDS.any { s.contains(it) }
+    } catch (_: Throwable) {
+        false
+    }
+
+    /**
+     * 紧跟在转向段后面的这一段，值不值得接上去。
+     *
+     * - 含转向/动作关键词 → 值得（`随后六十米右转`）；
+     * - 含距离词且含承接词 → 值得（`八十米后`、`随后一百五十米`）；
+     * - 其余（`新路线预计多三点三公里`、`大约需要两小时三分`）→ 不值得，调用方 break。
+     */
+    private fun shouldFollow(s: String): Boolean = try {
+        if (isTurnSegment(s)) {
+            true
+        } else {
+            val hasDistance = s.contains("米") || s.contains("公里")
+            hasDistance && (
+                s.contains("后") || s.contains("随后") ||
+                    s.contains("然后") || s.contains("再")
+                )
+        }
+    } catch (_: Throwable) {
+        false
     }
 
     /**
