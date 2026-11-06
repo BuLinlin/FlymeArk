@@ -199,6 +199,23 @@ internal object ArkMiniBarStyleHook {
     @Volatile
     private var publicCircleId = 0
 
+    /**
+     * 左侧图标与扩展位（v3.15.76）：如果 Flyme 原生模板用其中某个可见 View 画
+     * 「蓝渐变块 + 向上箭头」，改造非影子行时顺手压掉，避免和 overlay 蓝块重叠。
+     * 真机 dump 里它们本来就是 GONE，压掉只是防御。0 = 该 ROM 没有。
+     */
+    @Volatile
+    private var iconLeftId = 0
+
+    @Volatile
+    private var ext1Id = 0
+
+    @Volatile
+    private var ext2Id = 0
+
+    @Volatile
+    private var ext3Id = 0
+
     /** 每个头部 + 深浅组合只打一条日志，避免通知刷新时刷屏（上限兜底，防长驻进程缓慢增长） */
     private val logged: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
     private const val LOGGED_CAP = 512
@@ -369,26 +386,40 @@ internal object ArkMiniBarStyleHook {
             (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.GONE
             return
         }
-        // v3.15.75 双源模型（核心修复）：不再因 `!parsed.present` 早退。
-        //
-        // dumpsys notification 已证：屏幕上显示的可能是**高德原生那条**
-        // （id=99910001, tag=null，extras 里没有 NAV_KEY_*，present=false），
-        // 而此前所有视觉改造只落在影子行（tag=flymeark_live_nav）上 ——
-        // 那条未必上屏，于是改造从未生效。
-        // 现在：影子行把数据喂进 lastGoodNav；原生行复用 lastGoodNav 套样式。
-        // 两条都覆盖，无论哪条上屏视觉都正确。
-        //
-        // 安全护栏：非影子行只在该行**确实显示**时才改造 —— 高德还有路况 / 限行等
-        // 其它实况通知，绝不允许它们被错误套上导航样式。
+        // v3.15.76 订正 3：displayed 降级为纯日志字段 —— 只回答「这条 row 此刻
+        // 是否显示在屏幕上」，不参与任何 return 判断。
         val displayed = header.isShown && header.isAttachedToWindow && header.height > 0
-        if (!parsed.present && (lastGoodNav == null || !displayed)) {
+        // v3.15.76 订正 1：用「通知身份」代替「是否 displayed」做门禁。
+        // displayed 只作日志字段 —— hook 回调时 header 可能刚 inflate、尚未
+        // attach/measure（isShown=false），拿它当门禁会把时序竞态升级成永久失效
+        // （没改造成功 → 没挂 preDraw → 永远没有第二次机会）。
+        // 真正的身份判据：Flyme 把高德 `category=navigation` 那条原生渲染成实况导航条
+        //（dumpsys 实证），而路况 / 限行等不是 navigation —— 用它挡住误伤。
+        val usable = parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L
+        val notif: Notification? = try {
+            XposedHelpers.callMethod(sbnOf(row), "getNotification") as? Notification
+        } catch (_: Throwable) {
+            null
+        }
+        val isNavCategory = notif?.category == Notification.CATEGORY_NAVIGATION
+        // 身份已知（category 读得到）按 category 判；读不到回退 displayed（旧行为兜底）
+        val isOurs = parsed.present ||
+            (notif != null && isNavCategory) ||
+            (notif == null && displayed)
+        if (!isOurs) {
+            logNavApply(parsed, displayed, header, row, density)
+            return
+        }
+        // v3.15.76 订正 2：身份确认即挂 preDraw，与「本帧改造是否成功」解耦 ——
+        // 这一帧没数据下一帧 preDraw 自己会补（writeNavTitle / hideNavChrome
+        // 幂等 + 带比较，重复调用无副作用）。overlay 不存在时 preDraw 里判空跳过。
+        armPredraw(header)
+        // 无数据不画空壳：parsed 读不到且没有历史好载荷 → 保持系统原样
+        if (!usable && lastGoodNav == null) {
             logNavApply(parsed, displayed, header, row, density)
             return
         }
         (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.VISIBLE
-        // present=true 但三字段全空 = 反射只读到一部分（正常帧 instr 必非空，见 buildShadow），
-        // 此时沿用上一次成功的载荷，语义等同「两次播报之间冻结」。
-        val usable = parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L
         val p = if (parsed.present && usable) {
             lastGoodNav = parsed
             parsed
@@ -582,6 +613,13 @@ internal object ArkMiniBarStyleHook {
             // public 变体只藏不清：'已加密' 是系统状态文案，清掉风险更大
             if (pub != null && pub.visibility != View.GONE) pub.visibility = View.GONE
         }
+        // v3.15.76：压掉左侧图标 / 扩展位（id 解析不到为 0，findViewById(0) 返回 null 自然跳过）。
+        // 幂等 + 带比较，preDraw 每帧也安全。影子行 dump 里它们本就 GONE，此处置只防原生模板。
+        for (iconId in intArrayOf(iconLeftId, ext1Id, ext2Id, ext3Id)) {
+            if (iconId == 0) continue
+            val iv = header.findViewById<View>(iconId)
+            if (iv != null && iv.visibility != View.GONE) iv.visibility = View.GONE
+        }
     }
 
     /**
@@ -628,9 +666,15 @@ internal object ArkMiniBarStyleHook {
     }
 
     /**
-     * 自证日志（v3.15.75）：一条日志同时看到「这条 row 的 sbn id / tag、是不是影子、
-     * header 是否显示、标题命中几个、圆环命中几个、写入后的文案与字号」。
-     * 一次导航即可彻底终结「屏幕上到底是哪一条」的争论。只打前 [NAV_APPLY_LOGS] 次。
+     * 自证日志（v3.15.75/76）：一条日志同时看到「这条 row 的 sbn id / tag、是不是影子、
+     * notification category、header 是否显示、直接子 View 可见性清单、标题命中几个、
+     * 圆环命中几个、写入后的文案与字号」。
+     *
+     * `children=[...]` 是本版最关键的自证：配合 displayed / sbnId 能一次判定
+     * ① 屏幕上是哪条（tag=flymeark_live_nav 且 displayed 的就是影子条）；
+     * ② 系统/我们有没有把 overlay 挂上（children 里应出现我们的 ArkMiniNavView，无 id 记作 `no-id`）；
+     * ③ 蓝渐变块归属（若某个可见的非文字 View 存在，即 Flyme 外层/原生模板画的）。
+     * 只打前 [NAV_APPLY_LOGS] 次。
      */
     private fun logNavApply(
         parsed: NavMiniPayload,
@@ -652,14 +696,34 @@ internal object ArkMiniBarStyleHook {
         } catch (_: Throwable) {
             null
         }
+        val notif: Notification? = try {
+            XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+        } catch (_: Throwable) {
+            null
+        }
+        // header 直接子 View 的「名字=visibility」摘要（0=VISIBLE 4=INVISIBLE 8=GONE）
+        val children = (header as? ViewGroup)?.let { g ->
+            (0 until g.childCount).joinToString(",") { i ->
+                val c = g.getChildAt(i)
+                val n = when {
+                    c.id == View.NO_ID -> "no-id"
+                    else -> try {
+                        c.resources.getResourceName(c.id).substringAfterLast('/')
+                    } catch (_: Throwable) {
+                        "#" + Integer.toHexString(c.id)
+                    }
+                }
+                "$n=${c.visibility}"
+            }
+        } ?: "?"
         val titles = navTitleViews(header)
         val first = titles.firstOrNull()
         val sizeSp = first?.textSize?.let { if (density > 0f) it / density else 0f }
         XposedBridge.log(
             "[$TAG] navApply: shadow=${parsed.present} displayed=$displayed " +
-                "sbnId=$id tag=$tag hdrs=${countHeaders(header)} " +
+                "cat=${notif?.category} sbnId=$id tag=$tag hdrs=${countHeaders(header)} " +
                 "titles=${titles.size} circles=${navCircleViews(header).size} " +
-                "after='${first?.text}' size=$sizeSp"
+                "after='${first?.text}' size=$sizeSp children=[$children]"
         )
     }
 
@@ -1260,6 +1324,11 @@ internal object ArkMiniBarStyleHook {
         publicTitleId = r.getIdentifier("title_header_live_public", "id", "android")
         publicContentId = r.getIdentifier("content_header_live_public", "id", "android")
         publicCircleId = r.getIdentifier("iv_circle_progress_live_public", "id", "android")
+        // v3.15.76：左侧图标 / 扩展位（解析不到为 0，跳过不抛）
+        iconLeftId = r.getIdentifier("icon_left_live", "id", "android")
+        ext1Id = r.getIdentifier("iv_extends1_live", "id", "android")
+        ext2Id = r.getIdentifier("iv_extends2_live", "id", "android")
+        ext3Id = r.getIdentifier("iv_extends3_live", "id", "android")
         idsReady = true
     }
 
