@@ -1543,6 +1543,9 @@ internal object ArkNavLiveInjector {
         extrasDumped = false
         // v3.15.64：文案捕捞网同样每趟一次，跟着 extras 一起复位
         textBufDumped = false
+        // ⚠ **绝对不要在这里加 `textBuf.clear()`**。执行顺序是「reset → dump」，一清就永远是
+        // `NAV TEXT BUF: n=0`（合法输出！看不出错），整个网白干。而且缓冲区必须横跨这一次
+        // reset 才能覆盖「搜索 → 选点 → 开始导航」这段过程。详见 changelog v3.15.64 §4。
     }
 
     /**
@@ -1754,7 +1757,7 @@ internal object ArkNavLiveInjector {
     //
     //  R5 **目的地预留额度**（QA 回归）：主额度是「先来先占」，带 extras 的 push / 统计 / SDK Service
     //     一样能吃掉 8 格 —— 真机上导航那条照样可能抓不到。**action 关键词过滤不可靠**
-    //     （`NONAV` / `canvas` 都含 `nav`，实测误命中），所以改成**按内容判定**：主额度被占满后，
+    //     （`NONAV` / `UNAVAILABLE` 这类都含 `nav` 子串，误命中），所以改成**按内容判定**：主额度被占满后，
     //     `looksLikeDest(extras)` 为真的 Intent 还有 [SVC_INTENT_RESERVE] = 4 次预留机会。
 
     /** 已 dump 过的 `serviceClassName:action` 组合（主额度去重） */
@@ -1793,7 +1796,8 @@ internal object ArkNavLiveInjector {
     /**
      * action 像导航 Service 的关键词（弱额度只放这些；不区分大小写）。
      *
-     * v3.15.64 改严：原来裸 `nav` 会命中 `NONAV` / `canvas` 这类纯子串噪声。
+     * v3.15.64 改严：原来裸 `nav` 会命中 `NONAV` / `UNAVAILABLE` 这类纯子串噪声
+     * （`unav` 里含 `nav`；注意 `canvas` 里是 `nva`，新旧正则都不命中，别拿它当例子）。
      * 现在要求 `navigat` / `navi_` / `_nav` 这类带边界的形状（真机那批 push SDK 里没有一条
      * 是靠裸 `nav` 命中的，改严不会漏）。
      */
@@ -2239,7 +2243,11 @@ internal object ArkNavLiveInjector {
     //
     // 所以换个打法：**全程撒网**（记住最近 30 条「像地名」的短文本 + 时间戳），
     // **导航开始时收网**（影子通知首次投递时一次性倒进日志）。
-    // 相对时间是负数 —— 越负说明越是导航前输入的，正是本轮要的证据。
+    //
+    // 时间口径：日志里的秒数是「这条文案多少秒前被看到的」，**恒为正**（`now - atMs`，
+    // `elapsedRealtime` 单调递增），越小越接近导航开始那一刻，`0.0s` 就是启动瞬间的文案。
+    // **不要想改成「负号 = 导航前」**：那得拿 `navStartedAt` 当基准，而它只在 `captureTotals()`
+    // 收到出发播报时才置位 —— 首帧 dump 时它还是 0，会打出 `-1.4e9s` 这种垃圾数字。
 
     /** 一条文案命中：什么时候看到的（elapsedRealtime）、文本是什么 */
     private data class TextHit(val atMs: Long, val text: String)
@@ -2250,7 +2258,12 @@ internal object ArkNavLiveInjector {
     /** 倒出时整行上限（超了截断，防一条日志把 logcat 刷爆） */
     private const val TEXT_BUF_LINE_MAX = 900
 
-    /** 环形缓冲（老 → 新）。读写都必须进 [textBufLock]：hook 回调跨线程 */
+    /**
+     * 环形缓冲（老 → 新）。读写都必须进 [textBufLock]：hook 回调跨线程。
+     *
+     * **跨趟不清空**（只在容量满时淘汰最老的）—— 缓冲区要覆盖「搜索 → 选点 → 开始导航」这段
+     * 过程，而这段横跨一次 [resetNavPayload]；见那里的警告。
+     */
     private val textBuf = ArrayDeque<TextHit>()
 
     /** [textBuf] 的锁 */
@@ -2334,7 +2347,12 @@ internal object ArkNavLiveInjector {
         }
     }
 
-    /** 相对收网时刻的秒数（1 位小数；**负数 = 发生在导航开始之前**） */
+    /**
+     * 相对收网时刻的秒数（1 位小数）：**这条文案是多少秒前被看到的**。
+     *
+     * 恒为正 —— `now` 与 `atMs` 都来自 [SystemClock.elapsedRealtime]（单调递增），`atMs` 必然更早。
+     * 越小越接近导航开始那一刻（`0.0s` = 启动瞬间的文案）。别改成负数语义，见本段顶部的说明。
+     */
     private fun relSecText(atMs: Long, nowMs: Long): String = try {
         String.format(Locale.US, "%.1f", (nowMs - atMs) / 1000.0)
     } catch (_: Throwable) {

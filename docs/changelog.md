@@ -35,11 +35,17 @@ v3.15.63 装机实测：**三条旧通道全部查空，都有实证**（完整�
   （`textBufDumped`，随 `resetNavPayload()` 复位）。格式（可 grep）：
 
 ```
-NAV TEXT BUF: n=4 | [-12.3s] 西岸 | [-8.1s] 望京 | [-3.2s] 建国路 | [-0.4s] 我的位置
+NAV TEXT BUF: n=4 | [12.5s] 西岸 | [12.5s] 静安嘉里中心 | [3.1s] 外滩 | [0.0s] 徐家汇
 ```
 
-  相对时间是**负数 = 发生在导航开始之前**（正是要的证据）。整行超 900 字符截断；
-  条数为 0 也打 `NAV TEXT BUF: n=0`，用来区分「网捞空了」和「网没挂上」。
+  **数字 = 这条文案是「多少秒前」被看到的**，所以**恒为正、越小越接近导航开始那一刻**；
+  `0.0s` 就是导航启动瞬间的文案，`12.5s` 是启动前 12.5 秒（≈ 用户在搜索框输入/选点的时候）。
+  整行超 900 字符截断；条数为 0 也打 `NAV TEXT BUF: n=0`，用来区分「网捞空了」和「网没挂上」。
+
+> ⚠ **不要试图把它改成「负号语义」**（负数 = 导航前）。要打出负数就得拿「导航开始时刻」
+> 当基准，也就是 `navStartedAt`。但 `navStartedAt` 只在 `captureTotals()` 收到**出发播报**
+> 时才置位，而首帧 dump 时它还是 `0` —— 拿它当基准会打出 `-1.4e9s` 这种垃圾数字。
+> 现在的「恒正秒数」虽然符号相反，但语义同样清楚（越小越接近导航开始），别再动。
 
 ### 3. 顺手修两个缺陷 + 降噪
 
@@ -47,11 +53,25 @@ NAV TEXT BUF: n=4 | [-12.3s] 西岸 | [-8.1s] 望京 | [-3.2s] 建国路 | [-0.4
   return，`reserve exhausted (4)` 永远打不出来。现在闸门里在 `noteCapReachedLocked()` 之后
   补一句 `if (svcIntentReserveDumps >= SVC_INTENT_RESERVE) noteReserveExhaustedLocked()`，
   两个 note 各有 flag 幂等，不会重复。
-- **`NAV_SVC_ACTION_RE` 误命中**：裸 `nav` 会命中 `NONAV` / `canvas`。改严成
+- **`NAV_SVC_ACTION_RE` 误命中**：裸 `nav` 会命中 `NONAV` / `UNAVAILABLE`（`unav` 里含 `nav`）。
+  改严成
   `(?i)(navigat|navi_|_nav|route|guide|tbt|drive|simulat)`。真机那批 push SDK 里没有一条是靠
   裸 `nav` 命中的，改严不会漏。
+  勘误：早期文档举例写的 `canvas` **不成立** —— `canvas` 里是 `nva` 不是 `nav`，新旧正则都不命中。
 - **Service Intent 探针降噪**：真机证明这条路无用（全是 push SDK），主额度 **8 → 4**
   （弱 2、预留 4 不变），常量名不变，只改数值。
+
+### 4. 一条给下一轮的硬约束（**不要动**）
+
+`resetNavPayload()` **不清空** `textBuf`，这是**故意的**，而且必须保持。
+执行顺序是「reset → dump」：若有人「顺手」在 `resetNavPayload()` 里加一句
+`textBuf.clear()`，那么每趟第一次 postShadow 都会先清后倒，`dumpTextBuf()` 永远打出
+`NAV TEXT BUF: n=0` —— **整个捕捞网白干，而且日志看起来完全正常**（这才是最坑的地方：
+`n=0` 是合法输出，只是永远是 0）。
+
+之所以不清也有正当理由：缓冲区要覆盖「搜索 → 选点 → 开始导航」这段过程，而这段过程**横跨**
+一次 `resetNavPayload()` 调用，清了就把最关键的导航前文案丢掉了。
+代价是换趟后日志里会带上上一趟的旧文案（相对时间更大），同文本去重会让它自然收敛。
 
 版本 `versionCode 87 / 3.15.64`。
 
