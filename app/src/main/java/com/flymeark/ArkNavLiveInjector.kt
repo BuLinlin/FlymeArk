@@ -160,6 +160,17 @@ internal object ArkNavLiveInjector {
         "导航到此为止", "下次再见", "导航结束", "已到达目的地", "您已到达"
     )
 
+    /**
+     * 出发类短语。只在导航**起点**播，用来解除退出静默窗。
+     *
+     * 为什么不复用 [pickCapsuleText] 的「任意有效指令」：真机实测高德在导航过程中
+     * **不重发导航通知**（只有冷启动时重复提交一次，两次命中相隔 74ms），
+     * 所以解窗后没有任何 `postShadow` 会来补发影子 —— 只能靠 [updateShadowContent]
+     * 自愈。而且「任意有效指令」会让退出瞬间残留的转向播报把刚关上的窗顶开，
+     * 让 v3.15.58 修好的「胶囊不销毁」复发。用出发类短语则两头都稳。
+     */
+    private val START_PHRASES = listOf("出发", "开始导航", "全程")
+
     // ---------------------------------------------------------------- 播报 → 胶囊 的实时状态
     //
     // 重要：以下字段全部活在**高德进程**里（hook 装在 App 侧）。SystemUI 侧那一份
@@ -196,6 +207,12 @@ internal object ArkNavLiveInjector {
 
     /** 进入退出态的时刻（`SystemClock.elapsedRealtime()`）；0 表示不在退出态 */
     private var navEndingAt = 0L
+
+    /** 上一次打 `skip (ending window)` 的时刻（1s 节流，防退出时高频刷新刷屏） */
+    private var lastSkipLogAt = 0L
+
+    /** `skip (ending window)` 日志最短间隔 */
+    private const val SKIP_LOG_INTERVAL_MS = 1_000L
 
     /** 现在是否处于「刚退出导航」的静默窗内 */
     private fun inEndingWindow(): Boolean = try {
@@ -336,8 +353,18 @@ internal object ArkNavLiveInjector {
         // v3.15.58：刚退出导航的静默窗内**一律不发影子**。
         // 这一步必须在取素材、置 navActive 之前 —— 高德退出导航时会重发一次导航通知，
         // 那次重发如果照常走完，就会在 SystemUI 撤掉旧影子之后又发出一条新的（见 bug 时间线）。
+        //
+        // v3.15.59：日志加 1s 节流 —— 真机上高德退出时可能高频刷新同一条通知，
+        // 不节流会把这行刷满 logcat（`log()` 本身没有节流，`probe()` 才有）。
         if (inEndingWindow()) {
-            log("skip (ending window)")
+            try {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastSkipLogAt >= SKIP_LOG_INTERVAL_MS) {
+                    lastSkipLogAt = now
+                    log("skip (ending window)")
+                }
+            } catch (_: Throwable) {
+            }
             return
         }
 
@@ -508,20 +535,24 @@ internal object ArkNavLiveInjector {
      * 所以额外 `setDefaults(0)` 清掉 DEFAULT_SOUND / DEFAULT_VIBRATE / DEFAULT_LIGHTS，
      * 通道本身也是 IMPORTANCE_LOW + 无声音 + 无振动，三重保险，更新文案绝不响不震。
      *
-     * @return 素材不全（无 Context / title / 大图标 / 小图标）时返回 null
+     * @param requireLargeIcon 大图标不存在时是否直接放弃。
+     *   `postShadow`（首次发布）传 true —— 空图标胶囊比没有更糟；
+     *   自愈路径（[selfHealShadow]）传 false —— 宁可先出个没图标的胶囊，
+     *   也不能因为图钉（转向箭头）缓存丢了就整趟不显示。
+     * @return 素材不全（无 Context / title / 小图标，或 requireLargeIcon 且无大图标）时返回 null
      */
     @Suppress("DEPRECATION")
-    private fun buildShadow(content: String): Notification? {
+    private fun buildShadow(content: String, requireLargeIcon: Boolean = true): Notification? {
         val ctx = lastCtx ?: return null
         val title = lastTitle ?: return null
-        val largeIcon = lastNaviIcon ?: return null
+        val largeIcon = lastNaviIcon
+        if (requireLargeIcon && largeIcon == null) return null
         val smallIcon = lastSmallIcon ?: return null
         return try {
             val b = Notification.Builder(ctx, NAV_SHADOW_CHANNEL)
                 .setSmallIcon(smallIcon)
                 .setContentTitle(title)
                 .setContentText(lastBody ?: title)
-                .setLargeIcon(largeIcon)
                 .setOnlyAlertOnce(true)
                 .setDefaults(0)
                 .setShowWhen(false)
@@ -529,6 +560,7 @@ internal object ArkNavLiveInjector {
                 // 导航本身是常驻通知，影子同样常驻；结束时由 SystemUI 侧
                 // onNotificationRemoved 同步撤销（ArkLiveShadowHook）
                 .setOngoing(true)
+            if (largeIcon != null) b.setLargeIcon(largeIcon)
             val ci = lastContentIntent
             if (ci != null) b.setContentIntent(ci)
             val n = b.build()
@@ -550,7 +582,9 @@ internal object ArkNavLiveInjector {
             capsule.putInt("notification.live.capsuleStatus", 1)
             capsule.putInt("notification.live.capsuleType", 1)
             capsule.putString("notification.live.capsuleContent", content)
-            capsule.putParcelable("notification.live.capsuleIcon", largeIcon)
+            if (largeIcon != null) {
+                capsule.putParcelable("notification.live.capsuleIcon", largeIcon)
+            }
             capsule.putInt("notification.live.capsuleBgColor", CAPSULE_BG)
             capsule.putInt(
                 "notification.live.capsuleContentColor", ArkConstants.readableTextOn(CAPSULE_BG)
@@ -611,23 +645,38 @@ internal object ArkNavLiveInjector {
         }
 
         for (candidate in listOfNotNull(lastSentenceOf(group), data)) {
+            // v3.15.59：**出发类短语**才解静默窗（不再用「任意有效指令」，见 isDeparture 注释）
+            if (isDeparture(candidate) && inEndingWindow()) {
+                navEndingAt = 0L
+                log("ending window cleared (departure)")
+            }
             if (isFarewell(candidate)) {
                 endNavForFarewell()
                 return null
             }
-            pickCapsuleText(candidate)?.let {
-                // v3.15.58：静默窗内又冒出一条**真指令** → 用户其实已经重新开始导航了，
-                // 提前解除静默窗，免得「退出后马上重开」要干等 15 秒才出胶囊。
-                // 这条播报本身仍然不进胶囊（navActive 还是 false），等下一次导航通知
-                // 命中走 postShadow 重新发影子即可 —— 导航中通知是秒级刷新的。
-                if (inEndingWindow()) {
-                    navEndingAt = 0L
-                    log("ending window cleared by new guidance")
-                }
-                return it
-            }
+            pickCapsuleText(candidate)?.let { return it }
         }
         return null
+    }
+
+    /**
+     * 是不是「新一轮导航刚开始」的播报。
+     *
+     * 只认 [START_PHRASES]（`出发` / `开始导航` / `全程`）：这三个词只在导航**起点**播，
+     * 结束语里绝不会出现，所以拿它解静默窗是安全的。
+     *
+     * v3.15.58 曾经用「任意有效指令」解窗，被真机证伪 —— 高德导航中**不重发导航通知**，
+     * 解了窗也没有下一次 `postShadow` 来发影子，导致退出后重开导航整趟没有胶囊；
+     * 而且退出瞬间若残留一句转向播报，窗会被提前解掉，刚修的「胶囊不销毁」bug 复发。
+     */
+    private fun isDeparture(raw: String?): Boolean {
+        if (raw.isNullOrBlank()) return false
+        return try {
+            val norm = raw.replace('，', ',')
+            START_PHRASES.any { norm.contains(it) }
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /** 是不是结束语（`这次的旅途结束了呐，下次再会！` 之类） */
@@ -841,21 +890,39 @@ internal object ArkNavLiveInjector {
     }
 
     /**
-     * 用新的播报文案覆盖胶囊。
+     * 用新的播报文案覆盖胶囊；**没在导航时则自愈补发影子**。
      *
-     * 三道闸，缺一不可：
-     *  1. `navActive` —— 没在导航就不要凭空造胶囊；
+     * 三道闸（更新路径）：
+     *  1. `navActive` —— 没在导航走自愈分支（见下）；
      *  2. `content != lastNaviText` —— 同一句反复播（高德会重播）不重复刷通知；
      *  3. `navNotificationAlive()` —— 源导航通知已经没了说明导航结束，
      *     此时再来一条播报**绝不能把胶囊复活**（这是 v3.15.55 最容易出错的地方）。
+     *
+     * ## v3.15.59 的自愈分支（为什么必须有）
+     *
+     * 真机实测：**高德在导航过程中不重发导航通知**（整个 7 秒导航只有冷启动时那两次
+     * `navInject: hit`，相隔 74ms）。所以「退出导航 → 5 秒内重开」时：
+     *
+     * - 静默窗把退出后那次重发挡掉了 → `navActive` 一直是 false；
+     * - 之后再没有任何通知会来触发 `postShadow`；
+     * - 结果整趟行程没有胶囊。
+     *
+     * 因此这里在 `navActive == false` 时**自己把影子补发出来**：素材沿用上一次缓存的
+     * （标题 / 图标 / Context），缺大图标也照发（`requireLargeIcon = false`）。
      */
     private fun updateShadowContent(content: String) {
         try {
             // 刚退出导航：这条播报可能是退出时残留的尾巴，不许刷胶囊
             if (inEndingWindow()) return
-            if (!navActive) return
+            if (!navActive) {
+                selfHealShadow(content)
+                return
+            }
             if (content == lastNaviText) return
-            val nm = lastNm ?: return
+            val nm = lastNm
+                ?: (appContext()?.getSystemService(Context.NOTIFICATION_SERVICE)
+                    as? NotificationManager)
+                ?: return
             if (!navNotificationAlive(nm)) {
                 navActive = false
                 lastNaviText = ""
@@ -868,6 +935,87 @@ internal object ArkNavLiveInjector {
             XposedBridge.log("[${ArkConstants.LOG_TAG}] navTts: $content")
         } catch (_: Throwable) {
         }
+    }
+
+    /**
+     * 自愈：没有导航通知触发 `postShadow` 的情况下，自己把影子发出来。
+     *
+     * 触发场景（真机 v3.15.58 的坑）：退出导航后 5 秒内重开 → 静默窗挡掉了退出时那次
+     * 通知重发 → `navActive` 一直 false → 高德导航中**不再发任何通知** → 胶囊整趟不出现。
+     *
+     * 素材全部来自缓存（上一次导航的标题 / 图标 / Context），所以：
+     *  - 标题缺失 → 用应用名（`applicationInfo.loadLabel`）兜底；
+     *  - 小图标缺失 → 用本包 `applicationInfo.icon` 兜底（必须是本包资源，
+     *    `Icon.createWithResource` 只认本包，正好我们是高德进程）；
+     *  - **大图标缺失照发**（`requireLargeIcon = false`）—— 少一个转向箭头，
+     *    也好过整趟没有胶囊。
+     *
+     * 成功后把状态推回「导航中」，后续播报继续走正常更新路径。
+     */
+    private fun selfHealShadow(content: String) {
+        try {
+            val ctx = lastCtx ?: appContext()
+            if (ctx == null) {
+                log("self-heal skipped (no context)")
+                return
+            }
+            lastCtx = ctx
+
+            val nm = lastNm
+                ?: (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)
+            if (nm == null) {
+                log("self-heal skipped (no nm)")
+                return
+            }
+            lastNm = nm
+
+            // 自愈的前提：高德此刻**真的挂着导航通知**。
+            // 没有这道闸，非导航场景的语音（比如巡航时的测速提醒）也会让我们凭空发胶囊。
+            // 这道闸不影响验收第 3 条：退出后重开导航时高德会重新 post 导航通知
+            // （只是那次命中被静默窗跳过），通知本身在系统里是存在的。
+            if (!navNotificationAlive(nm)) {
+                log("self-heal skipped (no nav notification)")
+                return
+            }
+
+            if (lastTitle.isNullOrBlank()) lastTitle = appLabel(ctx) ?: "高德地图"
+            if (lastSmallIcon == null) lastSmallIcon = appSmallIcon(ctx)
+            if (lastSmallIcon == null) {
+                log("self-heal skipped (no small icon)")
+                return
+            }
+
+            ensureChannel(nm)
+            val shadow = buildShadow(content, requireLargeIcon = false)
+            if (shadow == null) {
+                log("self-heal skipped (build failed)")
+                return
+            }
+            if (!publishShadow(nm, shadow)) return
+
+            navActive = true
+            lastNaviText = content
+            navEndingAt = 0L
+            log("self-heal shadow posted content='$content' hasIcon=${lastNaviIcon != null}")
+        } catch (t: Throwable) {
+            log("self-heal failed: ${t.message}")
+        }
+    }
+
+    /** 应用名（自愈时没有缓存标题，用它当影子通知的 `contentTitle`） */
+    private fun appLabel(ctx: Context): String? = try {
+        ctx.applicationInfo.loadLabel(ctx.packageManager)?.toString()?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 应用自身图标（自愈时没有缓存 `smallIcon` 的兜底；必须是本包资源） */
+    private fun appSmallIcon(ctx: Context): Icon? = try {
+        val info = ctx.applicationInfo
+        if (info.icon != 0) Icon.createWithResource(info.packageName, info.icon) else null
+    } catch (_: Throwable) {
+        null
     }
 
     /**
@@ -1231,11 +1379,15 @@ internal object ArkNavLiveInjector {
                         // ① 真功能：播报文案 → 胶囊。
                         //    注意必须排在日志上限判断**之前** —— 否则播报超过 200 条
                         //    之后功能就悄悄停了（v3.15.55 差点写错的地方）。
+                        //
+                        //    v3.15.59：**不能**再用 `if (navActive)` 拦住这里。
+                        //    高德导航中不重发导航通知（真机实测），所以「退出后重开导航」时
+                        //    没有任何通知会来置 navActive —— 只能靠这里自愈（见
+                        //    updateShadowContent 的 navActive=false 分支）。加回这个门槛
+                        //    就等于关掉自愈，胶囊整趟不出现。
                         if (feedCapsule) {
                             try {
-                                if (navActive) {
-                                    extractNaviText(task)?.let { updateShadowContent(it) }
-                                }
+                                extractNaviText(task)?.let { updateShadowContent(it) }
                             } catch (_: Throwable) {
                             }
                         }

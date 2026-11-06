@@ -2,6 +2,85 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.59 修「退出后重开导航胶囊不出现」（静默窗自愈）
+
+### 0. 实测结论：高德在导航过程中**不重发导航通知**
+
+v3.15.58 里我加过一段「解析出有效指令就清静默窗」，前提是「导航中通知会秒级刷新，
+清了窗之后下一次命中会走 `postShadow` 重发影子」。真机日志把这个前提证伪了：
+
+```
+10:33:50.126  navInject: hit id=99910001
+10:33:50.196  navInject: hit id=99910001     ← 两次相隔 74ms，属冷启动重复提交
+   …… 中间 7 秒导航全程，一次 navInject: hit 都没有 ……
+10:33:57.351  navInject: hit id=99910001     ← 这次是「退出导航」时那次重发
+```
+
+所以那 6 行不仅没用，还制造了新隐患：**退出后 15 秒内重新开始导航 → 整趟行程
+`navActive` 一直是 false，胶囊全程不出现**（比原 bug 更难被发现）。
+
+### 1. 改成「出发类短语清窗」
+
+删掉「任意有效指令清窗」。新增 `START_PHRASES = ["出发", "开始导航", "全程"]`，
+在 `extractNaviText` 里对候选串归一化后整串 `contains`，命中才 `navEndingAt = 0L`，
+打 `ending window cleared (departure)`。
+
+为什么这样安全：这三个词只在导航**起点**播（`准备出发,` / `全程十公里` / `开始导航`），
+结束语里绝不会出现；而「任意有效指令」会让退出瞬间残留的一句转向播报把刚关上的窗顶开，
+v3.15.58 修好的「胶囊不销毁」立刻复发。
+
+### 2. 胶囊自愈：`navActive=false` 时自己补发影子
+
+`updateShadowContent` 不再「没导航就直接 return」，而是走 `selfHealShadow(content)`：
+
+- 素材全部用缓存（标题 / 大小图标 / Context / NM）；
+- 标题缺失 → `applicationInfo.loadLabel()`（= 「高德地图」）兜底；
+- 小图标缺失 → `Icon.createWithResource(packageName, applicationInfo.icon)` 兜底；
+- **大图标缺失照发**（`buildShadow(content, requireLargeIcon = false)`）——
+  少一个转向箭头，也好过整趟没胶囊；
+- 成功后 `navActive = true` / `lastNaviText = content` / `navEndingAt = 0L`，
+  打 `self-heal shadow posted content='…' hasIcon=…`。
+
+同时**去掉了 `playPCMStart` hook 里的 `if (navActive)` 门槛** —— 不去掉的话自愈永远走不到。
+
+### 3. 自愈前提：高德此刻真的挂着导航通知
+
+`selfHealShadow` 里加了一道 `navNotificationAlive(nm)` 闸，否则非导航场景的语音
+（巡航时的测速提醒等）也会凭空发胶囊。这道闸不影响验收第 3 条：重开导航时高德会重新
+post 导航通知（只是那次命中被静默窗跳过），通知本身在系统里是存在的。
+
+### 4. `skip (ending window)` 日志加 1s 节流
+
+`lastSkipLogAt` + `SKIP_LOG_INTERVAL_MS = 1000L`。`log()` 本身没节流（只有 `probe()` 有），
+退出时若高德高频刷新通知会把 logcat 刷满。
+
+### 5. 验收预期
+
+| 场景 | 预期日志 |
+|---|---|
+| 正常导航 | `shadow posted …` + `navTts: …`（v3.15.57 行为不变） |
+| 手动退出 | `nav ended (farewell, shadow cancelled)`，之后最多每秒一条 `skip (ending window)`，**不再有** `shadow posted` |
+| 退出后 5s 内重开 | `ending window cleared (departure)` → `self-heal shadow posted content='…'` |
+
+### 6. 改动范围
+
+只改 `ArkNavLiveInjector.kt`。`ArkMessageLiveInjector` / `ArkLiveShowFixHook` /
+`ArkLiveSwipeDismissHook` / `ArkMiniBarStyleHook` / `ArkLiveExpandHook` /
+`ArkLiveShadowHook` 一行未改。
+
+### 未验证
+
+- 真机没跑（功能测试由用户做）；
+- **残留边界**：若重开导航后第一句播报不是「出发 / 开始导航 / 全程」这类出发语，
+  而是直接一句转向指令，静默窗不会被提前解除，胶囊要等到窗过期（≤15s）后第一次
+  播报才出现。真机如果观察到这个现象，把窗从 15s 缩到 5s 即可（退出时那次重发只隔 3ms，
+  5s 完全够挡）；
+- `navNotificationAlive` 依赖 `getActiveNotifications()`，若 Flyme 上对同包多进程不可见，
+  自愈会被这道闸一直挡住 —— 日志会打 `self-heal skipped (no nav notification)`，
+  届时把这道闸降级成「只在不处于静默窗时检查」或直接去掉。
+
+版本 `versionCode 82 / 3.15.59`（debug 变体已装机，release 签名同 debug key）。
+
 ## 2026-11-06 · v3.15.58 修「手动退出导航后胶囊不销毁」
 
 ### 0. 真机日志（用户抓的，根因已定位）
