@@ -569,3 +569,62 @@ v3.15.61 首轮自测发现 `九点五` 被解析成 `09:00`（`CLOCK_RE` 强制
 | 进度条 | 按剩余里程，示例 58% | 已用时间 / 总耗时 | 同上；解析不到总耗时就只画轨，不画球 |
 | 底部按钮 | 结束导航 | 回到导航 | 外部无法结束高德的导航 |
 | 状态行目标 | 目的地名 | 抓不到时回落「高德地图」 | 播报很少说出目的地名 |
+
+---
+
+## 8. v3.15.63 真机取证结论：三条通道全部关闭（实证）
+
+这一节是 **v3.15.63 装机实测**的结论汇总。三条旧通道都拿到了证伪证据，写在这里避免下一轮重踩。
+
+### 8.1 通知 extras：无地名，此路永久关闭
+
+`dumpNavExtras()` 在 4 次导航（2 趟）里全量倒出了通知 extras，**每一次的 key 集合完全一致**，
+只有 16 个标准字段，其中三个可疑项实测全为 null：
+
+| key | 实测值 |
+|---|---|
+| `android.subText` | `null` |
+| `android.infoText` | `null` |
+| `android.remoteInputHistory` | `null` |
+
+没有出现任何 `dest` / `poi` / `destination` 类字段，也没有子 Bundle。**导航通知里不存在目的地名**，
+不要再在通知 extras 上找。
+
+### 8.2 导航不是 Service：`dumpsys activity` 显示单 Activity 架构
+
+三条 hook 全部挂上（日志里 `probe svc intent: hooked …` 三条齐全），抓到 14 条 Service 派发，
+**全部是推送 / 网络 SDK**：
+
+```
+LotusPoolService / ChannelService / AmapAccsService
+PushAidlService / MsgDistributeService / TaobaoIntentService
+```
+
+`dumpsys activity` 显示高德的 Activity 只有 `SplashActivity` 与 `NewMapActivity`。
+**导航既不是独立 Service，也不是独立 Activity，而是在 `NewMapActivity` 里切状态。**
+也就是说「启动导航 Service 的 Intent 里带路线参数」这个前提本身不成立 ——
+**「导航 Service 启动参数」这个东西不存在**，此路关闭。
+
+> 探针保留（v3.15.64 把主额度 8 降到 4 只是省日志），作为旁证用。
+
+### 8.3 TTS 播报：6 条全文无地名
+
+这一趟的 6 条播报全文：
+
+```
+右转，随后一百五十米右转
+全程二十一公里
+预计下午一点二十七分到达
+（其余 3 条同为转向 / 距离 / 时间类）
+```
+
+`前往 / 目的地 / 终点` 命中 0 次。高德**不会把目的地念出来**。
+
+### 8.4 由此得出的下一步（v3.15.64 的做法）
+
+目的地是在**导航开始之前**就输入 / 展示过的（搜索框、POI 列表、路线页标题），
+那时它是**真实的 Java 文案**，一定经过 `TextView.setText` / `setContentDescription`。
+
+所以 v3.15.64 换打法：**全程撒网**（环形缓冲记最近 30 条「像地名」的短文本 + 时间戳），
+**导航开始时收网**（影子通知首次投递时倒成一行 `NAV TEXT BUF`，时间戳为负 = 导航前）。
+拿到这条日志就能知道「导航前那几秒屏幕上出现过哪些中文短串」，再决定用哪条 key / 哪个 View 定位。

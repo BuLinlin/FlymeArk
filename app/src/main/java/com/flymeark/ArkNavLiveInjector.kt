@@ -12,6 +12,8 @@ import android.graphics.drawable.Icon
 import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
+import android.view.View
+import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -542,6 +544,13 @@ internal object ArkNavLiveInjector {
             if (lastHitAt != 0L) resetNavPayload()
         }
         lastHitAt = now
+
+        // v3.15.64：收网 —— 把「导航前文案缓冲」一次性倒进日志。
+        //
+        // 位置必须在**上面这段会话复位之后**：复位会把 [textBufDumped] 置回 false，而高德每趟开头
+        // 会连发 2 次导航通知（实测相隔 74ms）。若跟在 dumpNavExtras 后面（复位之前）倒，
+        // 第一次那行会被复位抹掉，第二次再倒一次 → 每趟两行。放在这里 = 每趟恰好一行。
+        dumpTextBuf()
         val content = if (sameSession && lastNaviText.isNotEmpty()) {
             lastNaviText
         } else {
@@ -1532,6 +1541,8 @@ internal object ArkNavLiveInjector {
         etaText = ""
         destText = ""
         extrasDumped = false
+        // v3.15.64：文案捕捞网同样每趟一次，跟着 extras 一起复位
+        textBufDumped = false
     }
 
     /**
@@ -1758,8 +1769,14 @@ internal object ArkNavLiveInjector {
     /** 已 dump 次数（主额度：带 extras 的 Intent） */
     private var svcIntentDumps = 0
 
-    /** Service Intent dump 主额度上限（只给带 extras 的 Intent） */
-    private const val SVC_INTENT_MAX_DUMP = 8
+    /**
+     * Service Intent dump 主额度上限（只给带 extras 的 Intent）。
+     *
+     * v3.15.64 从 8 降到 4：真机实测这条路全是推送/网络 SDK（`LotusPoolService` /
+     * `ChannelService` / `AmapAccsService` / `PushAidlService` …），高德是**单 Activity 架构**，
+     * 「导航 Service 的启动参数」这个东西不存在。探针留着当旁证，但省日志。
+     */
+    private const val SVC_INTENT_MAX_DUMP = 4
 
     /** 已 dump 次数（弱额度：无 extras 但 action 像导航） */
     private var svcIntentNoExtraDumps = 0
@@ -1773,8 +1790,14 @@ internal object ArkNavLiveInjector {
     /** 预留额度上限 */
     private const val SVC_INTENT_RESERVE = 4
 
-    /** action 像导航 Service 的关键词（弱额度只放这些；不区分大小写） */
-    private val NAV_SVC_ACTION_RE = Regex("(?i)(nav|navi|route|guide|tbt|drive|simulat)")
+    /**
+     * action 像导航 Service 的关键词（弱额度只放这些；不区分大小写）。
+     *
+     * v3.15.64 改严：原来裸 `nav` 会命中 `NONAV` / `canvas` 这类纯子串噪声。
+     * 现在要求 `navigat` / `navi_` / `_nav` 这类带边界的形状（真机那批 push SDK 里没有一条
+     * 是靠裸 `nav` 命中的，改严不会漏）。
+     */
+    private val NAV_SVC_ACTION_RE = Regex("(?i)(navigat|navi_|_nav|route|guide|tbt|drive|simulat)")
 
     /** 「cap reached」提示是否已打过（只打一次，只针对主额度） */
     private var svcIntentCapLogged = false
@@ -2041,6 +2064,9 @@ internal object ArkNavLiveInjector {
     private fun svcIntentAnyBudgetLeft(): Boolean = synchronized(svcIntentLock) {
         if (svcIntentDumps < SVC_INTENT_MAX_DUMP) return@synchronized true
         noteCapReachedLocked()
+        // v3.15.64：预留额度也满了就打一次 `reserve exhausted`。三满场景下这是它唯一的出口 ——
+        // 预留额度是在「主额度认领失败之后」才领的，主额度一满这里就 return 的话永远轮不到它。
+        if (svcIntentReserveDumps >= SVC_INTENT_RESERVE) noteReserveExhaustedLocked()
         svcIntentNoExtraDumps < SVC_INTENT_NOEXTRA_BUDGET || svcIntentReserveDumps < SVC_INTENT_RESERVE
     }
 
@@ -2198,6 +2224,174 @@ internal object ArkNavLiveInjector {
         return null
     }
 
+    // ---------------------------------------------------------------- 取证：导航前文案捕捞网（v3.15.64）
+    //
+    // 真机结论（docs/live-nav-research.md §8）三条旧通道全查空：
+    //  ① 通知 extras —— 4 次 dump 的 16 个 key 完全一致，`android.subText/infoText/remoteInputHistory`
+    //     全是 null，无地名；
+    //  ② 导航 Service 启动参数 —— 高德是**单 Activity 架构**（只有 `SplashActivity` /
+    //     `NewMapActivity`），导航只是 `NewMapActivity` 里的状态切换，「导航 Service 的启动 Intent」
+    //     这个东西不存在（抓到的 14 条全是推送/网络 SDK）；
+    //  ③ TTS 播报 —— 6 条全文无地名。
+    //
+    // 但**目的地是用户在导航开始之前就输入/看过的**：搜索框里打的字、POI 列表项、路线页标题，
+    // 那一刻都是真实的 Java 文案，一定会经过 `TextView.setText` / `View.setContentDescription`。
+    //
+    // 所以换个打法：**全程撒网**（记住最近 30 条「像地名」的短文本 + 时间戳），
+    // **导航开始时收网**（影子通知首次投递时一次性倒进日志）。
+    // 相对时间是负数 —— 越负说明越是导航前输入的，正是本轮要的证据。
+
+    /** 一条文案命中：什么时候看到的（elapsedRealtime）、文本是什么 */
+    private data class TextHit(val atMs: Long, val text: String)
+
+    /** 环形缓冲容量：只要最近 30 条，够覆盖「搜索 → 选点 → 开始导航」这段输入过程 */
+    private const val TEXT_BUF_MAX = 30
+
+    /** 倒出时整行上限（超了截断，防一条日志把 logcat 刷爆） */
+    private const val TEXT_BUF_LINE_MAX = 900
+
+    /** 环形缓冲（老 → 新）。读写都必须进 [textBufLock]：hook 回调跨线程 */
+    private val textBuf = ArrayDeque<TextHit>()
+
+    /** [textBuf] 的锁 */
+    private val textBufLock = Any()
+
+    /** 每趟导航只倒一次网（重置点在 [resetNavPayload]） */
+    private var textBufDumped = false
+
+    /**
+     * 记住一条「像地名」的文本。
+     *
+     * **高频路径**（高德主线程每秒可能调几百次 `setText`），所以过滤顺序是硬要求：
+     * 先做最便宜的三刀 —— `null` / 长度不在 2..16 / 不含 CJK —— 任何一刀不过就返回，
+     * 连 `toString()` 都不做；只有走到最后才 `toString()` + [sanitizeDest]
+     * （噪声词、长度闸在里面再核一遍）。这样绝大多数 `setText`（数字、单位、英文、长句）
+     * 都是零分配走完的。
+     *
+     * 同文本只保留**最新一次**（先删旧项再 `addLast`）：高德会把同一个地名反复 `setText`，
+     * 不去重的话 30 条容量会被一条文案刷满，把别的候选挤掉。
+     *
+     * @param s 待记文本；null / 不合规静默丢弃
+     */
+    private fun rememberText(s: CharSequence?) {
+        try {
+            if (s == null) return
+            val n = s.length
+            if (n < 2 || n > 16) return                  // 第一刀：最便宜，砍掉绝大多数
+            var hasCjk = false
+            for (i in 0 until n) {
+                if (s[i] in '\u4e00'..'\u9fff') {        // 第二刀：不含中文的多半是 id / action / 数字
+                    hasCjk = true
+                    break
+                }
+            }
+            if (!hasCjk) return
+            val text = sanitizeDest(s.toString()) ?: return   // 第三刀：复用既有纯函数（噪声 + 长度）
+            val hit = TextHit(SystemClock.elapsedRealtime(), text)
+            synchronized(textBufLock) {
+                textBuf.removeAll { it.text == text }
+                textBuf.addLast(hit)
+                while (textBuf.size > TEXT_BUF_MAX) textBuf.removeFirst()
+            }
+        } catch (_: Throwable) {
+            // 宿主进程：捕捞网自己绝不能抛
+        }
+    }
+
+    /**
+     * 收网：把环形缓冲一次性倒进日志（每趟导航一次，由 [textBufDumped] 保证）。
+     *
+     * 条数为 0 也打一行 `NAV TEXT BUF: n=0` —— 用来区分「网捞空了」和「网压根没挂上」，
+     * 这两种情况的下一步动作完全不同。
+     */
+    private fun dumpTextBuf() {
+        if (textBufDumped) return
+        textBufDumped = true
+        try {
+            val snapshot = try {
+                synchronized(textBufLock) { textBuf.toList() }
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            if (snapshot.isEmpty()) {
+                log("NAV TEXT BUF: n=0")
+                return
+            }
+            val now = SystemClock.elapsedRealtime()
+            val sb = StringBuilder()
+            for (h in snapshot) {
+                if (sb.isNotEmpty()) sb.append(" | ")
+                sb.append('[').append(relSecText(h.atMs, now)).append("s] ").append(h.text)
+            }
+            val body = sb.toString()
+            val shown = if (body.length > TEXT_BUF_LINE_MAX) {
+                body.take(TEXT_BUF_LINE_MAX) + "…"
+            } else {
+                body
+            }
+            log("NAV TEXT BUF: n=${snapshot.size} | $shown")
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 相对收网时刻的秒数（1 位小数；**负数 = 发生在导航开始之前**） */
+    private fun relSecText(atMs: Long, nowMs: Long): String = try {
+        String.format(Locale.US, "%.1f", (nowMs - atMs) / 1000.0)
+    } catch (_: Throwable) {
+        "?"
+    }
+
+    /**
+     * 挂两张文案网：`TextView.setText` / `View.setContentDescription`。
+     *
+     * `setText` 有 5 个重载（`CharSequence` / `CharSequence+BufferType` / `int` / `int+BufferType` /
+     * `char[]+int+int`），逐个 `findAndHookMethod` 一定会漏（规格要求的两个只是其中两个），
+     * 所以用 `hookAllMethods` 一次全挂，回调里按「首参是 `CharSequence`」过滤 ——
+     * `int` / `char[]` 那两个重载自然被滤掉。
+     *
+     * hook 失败只记一行 probe，绝不影响导航胶囊本身。
+     */
+    private fun hookTextNets() {
+        try {
+            XposedBridge.hookAllMethods(
+                TextView::class.java, "setText",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        rememberFirstCharSequence(param)
+                    }
+                }
+            )
+            probeRaw("text net: hooked TextView.setText (all overloads)")
+        } catch (t: Throwable) {
+            probeRaw("text net: hook TextView.setText failed (${t.javaClass.simpleName})")
+        }
+        try {
+            XposedBridge.hookAllMethods(
+                View::class.java, "setContentDescription",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        rememberFirstCharSequence(param)
+                    }
+                }
+            )
+            probeRaw("text net: hooked View.setContentDescription")
+        } catch (t: Throwable) {
+            probeRaw("text net: hook View.setContentDescription failed (${t.javaClass.simpleName})")
+        }
+    }
+
+    /** 从 hook 参数里取首参（必须是 `CharSequence`）交给 [rememberText]；取不到就静默返回 */
+    private fun rememberFirstCharSequence(param: XC_MethodHook.MethodHookParam) {
+        try {
+            val args = param.args
+            if (args == null || args.isEmpty()) return
+            val first = args[0]
+            if (first !is CharSequence) return
+            rememberText(first)
+        } catch (_: Throwable) {
+        }
+    }
+
     // ---------------------------------------------------------------- 安装
 
     fun install(lpp: XC_LoadPackage.LoadPackageParam) {
@@ -2283,6 +2477,9 @@ internal object ArkNavLiveInjector {
         // 同批：`handleCreateService` 只记录 token→服务名（before hook，绝不 setResult），
         // 让 dump 日志里的 `svc=` 不再恒为 `?`。
         hookServiceCreates()
+        // v3.15.64：导航前文案捕捞网 —— 目的地是用户**导航前**输入/看过的，那时它是真实 Java 文案，
+        // 一定走 `TextView.setText`。全程撒网，导航开始时由 [dumpTextBuf] 收网。
+        hookTextNets()
 
         // 不在 App 侧 hook cancel：高德 cancel 的通知不一定是导航那条，一律清影子会让胶囊
         // 在高德刷新通知的间隙里闪没。销毁同步统一放 SystemUI 的 onNotificationRemoved。

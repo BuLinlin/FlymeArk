@@ -2,6 +2,61 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.64 导航前文案捕捞网（第二轮取证）
+
+v3.15.63 装机实测：**三条旧通道全部查空，都有实证**（完整证据见 `live-nav-research.md` §8）。
+所以这版不再在旧路上加码，改成**换个时机取证**。**用户可见行为仍然完全不变**。
+
+### 1. 先说结论：旧通道为什么关了
+
+| 通道 | 实测结论 |
+|---|---|
+| 通知 extras | 4 次全量 dump 的 key 集合**完全一致**，只有 16 个标准字段；`android.subText` / `infoText` / `remoteInputHistory` 实测全 null。**导航通知里没有地名**，此路永久关闭 |
+| 导航 Service 启动参数 | 三个 hook 都挂上了，抓到 14 条**全是推送 / 网络 SDK**（`LotusPoolService` / `ChannelService` / `AmapAccsService` / `PushAidlService` / `MsgDistributeService` / `TaobaoIntentService`）。`dumpsys activity` 显示高德是**单 Activity 架构**（只有 `SplashActivity` / `NewMapActivity`），导航只是 `NewMapActivity` 里的状态切换 —— **「导航 Service 的启动参数」这个东西不存在** |
+| TTS 播报 | 6 条全文无地名（`右转，随后一百五十米右转` / `全程二十一公里` / `预计下午一点二十七分到达`），`前往 / 目的地 / 终点` 命中 0 次 |
+
+### 2. 新探针：`NAV TEXT BUF` 文案捕捞网
+
+目的地是在**导航开始之前**就输入 / 展示过的（搜索框、POI 列表、路线页标题），那时它是
+**真实的 Java 文案**，一定会经过 `TextView.setText` / `View.setContentDescription`。
+所以：**全程撒网，导航开始时收网**。
+
+- **网**：`hookTextNets()` 用 `hookAllMethods` 一次挂全 `TextView.setText` 的**所有重载**
+  （`CharSequence` / `CharSequence+BufferType` / `int` / `int+BufferType` / `char[]+int+int`，
+  逐个 `findAndHookMethod` 会漏），回调按「首参是 `CharSequence`」过滤；另挂
+  `View.setContentDescription`。
+- **滤**：`rememberText()` 三刀 —— `null` / 长度不在 2..16 / 不含 CJK，任何一刀不过**连
+  `toString()` 都不做**（这是高频路径，主线程每秒可能几百次）；过了才 `sanitizeDest()`
+  （复用既有纯函数，噪声词与长度闸都在里面）。
+- **存**：环形缓冲 `ArrayDeque<TextHit>` 容量 30，`synchronized(textBufLock)` 保护；
+  **同文本只保留最新一次**（先删旧项再 `addLast`），否则高德反复 `setText` 同一个地名会把
+  30 条刷满、把别的候选挤掉。
+- **收**：影子通知**首次投递**时 `dumpTextBuf()` 倒一行，每趟导航一次
+  （`textBufDumped`，随 `resetNavPayload()` 复位）。格式（可 grep）：
+
+```
+NAV TEXT BUF: n=4 | [-12.3s] 西岸 | [-8.1s] 望京 | [-3.2s] 建国路 | [-0.4s] 我的位置
+```
+
+  相对时间是**负数 = 发生在导航开始之前**（正是要的证据）。整行超 900 字符截断；
+  条数为 0 也打 `NAV TEXT BUF: n=0`，用来区分「网捞空了」和「网没挂上」。
+
+### 3. 顺手修两个缺陷 + 降噪
+
+- **`reserve exhausted` 三满不可达**：主额度 4/4、弱 2/2、预留 4/4 全满时，前置闸门会提前
+  return，`reserve exhausted (4)` 永远打不出来。现在闸门里在 `noteCapReachedLocked()` 之后
+  补一句 `if (svcIntentReserveDumps >= SVC_INTENT_RESERVE) noteReserveExhaustedLocked()`，
+  两个 note 各有 flag 幂等，不会重复。
+- **`NAV_SVC_ACTION_RE` 误命中**：裸 `nav` 会命中 `NONAV` / `canvas`。改严成
+  `(?i)(navigat|navi_|_nav|route|guide|tbt|drive|simulat)`。真机那批 push SDK 里没有一条是靠
+  裸 `nav` 命中的，改严不会漏。
+- **Service Intent 探针降噪**：真机证明这条路无用（全是 push SDK），主额度 **8 → 4**
+  （弱 2、预留 4 不变），常量名不变，只改数值。
+
+版本 `versionCode 87 / 3.15.64`。
+
+---
+
 ## 2026-11-06 · v3.15.63 导航目的地取证加固（纯探针，行为不变）
 
 **这是一版取证版本：用户可见行为完全不变**（胶囊、迷你条、展开卡、消息 / 音乐分支一行未动）。
