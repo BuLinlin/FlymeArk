@@ -208,6 +208,21 @@ internal object ArkNavLiveInjector {
      */
     private val YAW_OFF_PHRASES = listOf("回到主路", "已回到")
 
+    /**
+     * 「已回到正常路线」的软提示词（v3.15.70）。
+     *
+     * 配合 [TURN_KEYWORDS] 一起用：只有**真正的转向指令**、或这几句明确的回归播报，
+     * 才算导航已恢复正常并允许清掉偏航红。
+     *
+     * 为什么不再用 `pickCapsuleText(raw) != null`（v3.15.69 的写法）：
+     * 那个函数表达的是「这句话能不能塞进胶囊」，不是「这句话是不是道路指引」——
+     * `前方三百米有违章拍照` / `当前路段限速八十` / `请注意保持车距` / `今日限行尾号三和八`
+     * 全都能过它，长绕路途中随便一句提示就把红抹掉了（QA 实测 7/7 误清）。
+     */
+    private val YAW_CLEAR_HINTS = arrayOf(
+        "继续行驶", "沿当前道路", "沿主路", "沿原路线", "回到主路", "已回到", "路线已更新", "路线更新"
+    )
+
     // ---------------------------------------------------------------- 播报 → 胶囊 的实时状态
     //
     // 重要：以下字段全部活在**高德进程**里（hook 装在 App 侧）。SystemUI 侧那一份
@@ -1024,9 +1039,10 @@ internal object ArkNavLiveInjector {
      * 3. [YAW_MIN_HOLD_MS] 最短保持期内 → **任何播报都不许清**。高德常在偏航后
      *    3~5 秒内就播下一条转向，若立刻清，红只闪一两秒，用户根本看不出变过色；
      * 4. 兜底清零 A：明确的「回到主路」类措辞；
-     * 5. 兜底清零 B：高德又给出了**有效道路指引**（[pickCapsuleText] 能抠出句子），
-     *    说明它已经重新规划完、并且正在新路线上指引 —— 继续红着没有意义。
-     *    噪音句（`高德地图持续为您导航` 之类）过不了 [pickCapsuleText]，不会误清。
+     * 5. 兜底清零 B：高德又给出了**真正的道路指引** —— 要么抠出来的句子含 [TURN_KEYWORDS]，
+     *    要么整段命中 [YAW_CLEAR_HINTS]（`沿当前道路` / `继续行驶` / `路线已更新` 之类）。
+     *    v3.15.70 收紧过：v3.15.69 只看 `pickCapsuleText != null`，测速 / 限速 / 车距 /
+     *    拥堵 / 限行那些提示也能过，长绕路途中会把红误清（QA 实测 7/7）。
      *
      * 状态没变时**不写日志** —— 每 3 秒一句播报，重复刷日志没有价值。
      *
@@ -1039,9 +1055,12 @@ internal object ArkNavLiveInjector {
 
             // ① 先判偏航词（命中即红，并记下置红时刻）
             if (YAW_ON_PHRASES.any { raw.contains(it) }) {
+                // v3.15.70：置红时刻**每句都刷新**。v3.15.69 把它关在 if (!navYawed) 里面，
+                // 导致连续偏航时「最短保持」是拿第一句算的 —— 第三句偏航播完后 1 秒就被清掉了。
+                // 语义上「仍在偏航」应该从最后一句偏航播报起算。
+                yawedAt = now
                 if (!navYawed) {
                     navYawed = true
-                    yawedAt = now
                     log("yaw state=true text='${raw.take(48)}'")
                 }
                 return
@@ -1061,11 +1080,15 @@ internal object ArkNavLiveInjector {
                 return
             }
 
-            // ⑤ 兜底清零 B（v3.15.69 新增）：高德又给出了**有效道路指引**，
-            //    说明它已经重新规划完并且在新路线上 —— 此时继续红着没有意义。
-            //    噪音句（`持续为您导航` 之类）pickCapsuleText 返回 null，不会误清。
-            val instr = pickCapsuleText(raw)
-            if (instr != null) {
+            // ⑤ 兜底清零 B（v3.15.70 收紧）：只认「真正的道路指引」。
+            //    v3.15.69 用 pickCapsuleText(raw) != null 当判据，实测 7/7 误清
+            //    （测速 / 限速 / 车距 / 拥堵 / 限行 全都能过那个函数）。
+            //    现在要求：要么抠出来的这句话里含转向关键词（[TURN_KEYWORDS]），
+            //    要么整段里出现明确的「已回到路线」措辞。
+            val picked = pickCapsuleText(raw)
+            val resumed = (picked != null && TURN_KEYWORDS.any { picked.contains(it) }) ||
+                YAW_CLEAR_HINTS.any { raw.contains(it) }
+            if (resumed) {
                 navYawed = false
                 log("yaw state=false (guidance resumed) text='${raw.take(48)}'")
             }

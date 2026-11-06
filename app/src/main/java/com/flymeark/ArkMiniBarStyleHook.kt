@@ -147,6 +147,9 @@ internal object ArkMiniBarStyleHook {
      */
     private var lastGoodNav: NavMiniPayload? = null
 
+    /** 「这不是我们的导航影子」只提示一次，避免高德其它实况刷新时刷屏 */
+    private var navGhostLogged = false
+
     @Volatile
     private var idsReady = false
 
@@ -310,8 +313,21 @@ internal object ArkMiniBarStyleHook {
     ) {
         val parent = header as? ViewGroup ?: return
         val parsed = navPayloadOf(row)
-        // 三个字段全空 = 解析失败（正常导航帧至少有一个），此时沿用上一次成功的载荷。
-        // 语义上等同「两次播报之间冻结」，与产品口径一致。
+        // v3.15.70：present=false 说明这条实况根本不是我们的导航影子（高德同包名下的
+        // 其它实况通知）。此时绝不能拿上一趟的载荷去画 —— 否则会把上一趟的指令 /
+        // 剩余时间 / 甚至偏航红画到一条跟导航无关的通知上。
+        val existing = header.getTag(KEY_NAV) as? ArkMiniNavView
+        if (!parsed.present) {
+            if (!navGhostLogged) {
+                navGhostLogged = true
+                XposedBridge.log("[$TAG] nav bar skipped: not our shadow")
+            }
+            existing?.visibility = View.GONE
+            return
+        }
+        existing?.visibility = View.VISIBLE
+        // present=true 但三字段全空 = 反射只读到一部分（正常帧 instr 必非空，见 buildShadow），
+        // 此时沿用上一次成功的载荷，语义等同「两次播报之间冻结」。
         val usable = parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L
         val p = if (usable) {
             lastGoodNav = parsed
@@ -320,7 +336,7 @@ internal object ArkMiniBarStyleHook {
             lastGoodNav ?: parsed
         }
 
-        var overlay = header.getTag(KEY_NAV) as? ArkMiniNavView
+        var overlay = existing
         if (overlay == null) {
             overlay = ArkMiniNavView(header.context, density, appIconOf(header.context, pkg))
             overlay.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -377,6 +393,9 @@ internal object ArkMiniBarStyleHook {
         val timeUnit: String = "",
         /** 偏航态（v3.15.67）：true 时三点转 [ArkTokens.NAV_YAW_RED] */
         val yawed: Boolean = false,
+
+        /** 影子通知 extras 里是否真的有 NAV_KEY_INSTR —— 用来区分「我们的导航影子」与「高德的其它实况通知」 */
+        val present: Boolean = false,
     )
 
     private fun navPayloadOf(row: View?): NavMiniPayload = try {
@@ -392,6 +411,7 @@ internal object ArkMiniBarStyleHook {
             timeText = ex.getString(ArkConstants.NAV_KEY_TIME).orEmpty(),
             timeUnit = ex.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty(),
             yawed = ex.getBoolean(ArkConstants.NAV_KEY_YAWED, false),
+            present = true,
         )
     } catch (_: Throwable) {
         NavMiniPayload()
