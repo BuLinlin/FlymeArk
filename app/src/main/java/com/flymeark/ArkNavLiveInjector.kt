@@ -1,5 +1,6 @@
 package com.flymeark
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -26,6 +27,7 @@ import java.lang.ref.WeakReference
 import java.lang.reflect.Modifier
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.HashSet
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -4282,19 +4284,122 @@ internal object ArkNavLiveInjector {
     }
 
     /**
-     * 给本趟挂 +3s / +8s 两次控件树 dump（v3.15.86 探针 4）。
+     * 给本趟挂 +3s / +8s / +20s 三次取证 dump（v3.15.86 探针 4，v3.15.87 扩到三次）。
      *
-     * 为什么两次：+3s 是刚进导航页（顶部那两条可能刚建出来），
-     * +8s 是数字第一轮刷新之后（能看到 `19:35到达` 这类会变的文本挂在哪个节点上）。
+     * 为什么三次：+3s 是刚进导航页（顶部那两条可能刚建出来）；
+     * +8s 是数字第一轮刷新之后（能看到 `19:35到达` 这类会变的文本挂在哪个节点上）；
+     * +20s 兜底 —— 有些页面要等定位 / 路线算完才把顶部卡片建出来。
      * 用主线程 Handler 而不是新线程：读 View 树必须在 UI 线程上做。
+     *
+     * v3.15.87：每个时间点**同时**跑 [dumpViewTreeOnce] 与 [dumpLocaleTextViews]。
      */
     private fun scheduleViewTreeDumps() {
         try {
             if (vProbeScheduled) return
             vProbeScheduled = true
             val h = Handler(Looper.getMainLooper())
-            h.postDelayed({ dumpViewTreeOnce("3s") }, 3_000L)
-            h.postDelayed({ dumpViewTreeOnce("8s") }, 8_000L)
+            h.postDelayed({ dumpViewTreeOnce("3s"); dumpLocaleTextViews("3s") }, 3_000L)
+            h.postDelayed({ dumpViewTreeOnce("8s"); dumpLocaleTextViews("8s") }, 8_000L)
+            h.postDelayed({ dumpViewTreeOnce("20s"); dumpLocaleTextViews("20s") }, 20_000L)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 探针 5A：从 `Activity.onResume` 拿真正的 DecorView（v3.15.87）。
+     *
+     * v3.15.86 的 [decorRef] 是从 `setText` / `setContentDescription` 的 `thisObject`
+     * 反推 `rootView` —— 但导航页主视图是 GLSurfaceView / MapView，它**不经过任何 setText**，
+     * 所以 `decorRef` 永远停在「最后一次碰巧 setText 的 GPS 角标」（238x238），
+     * 主界面整棵树从没进去过（真机 `VPROBE-TREE` 里只有 `GpsMapViewWithTips` / 空布局）。
+     *
+     * 改成每次 Activity `onResume` 直接把 `window.decorView` 记下来，根 View 才是真的。
+     */
+    private fun hookActivityForRoot() {
+        try {
+            XposedBridge.hookAllMethods(
+                Activity::class.java, "onResume",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val a = param.thisObject as? Activity ?: return
+                            val decor = a.window?.decorView ?: return
+                            decorRef = WeakReference(decor)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("probe: hooked Activity.onResume for decorView")
+        } catch (t: Throwable) {
+            probeRaw("probe: hook Activity.onResume failed (${t.javaClass.simpleName})")
+        }
+    }
+
+    /**
+     * 探针 5B：反射枚举 `AmapLocaleTextView` 的 `getText()`（v3.15.87）。
+     *
+     * dexdump 结论（team-lead 已采信）：高德那两条数字大概率是
+     * `com.amap.bundle.commonui.designtoken.view.textview.DtTextView`（及其父类
+     * `com.amap.bundle.utils.language.view.AmapLocaleTextView`）在画，而它**直接继承
+     * `android.widget.TextView` 且没重写 `setText`** —— 文字的最终存储仍在标准的
+     * `TextView.mText` 里，只是设字的时机/路径还没抓到。所以只要拿到真根 View，
+     * 枚举树里所有 `AmapLocaleTextView` 实例并反射 `text`，数字一定在里面。
+     *
+     * `Class.forName` **必须**用 `root.context.classLoader`（高德的类加载器）——
+     * 不能靠 `AmapLocaleTextView::class.java` 的隐式 loader，那在高德进程里找不到类。
+     * 找不到类时本函数静默跳过（`cls = null`），只损失这一次枚举，不影响其它探针。
+     */
+    private fun dumpLocaleTextViews(tag: String) {
+        try {
+            val root = decorRef?.get() ?: return
+            val out = StringBuilder()
+            val seen = HashSet<String>()
+            var n = 0
+            val cls = try {
+                Class.forName(
+                    "com.amap.bundle.utils.language.view.AmapLocaleTextView",
+                    false, root.context.classLoader
+                )
+            } catch (_: Throwable) {
+                null
+            }
+            val queue = ArrayDeque<View>()
+            queue.addLast(root)
+            var guard = 0
+            while (queue.isNotEmpty() && guard++ < 2000) {
+                val v = queue.removeFirst()
+                if (cls != null && cls.isInstance(v)) {
+                    val t = try {
+                        (v as TextView).text?.toString() ?: ""
+                    } catch (_: Throwable) {
+                        ""
+                    }
+                    if (t.isNotEmpty()) {
+                        val key = "${v.javaClass.simpleName}:$t"
+                        if (seen.add(key) && n++ < 60) {
+                            if (out.isNotEmpty()) out.append(" | ")
+                            out.append(v.javaClass.simpleName).append('(')
+                                .append(v.width).append('x').append(v.height).append(")='")
+                                .append(t.take(24)).append('\'')
+                        }
+                    }
+                }
+                if (v is ViewGroup) {
+                    val cn = try {
+                        v.childCount
+                    } catch (_: Throwable) {
+                        0
+                    }
+                    for (i in 0 until cn) {
+                        try {
+                            queue.addLast(v.getChildAt(i))
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+            log("VPROBE-LOCALE[$tag] n=$n $out")
         } catch (_: Throwable) {
         }
     }
@@ -4688,6 +4793,8 @@ internal object ArkNavLiveInjector {
         hookTextNets()
         // v3.15.86 探针 3：Canvas 自绘文本（只喂取证环，不接任何解析）。
         hookCanvasText()
+        // v3.15.87 探针 5A：从 Activity.onResume 拿真正的 DecorView（修 3.15.86 抓错根的毛病）。
+        hookActivityForRoot()
 
         // 不在 App 侧 hook cancel：高德 cancel 的通知不一定是导航那条，一律清影子会让胶囊
         // 在高德刷新通知的间隙里闪没。销毁同步统一放 SystemUI 的 onNotificationRemoved。
