@@ -16,4 +16,28 @@
     <string name="ark_msg_app">消息应用</string>
     <string name="ark_msg_hint_open">进入会话</string>
     <string name="ark_msg_unknown">新消息</string>
+
+    <!--
+        v3.15.61：导航展开卡。
+        三栏标签只有「总量口径」可用 —— 高德不给我们实时的剩余距离 / 剩余时间
+        （见 docs/live-nav-research.md §7），所以标签写成 耗时 / 全程 / 到达，
+        而不是设计稿的 剩余时间 / 剩余距离 / 预计到达。
+    -->
+    <string name="ark_nav_live">导航中</string>
+    <string name="ark_nav_default_instr">正在导航</string>
+    <string name="ark_nav_back">回到导航</string>
+    <string name="ark_nav_source">高德地图</string>
+    <string name="ark_nav_time_label">耗时</string>
+    <string name="ark_nav_dist_label">全程</string>
+    <string name="ark_nav_eta_label">到达</string>
+    <string name="ark_nav_placeholder">--</string>
+    <string name="ark_nav_collapse">收起</string>
+    <string name="ark_nav_turn">转向指示</string>
+
+    <!-- 转向箭头的无障碍描述（设计稿没有，按语义补；tint 后仍是同一张图） -->
+    <string name="ark_nav_turn_left">左转</string>
+    <string name="ark_nav_turn_right">右转</string>
+    <string name="ark_nav_turn_straight">直行</string>
+    <string name="ark_nav_turn_uturn">掉头</string>
+    <string name="ark_nav_turn_arrive">到达目的地</string>
 </resources>

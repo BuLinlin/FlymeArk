@@ -1,0 +1,302 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  v3.15.61：点击**导航胶囊**（高德）后从状态栏下方展开的导航大卡。
+
+  结构与 activity_message_panel 完全同构（nav_root / nav_card / nav_content 三层），
+  为的是复用 ArkMorphAnim 的「胶囊长大成卡片」动画：
+   - nav_card 只负责背景与尺寸插值（终态 28dp 圆角玻璃卡）
+   - nav_content 固定最终尺寸，动画中只做 alpha，超出部分被裁掉
+
+  设计稿映射（nav.html，392px 宽卡按 1x 量取后落到 dp/sp）：
+   - 卡内边距 19 / 20 / 17；状态行 22dp（44dp 收起按钮用负 margin 溢出到行外，
+     所以 nav_root→nav_card→nav_content 这条链上要开 clipChildren=false）
+   - 转向块 52dp + 16dp 圆角 + 27dp 白色人字箭头，指令 17sp/600，副指令 13sp
+   - 进度条整块 17dp（轨 4dp / 球 13dp + 白环 / 终点白球 9dp）
+   - 三栏：数值 16sp/600 + 单位 11sp（运行时用 Spannable 拼），标签 11sp
+   - 底部：1dp 分割线 + 「回到导航」30dp 胶囊按钮 + 来源名
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/nav_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/transparent"
+    android:clickable="true"
+    android:focusable="true">
+
+    <FrameLayout
+        android:id="@+id/nav_card"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="10dp"
+        android:background="@drawable/bg_ark_panel"
+        android:clickable="true"
+        android:clipChildren="false"
+        android:clipToPadding="false"
+        android:focusable="true">
+
+        <LinearLayout
+            android:id="@+id/nav_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:clipChildren="false"
+            android:clipToPadding="false"
+            android:orientation="vertical"
+            android:paddingHorizontal="@dimen/ark_nav_pad_h"
+            android:paddingTop="@dimen/ark_nav_pad_top"
+            android:paddingBottom="@dimen/ark_nav_pad_bottom">
+
+            <!-- ============ 状态行：蓝点 + 「导航中」 + 目的地 + 收起 ============ -->
+            <FrameLayout
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/ark_nav_status_height"
+                android:clipChildren="false"
+                android:clipToPadding="false">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <!-- 6dp 蓝点 + 3dp 的 16% 同色光环（两层自绘，见 ArkNavPanelActivity） -->
+                    <FrameLayout
+                        android:id="@+id/nav_dot"
+                        android:layout_width="@dimen/ark_nav_dot"
+                        android:layout_height="@dimen/ark_nav_dot">
+
+                        <View
+                            android:id="@+id/nav_dot_ring"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent" />
+
+                        <View
+                            android:id="@+id/nav_dot_core"
+                            android:layout_width="@dimen/ark_nav_dot_core"
+                            android:layout_height="@dimen/ark_nav_dot_core"
+                            android:layout_gravity="center" />
+                    </FrameLayout>
+
+                    <TextView
+                        android:id="@+id/nav_live"
+                        style="@style/ArkNavLive"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="6dp"
+                        android:text="@string/ark_nav_live" />
+
+                    <View
+                        android:id="@+id/nav_sep"
+                        android:layout_width="@dimen/ark_nav_sep"
+                        android:layout_height="@dimen/ark_nav_sep"
+                        android:layout_marginStart="8dp" />
+
+                    <TextView
+                        android:id="@+id/nav_dest"
+                        style="@style/ArkNavDest"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:layout_weight="1" />
+                </LinearLayout>
+
+                <!--
+                  收起按钮：设计稿 44×44、margin -11 -12 -11 0。
+                  父容器已固定 22dp 高并开 clipChildren=false，所以负 margin 不会把行撑高。
+                -->
+                <ImageView
+                    android:id="@+id/nav_collapse"
+                    android:layout_width="@dimen/ark_nav_collapse"
+                    android:layout_height="@dimen/ark_nav_collapse"
+                    android:layout_gravity="top|end"
+                    android:layout_marginTop="-11dp"
+                    android:layout_marginEnd="-12dp"
+                    android:background="?android:attr/selectableItemBackgroundBorderless"
+                    android:clickable="true"
+                    android:contentDescription="@string/ark_nav_collapse"
+                    android:focusable="true"
+                    android:padding="12dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_ark_chevron_up" />
+            </FrameLayout>
+
+            <!-- ============ 转向指令 ============ -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/ark_nav_maneuver_top"
+                android:clipChildren="false"
+                android:clipToPadding="false"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.flymeark.ArkNavTurnBlockView
+                    android:id="@+id/nav_turn"
+                    android:layout_width="@dimen/ark_nav_turn"
+                    android:layout_height="@dimen/ark_nav_turn"
+                    android:contentDescription="@string/ark_nav_turn" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="@dimen/ark_nav_gap_turn"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/nav_instr"
+                        style="@style/ArkNavInstr"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:id="@+id/nav_sub"
+                        style="@style/ArkNavSub"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- ============ 路线进度（时间口径，见 ArkNavProgressView 注释） ============ -->
+            <com.flymeark.ArkNavProgressView
+                android:id="@+id/nav_progress"
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/ark_nav_progress"
+                android:layout_marginHorizontal="2dp"
+                android:layout_marginTop="@dimen/ark_nav_progress_top" />
+
+            <!-- ============ 三栏数据（总量口径） ============ -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/ark_nav_stats_top"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:paddingStart="1dp">
+
+                    <TextView
+                        android:id="@+id/nav_time_value"
+                        style="@style/ArkNavValue"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:id="@+id/nav_time_label"
+                        style="@style/ArkNavLabel"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="5dp"
+                        android:text="@string/ark_nav_time_label" />
+                </LinearLayout>
+
+                <View
+                    android:id="@+id/nav_divider_1"
+                    android:layout_width="@dimen/ark_nav_divider"
+                    android:layout_height="@dimen/ark_nav_stat_height" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:paddingStart="@dimen/ark_nav_stat_gap">
+
+                    <TextView
+                        android:id="@+id/nav_dist_value"
+                        style="@style/ArkNavValue"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:id="@+id/nav_dist_label"
+                        style="@style/ArkNavLabel"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="5dp"
+                        android:text="@string/ark_nav_dist_label" />
+                </LinearLayout>
+
+                <View
+                    android:id="@+id/nav_divider_2"
+                    android:layout_width="@dimen/ark_nav_divider"
+                    android:layout_height="@dimen/ark_nav_stat_height" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:paddingStart="@dimen/ark_nav_stat_gap">
+
+                    <TextView
+                        android:id="@+id/nav_eta_value"
+                        style="@style/ArkNavValue"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:id="@+id/nav_eta_label"
+                        style="@style/ArkNavLabel"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="5dp"
+                        android:text="@string/ark_nav_eta_label" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- ============ 底部操作 ============ -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/ark_nav_foot_top"
+                android:orientation="vertical">
+
+                <View
+                    android:id="@+id/nav_foot_divider"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/ark_nav_divider" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal"
+                    android:paddingTop="@dimen/ark_nav_foot_pad_top">
+
+                    <!--
+                      设计稿文案是「结束导航」，但外部 App 无法结束别人的导航
+                      （高德没暴露任何可供第三方调用的停止入口），所以按钮只做
+                      「回到导航」：把高德主界面拉起来。取舍见 docs/changelog.md。
+                    -->
+                    <TextView
+                        android:id="@+id/nav_btn"
+                        style="@style/ArkNavButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="@dimen/ark_nav_btn_height"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:gravity="center"
+                        android:paddingHorizontal="@dimen/ark_nav_btn_pad_h"
+                        android:text="@string/ark_nav_back" />
+
+                    <View
+                        android:layout_width="0dp"
+                        android:layout_height="1dp"
+                        android:layout_weight="1" />
+
+                    <TextView
+                        android:id="@+id/nav_source"
+                        style="@style/ArkNavSource"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/ark_nav_source" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+</FrameLayout>

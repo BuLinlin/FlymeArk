@@ -2,6 +2,68 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.61 导航展开卡（设计稿落地）
+
+点高德导航胶囊 → 从状态栏下方展开 392×258 的导航大卡。**胶囊本体（迷你条）、消息卡、音乐卡一律不动**，
+`pickCapsuleText` 的 17 行样例表也一行没改。
+
+### 新增文件
+
+| 文件 | 作用 |
+|---|---|
+| `ArkNavPanelActivity.kt` + `activity_nav_panel.xml` | 大卡本体，复用 `ArkMorphAnim` 的「胶囊长大成卡片」 |
+| `ArkNavProgressView.kt` | 4dp 轨 + 13dp 球 + 白环 + 9dp 终点圆，自绘 |
+| `ArkNavTurnBlockView.kt` | 52dp / R16 品牌蓝渐变转向块 + 27dp 白色箭头 |
+| `ArkNavParse.kt` | 中文数字 / 数值格式化 / 时刻解析，纯函数、不碰 Android |
+| `ic_ark_turn_{left,right,straight,uturn,arrive}.xml` `ic_ark_chevron_up.xml` | 6 张矢量图 |
+
+`ArkNavPanelActivity` 用 `taskAffinity=com.flymeark.navpanel` 独立注册（与 `panel` / `msgpanel` 都不同），
+`queries` 补上 `com.autonavi.minimap`，否则「回到导航」的 `getLaunchIntentForPackage()` 会拿不到。
+
+### 载荷通道：影子通知的 extras
+
+高德进程（写数据）、SystemUI 进程（响应点击）、模块自身进程（渲染卡片）三方没有共享内存。
+唯一现成通道是**已经存在的那条导航影子通知**：`ArkNavLiveInjector.buildShadow()` 把
+`instr / sub / dest / dist / time / eta / started / totalMs / turn` 9 组值平铺进顶层 extras，
+`ArkLiveExpandHook.launchNavPanel()` 从 `mNotificationEntries` 里找到
+`tag=flymeark_live_nav` 那条读出，原样搬进启动 Intent。详见 `docs/live-nav-research.md` §7。
+
+### 三条取舍（都是设计稿里没有、但必须这么定的）
+
+1. **三栏改用总量口径**：`耗时 27 分钟 / 全程 8 公里 / 到达 12:19`，替代设计稿的
+   `剩余时间 / 剩余距离 / 预计到达`。高德的实时剩余值只存在于它自己的渲染层，
+   外部拿不到；能拿到的只有出发播报里那一次总量
+   （`准备出发,,全程八公里,大约需要二十七分钟,预计中午十二点十九分到达`）。
+   播报里是中文数字，所以补了 `parseCnNumber()`（`一百三十三` → 133、`三点三` → 3.3）。
+2. **进度条是时间口径**：`已用时间 / 总耗时`（都用 `elapsedRealtime` 单调时钟），每秒刷新。
+   不是设计稿那根按剩余里程走的 58% 进度。解析不到总耗时时只画轨和终点圆、**不画进度球**——
+   画个 0% 的球会让人误以为刚出发，宁可少画也不虚构。
+3. **底部按钮改成「回到导航」**：设计稿写的是「结束导航」，但外部 App 无法结束别人的导航
+   （高德没有暴露第三方可调用的停止入口），做一个点了没反应的按钮更糟。
+   点击走 `getLaunchIntentForPackage()` 拉起高德；拿不到 Launcher Intent 时才兜底发
+   导航通知的 `contentIntent`（后者在 Android 15 上可能被 BAL 静默拦掉，不能当主路径）。
+
+### 与设计稿的已知偏差
+
+- `nav.html` 右上角是**收起 chevron**，`handoff-spec.md` §四 说展开卡右上角应给 28×28 来源 logo、
+  且「不再提供收起箭头」。本轮按导航稿实现 chevron，来源名放在底部右下角「高德地图」。
+- 渐变方向：CSS `160deg` 在原生按垂直 `LinearGradient` 近似，三段色停 0/60/100% 一致。
+- `handoff-spec.md` §七.5 明确暗色模式未出图、**不要直接反色**。本轮按现有 `GlassParams.light`
+  下发文字色与分割线，转向块的品牌蓝渐变两档共用；暗色只是让卡片可读，不是设计交付。
+- 主指令 / 副指令：胶囊只有一句话，播报里带 `进入…` / `驶入…` 段时优先抽成副行
+  （`进入 建国路`），否则退化成「首句 / 后续句」。后续句可能较长，单行 ellipsize。
+- 目的地名只在少数播报表述里出现（`前往…` / `目的地是…`），抓不到时回落显示「高德地图」。
+
+### 验证边界（未在真机验证，交由用户实测）
+
+- `assembleDebug` 通过；`ArkNavParse` 的 20 项纯函数样例表全部通过（用生产源码直接编译运行）。
+- 尚未验证：`mNotificationEntries` 里导航影子的 extras 能否在 SystemUI 进程完整读出、
+  展开动画在 392 宽卡上的实际观感、`回到导航` 是否把高德导航页带回前台。
+
+版本 `versionCode 84 / 3.15.61`。
+
+---
+
 ## 2026-11-06 · v3.15.60 静默窗 15s → 5s（导航数据侧收口）
 
 只改一个常量，**没有任何逻辑改动**。

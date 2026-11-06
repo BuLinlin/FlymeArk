@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.61：到达目的地箭头（设计稿没给，用「终点水滴」表示）：
+    水滴轮廓 + 中心圆点，笔画 2.5 / round，与其它转向箭头同重量。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="27dp"
+    android:height="27dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M12,21 C12,21 18,15.8 18,10.8 A6,6 0 1 0 6,10.8 C6,15.8 12,21 12,21 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="2.5" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M12,13.4 A2.6,2.6 0 1 0 12,8.2 A2.6,2.6 0 0 0 12,13.4 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="2.5" />
+</vector>

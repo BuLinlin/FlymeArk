@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.61：右转箭头。直接照搬设计稿 nav.html 里 .turn 内的两段 path
+    （`M8 20.6V10.4A4.4 4.4 0 0 1 12.4 6h5` + `M15.4 2.9 19 6l-3.6 3.1`），
+    只把简写命令展开成绝对坐标，笔画参数（2.5 / round）保持设计值。
+
+    24 视口 × 24 视口，落位时缩到 27dp（设计稿 .turn 内 svg 的 27×27）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="27dp"
+    android:height="27dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M8,20.6 L8,10.4 A4.4,4.4 0 0 1 12.4,6 L17.4,6"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="2.5" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M15.4,2.9 L19,6 L15.4,9.1"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="2.5" />
+</vector>

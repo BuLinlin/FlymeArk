@@ -177,4 +177,79 @@ internal object ArkTokens {
      */
     const val TOUCH_SOFT_LIGHT = 0xFFF2F4F7.toInt()
     const val TOUCH_SOFT_DARK = 0x24FFFFFF
+
+    // ------------------------------------------------------------------
+    // v3.15.61：导航展开卡（设计稿 nav.html / design-tokens.css）
+    //
+    // 面板是**模块自身进程**的普通 Activity，背景是玻璃卡；这里的色值只用于
+    // 卡内元素（文字 / 分割线 / chip / 转向块渐变 / 进度条）。
+    // 深浅两档都由 ArkLiquidGlass.resolve() 的 p.light 决定，不吃 values-night，
+    // 与消息卡同一套规则（系统夜间 + 亮壁纸时不会错配）。
+    // ------------------------------------------------------------------
+
+    /** 语义色（设计稿 success / warn），本轮只登记，导航卡暂未使用 */
+    const val SUCCESS = 0xFF12A150.toInt()
+    const val WARN = 0xFFE5484D.toInt()
+
+    /** 设计稿 ink-2：目的地 / 指令副行 / 数值单位 */
+    const val SUBTLE_TEXT_LIGHT = 0xFF6B7280.toInt()
+    const val SUBTLE_TEXT_DARK = 0xFFAEB6C4.toInt()
+
+    /** 设计稿 ink-3：三栏标签 / 来源名 */
+    const val INK3_LIGHT = 0xFF9AA1AC.toInt()
+    const val INK3_DARK = 0xFF8E97A6.toInt()
+
+    /** 底部按钮底：5.5% 墨（浅）/ 10% 白（深） */
+    const val SUBTLE_CHIP_LIGHT = 0x0E161A22
+    const val SUBTLE_CHIP_DARK = 0x1AFFFFFF
+
+    /** 1dp 分割线：7% 墨（浅）/ 12% 白（深） */
+    const val DIVIDER_LIGHT = 0x12161A22
+    const val DIVIDER_DARK = 0x1FFFFFFF
+
+    /** 转向块渐变（设计稿 160° #3D77FF → #2F6BFF → #2455D6） */
+    const val TURN_TOP = 0xFF3D77FF.toInt()
+    const val TURN_MID = 0xFF2F6BFF.toInt()
+    const val TURN_BOTTOM = 0xFF2455D6.toInt()
+
+    /** 转向块 52dp 圆角 16dp */
+    const val RADIUS_TURN_DP = 16
+    const val TURN_BLOCK_DP = 52
+
+    /** 转向块中央的白色人字箭头 27dp（设计稿 `.turn svg` 的 27×27） */
+    const val NAV_TURN_ICON_DP = 27
+
+    /** 底部「回到导航」按钮高 30dp、全圆角、左右内边距 15dp */
+    const val NAV_BTN_HEIGHT_DP = 30
+    const val NAV_BTN_PADDING_H_DP = 15
+
+    /** 进度条：轨 4dp、球 13dp + 3dp 白环、终点白球 9dp + 2.5dp 环；整块高 17dp */
+    const val NAV_PROGRESS_TRACK_DP = 4
+    const val NAV_PROGRESS_THUMB_DP = 13
+    const val NAV_PROGRESS_THUMB_RING_DP = 3
+    const val NAV_PROGRESS_END_DP = 9
+    const val NAV_PROGRESS_END_RING_DP = 2.5f
+    const val NAV_PROGRESS_HEIGHT_DP = 17
+
+    /**
+     * 进度条左右留白 9dp。
+     *
+     * 设计稿 `.prog{margin:0 2px}` 让轨几乎贴满卡片，但它没有 `overflow:hidden`，
+     * 球画到 0% / 100% 时会溢出到轨外面 —— 原生 View 画不出界（会被父容器裁掉），
+     * 所以两侧各让 9dp（= 球的 6.5dp 半径 + 3dp 白环 - 0.5dp 余量），
+     * 保证 `0%` 的球和 `100%` 的球都是完整的圆。
+     */
+    const val NAV_PROGRESS_H_INSET_DP = 9
+
+    /** 终点白球的环色（设计稿 #D3D8E1，亮暗同值） */
+    const val NAV_PROGRESS_END_RING_COLOR = 0xFFD3D8E1.toInt()
+
+    /** 目的地 / 状态行字号 11.5sp；标签 11sp；数值 16sp + 单位 11sp */
+    const val TYPE_NAV_META_SP = 11.5f
+    const val TYPE_NAV_LABEL_SP = 11f
+    const val TYPE_NAV_VALUE_SP = 16f
+    const val TYPE_NAV_UNIT_SP = 11f
+    const val TYPE_NAV_INSTR_SP = 17f
+    const val TYPE_NAV_SUB_SP = 13f
+    const val TYPE_NAV_BTN_SP = 12.5f
 }

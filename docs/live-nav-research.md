@@ -481,3 +481,91 @@ RelativeLayout  (match_parent × wrap_content)
 
 → 把 `com.autonavi.minimap` 加进去只是**让开关可见**，是个纯粹的 UI 完善项，和方案 A 能不能跑通没有因果关系。
 可以顺手加，但不要指望它解决问题。
+
+---
+
+## 6. 结论修正：数据是从「语音播报」拿到的，不是通知里
+
+§4.6 末尾那个「数据落差」的判断（第一版只能做 `arrow + 导航中 + 剩余里程`），
+在后来的真机取证里被**推翻了一半**：
+
+- 高德导航通知的 `android.title` / `android.text` 确实是占位值（`高德地图` / `正在导航`），
+  而且 `setLargeIcon` 里那枚箭头也拿不到语义；
+- 但是 `com.amap.bundle.audio` + `com.autonavi.jni.tts` 这条链里，
+  `AudioPlayerTask` 的公开字段 `data`(String) / `groupData`(String，JSON 数组)
+  **就是即将播报的明文中文**。抽象 `JNIPlayer` 在 Java 层只有一个实现（混淆类 `j25`，
+  classes4），hook `playPCMStart` / `playAudioFileStart` 即可在播报前拿到文本：
+
+```
+10:24:42.747 ttspcm data='您已偏航,七十米后左转,随后六十米右转,新路线预计多三点三公里'
+10:24:42.747 navTts: 七十米后左转，随后六十米右转，新路线预计多三点三…
+```
+
+已证伪的死路（不要再试）：`NaviManager.registerEventReceiver/queryData`（真机 0 次调用，
+只服务车机投屏 / HiCar）、`fj5.notifyNaviInfo` / `ModuleRoute.notifyNaviInfo`（0 次）、
+`CrossNaviInfo` / `CurrentNaviInfo` / `SoundInfo`（8 个 dex 全量扫描 0 个 Java 引用）、
+AJX 导航模块、任何 Java 层导航卡 View 类、Android `android.speech.tts`。
+
+**仍然成立的那半句**：实时「剩余距离 / 剩余时间 / 预计到达」这三个**递减值**依然拿不到。
+播报里只有出发那一次的总量，以及每次转向时的距离短语。这就是下一节三栏口径的由来。
+
+---
+
+## 7. 展开卡载荷通道（v3.15.61）
+
+### 7.1 三进程隔离
+
+```
+com.autonavi.minimap        com.android.systemui          com.flymeark
+  ArkNavLiveInjector    →     ArkLiveExpandHook      →     ArkNavPanelActivity
+  (写语音播报解析结果)        (响应胶囊点击，搬运)          (渲染卡片)
+        │                          │                          │
+        └── 影子通知 extras ───────┘                          │
+             tag=flymeark_live_nav                            │
+             id =0x4B000002                                  │
+                                    └── Intent extras ───────┘
+```
+
+三个进程没有共享内存。`SharedPreferences` 是 app 私有、`ContentProvider` 要新增组件、
+文件写不进彼此的沙箱；而**影子通知本来就是一条真实的系统通知**，SystemUI 作为通知宿主
+天然能读它的 extras。所以载荷挂在那里，不新增任何跨进程基础设施。
+
+生命周期也自动对齐：退出导航 → 影子被 `nm.cancel` → 载荷随通知一起消失，
+不需要额外的清理协议（`resetNavPayload()` 只防「同一进程里下一趟复用旧静态值」）。
+
+### 7.2 读写两侧
+
+- 写：`ArkNavLiveInjector.buildShadow()`（发布 / 播报更新 / 自愈三条路径的唯一出口），
+  在 `notification.live.capsule` 子 Bundle 之外**平铺** 9 组顶层 key，避免 SystemUI 侧再拆一层。
+- 读：`ArkLiveExpandHook.latestNavShadowSbn()` 从 `mNotificationEntries` 里按 tag 找影子，
+  `sbn.notification.extras` 取值，原样 `putExtra` 给 `ArkNavPanelActivity`。
+
+⚠️ 这里必须用 Kotlin 属性 `n.extras`。Flyme 上 `XposedHelpers.callMethod(n, "getExtras")`
+会抛 `NoSuchMethodError`（v3.15.27 探针取证，见 `ArkLiveShadowHook` 注释）；
+消息面板走的也是属性访问，已验证可用。
+
+### 7.3 纯函数自测
+
+`ArkNavParse.kt` 不依赖 Android / Xposed，可以脱离 APK 单独编译运行（用 Gradle 缓存里的
+`kotlin-compiler-embeddable` + `kotlin-stdlib`），样例表直接用**生产源码**跑：
+
+| 输入 | 期望 | 输入 | 期望 |
+|---|---|---|---|
+| `八` / `十` / `十二` | 8 / 10 / 12 | `二十七` / `二十八` | 27 / 28 |
+| `一百三十三` | 133 | `一千零五十` | 1050 |
+| `三点三` | 3.3 | `两` / `133` / `3.3` | 2 / 133 / 3.3 |
+| `中午十二点十九分` | 12:19 | `下午三点` | 15:00 |
+| `上午九点五` | 09:05 | `三点半` | 03:30 |
+| `凌晨十二点` | 00:00 | `fmtNum(8.0)` | `"8"` |
+
+v3.15.61 首轮自测发现 `九点五` 被解析成 `09:00`（`CLOCK_RE` 强制要求分钟段带「分」），
+已把 `分` 改成可选并补上「点半」→ 30 分支，20 项样例全过。
+
+### 7.4 口径
+
+| 卡片位置 | 设计稿 | 实际 | 原因 |
+|---|---|---|---|
+| 三栏 | 剩余时间 / 剩余距离 / 预计到达 | 耗时 / 全程 / 到达 | 实时递减值外部拿不到，只有出发播报的总量 |
+| 进度条 | 按剩余里程，示例 58% | 已用时间 / 总耗时 | 同上；解析不到总耗时就只画轨，不画球 |
+| 底部按钮 | 结束导航 | 回到导航 | 外部无法结束高德的导航 |
+| 状态行目标 | 目的地名 | 抓不到时回落「高德地图」 | 播报很少说出目的地名 |

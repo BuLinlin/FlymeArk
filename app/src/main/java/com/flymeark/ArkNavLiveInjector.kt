@@ -241,6 +241,46 @@ internal object ArkNavLiveInjector {
     private var lastCtx: Context? = null
     private var lastNm: NotificationManager? = null
 
+    // ---------------------------------------------------------------- 展开卡载荷（v3.15.61）
+    //
+    // 三进程隔离：本对象活在**高德进程**，展开卡 [ArkNavPanelActivity] 活在**模块自身进程**，
+    // SystemUI 侧的 [ArkLiveExpandHook] 只负责搬运。三者之间没有共享内存 / 文件 / Provider，
+    // 唯一现成的跨进程通道就是**影子通知的 extras**（SystemUI 本来就读得到这条通知）。
+    //
+    // 所以下面这些值全部写进 [buildShadow] 的**顶层** key（`ArkConstants.NAV_KEY_*`），
+    // 由 SystemUI 原样搬进 Intent，最终由面板读取。
+    // 生命周期 = 影子通知的生命周期：退出导航 → 影子被撤 → 载荷自然消失，不需要清理逻辑。
+    //
+    // 数据来源只有一个 —— **语音播报**（`AudioPlayerTask.groupData` 整段拼起来）：
+    // ```
+    // 准备出发,,全程一百三十三公里,大约需要两小时三分,预计中午十二点十九分到达,共有一个服务区
+    // ```
+    // 导航通知本身永远是占位值（`导航中` / `正在导航`），拿不到任何行程数字。
+
+    /** 本趟出发时刻（`elapsedRealtime`），进度条用；0 表示本趟还没出发 */
+    private var navStartedAt = 0L
+
+    /** 全程距离数值：`"8"` / `"133"` / `"800"`（单位另存，面板负责加粗数值 / 弱化单位） */
+    private var totalDistValue = ""
+
+    /** 全程距离单位：`"公里"` / `"米"` */
+    private var totalDistUnit = "公里"
+
+    /** 总耗时数值：`"27"` / `"2"` */
+    private var totalTimeValue = ""
+
+    /** 总耗时单位：`"分钟"` / `"小时"` */
+    private var totalTimeUnit = "分钟"
+
+    /** 总耗时毫秒（进度条分母）；0 表示没解析出来 → 面板只画轨不画球 */
+    private var totalMs = 0L
+
+    /** 预计到达时刻 `HH:mm`；空串表示算不出来 */
+    private var etaText = ""
+
+    /** 目的地名；空串表示没解析到（面板回落显示「高德地图」） */
+    private var destText = ""
+
     /**
      * 防重入标记。`notify(int,Notification)` 内部会转调 `notify(String,int,Notification)`，
      * 两个重载都 hook 时同一帧会生成两条影子（消息卡 v3.15.34 踩过）。
@@ -472,7 +512,15 @@ internal object ArkNavLiveInjector {
         //   * 新一轮导航（间隔超过 SESSION_GAP_MS）→ 丢掉上一轮的旧指令，回到占位文案。
         val now = SystemClock.elapsedRealtime()
         val sameSession = navActive && (now - lastHitAt) < SESSION_GAP_MS
-        if (!sameSession) lastNaviText = ""
+        if (!sameSession) {
+            lastNaviText = ""
+            // v3.15.61：新一趟导航 → 上一趟的行程数字必须清掉，否则展开卡会显示上一趟
+            // 的距离 / 耗时 / 到达时刻（数字错得比没有更糟）。
+            //
+            // `lastHitAt != 0L` 是防误清：自愈路径 [selfHealShadow] 不发通知、不更新
+            // lastHitAt，此时若紧跟着来一次真正的 postShadow，不能把刚解析好的数字抹掉。
+            if (lastHitAt != 0L) resetNavPayload()
+        }
         lastHitAt = now
         val content = if (sameSession && lastNaviText.isNotEmpty()) {
             lastNaviText
@@ -595,6 +643,27 @@ internal object ArkNavLiveInjector {
                 "notification.live.capsuleContentColor", ArkConstants.readableTextOn(CAPSULE_BG)
             )
             se.putBundle("notification.live.capsule", capsule)
+
+            // ---- v3.15.61：展开卡载荷（**顶层 key**，不再套 Bundle）
+            //
+            // 为什么不复用 capsule 子 Bundle：SystemUI 侧读一条通知的 extras 只有一层
+            // （`sbn.notification.extras`），再取子 Bundle 只是为了拿胶囊正文；
+            // 展开卡载荷字段多、类型杂（String / Long / Int），平铺在这里最好搬。
+            //
+            // 面板侧 [ArkNavPanelActivity] 只从 Intent 读，不碰通知，所以这些 key
+            // 最终会被 SystemUI 原样 putExtra 进去（见 ArkLiveExpandHook.launchNavPanel）。
+            val instrPair = splitInstruction(content)
+            se.putString(ArkConstants.NAV_KEY_INSTR, instrPair.first)
+            se.putString(ArkConstants.NAV_KEY_SUB, instrPair.second)
+            se.putString(ArkConstants.NAV_KEY_DEST, destText)
+            se.putString(ArkConstants.NAV_KEY_DIST, totalDistValue)
+            se.putString(ArkConstants.NAV_KEY_DIST_UNIT, totalDistUnit)
+            se.putString(ArkConstants.NAV_KEY_TIME, totalTimeValue)
+            se.putString(ArkConstants.NAV_KEY_TIME_UNIT, totalTimeUnit)
+            se.putString(ArkConstants.NAV_KEY_ETA, etaText)
+            se.putLong(ArkConstants.NAV_KEY_STARTED, navStartedAt)
+            se.putLong(ArkConstants.NAV_KEY_TOTAL_MS, totalMs)
+            se.putInt(ArkConstants.NAV_KEY_TURN, turnCodeOf(instrPair.first))
             n
         } catch (t: Throwable) {
             log("build shadow failed: ${t.message}")
@@ -648,6 +717,11 @@ internal object ArkNavLiveInjector {
         } catch (_: Throwable) {
             null
         }
+
+        // v3.15.61：展开卡的行程数字（全程距离 / 总耗时 / 预计到达）只在播报里有，
+        // 而且散落在**中间**几段（`准备出发,,全程八公里,大约需要二十七分钟,…`），
+        // 只看最后一句永远抓不到 —— 所以先整段解析一遍，再挑胶囊文案。
+        captureTotals(group, data)
 
         for (candidate in listOfNotNull(lastSentenceOf(group), data)) {
             // v3.15.59：**出发类短语**才解静默窗（不再用「任意有效指令」，见 isDeparture 注释）
@@ -712,6 +786,9 @@ internal object ArkNavLiveInjector {
             val wasActive = navActive
             navActive = false
             lastNaviText = ""
+            // v3.15.61：影子马上被 cancel，展开卡的载荷也一起作废（否则下一次导航
+            // 复用同一张卡时会带回这一趟的数字）。
+            resetNavPayload()
 
             // ② 主动撤掉自己的影子。不撤的话，SystemUI 撤一次之后
             //    高德重发通知又会让我们发一条新的（v3.15.57 胶囊常驻不消的直接原因）。
@@ -894,6 +971,233 @@ internal object ArkNavLiveInjector {
         false
     }
 
+    // ---------------------------------------------------------------- 展开卡：行程数字解析
+    //
+    // 这里只留「和播报格式绑死」的正则；中文数字解析 / 数值格式化 / 时刻解析三个纯函数
+    // 抽到了 [ArkNavParse] —— 它不碰 Android 也不碰 Xposed，可以单独编译跑样例表自测
+    // （自测脚本见 docs/live-nav-research.md §7.3）。
+
+    /** 中文数字字符类（正则用），含 `十百千万` 与 `两` */
+    private const val CN_NUM_CLASS = "[零〇一二三四五六七八九十百千万两]+"
+
+    /** 阿拉伯数字 / 小数（正则用） */
+    private const val AR_NUM_CLASS = "\\d+(?:\\.\\d+)?"
+
+    /** `全程一百三十三公里` / `全程八百米` / `全程1.2公里` */
+    private val DIST_RE = Regex("全程\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(公里|千米|米)")
+
+    /** `大约需要二十七分钟` / `大约需要两小时三分` / `需要2小时` */
+    private val TIME_RE =
+        Regex("(?:大约)?需要\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*(?:个)?(小时|分钟|分)")
+
+    /** 小时制后面可能还跟的「三分」，只用于算 [totalMs]，不参与展示 */
+    private val TRAIL_MIN_RE = Regex("^\\s*($AR_NUM_CLASS|$CN_NUM_CLASS)\\s*分")
+
+    /** `预计中午十二点十九分到达` → 取「到达」前面的那段时刻描述 */
+    private val ETA_RE = Regex("预计(.{1,20}?)到达")
+
+    /** 目的地：`前往静安嘉里中心` / `目的地是…` / `导航到…` */
+    private val DEST_PATTERNS = listOf(
+        Regex("(?:目的地(?:是|为)|终点是)[：: ]?([^,，。！!？?]{2,16})"),
+        Regex("(?:前往|驶向|导航到|去往)([^,，。！!？?]{2,16})")
+    )
+
+    /** 到达类关键词（优先于转向词判定，`已到达目的地` 不该被判成直行） */
+    private val ARRIVE_KEYWORDS = listOf("到达目的地", "已到达", "抵达目的地", "即将到达")
+
+    /** 左转类（`向左前方` 含 `向左`，`靠左行驶` 含 `靠左`，一条都不用多写） */
+    private val LEFT_KEYWORDS = listOf("左转", "靠左", "向左", "左前方", "左侧")
+
+    /** 右转类 */
+    private val RIGHT_KEYWORDS = listOf("右转", "靠右", "向右", "右前方", "右侧")
+
+    /**
+     * 从一整段播报里抓目的地名（纯函数）。
+     *
+     * 高德的 TTS 只在少数场景说出目的地（`前往静安嘉里中心` / `目的地是…`），
+     * 抓不到就返回 null —— 面板会回落显示「高德地图」，比显示错的地名好。
+     */
+    private fun parseDest(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        for (re in DEST_PATTERNS) {
+            val m = re.find(raw) ?: continue
+            val name = m.groupValues[1].trim().trim('的', ' ', '，', ',')
+            if (name.length in 2..16) return name
+        }
+        return null
+    }
+
+    /**
+     * 把整段播报里的「全程距离 / 总耗时 / 预计到达」解析出来并回写状态。
+     *
+     * 三项各自独立：解析失败**不动旧值**（宁可显示上一趟的数字，也不要显示 0）。
+     * `totalMs` 一律按毫秒落盘，`两小时三分` 会额外吃掉后面那个「三分」，
+     * 否则 2h3m 会被当成 2h，进度球会跑偏 0.8%。
+     *
+     * @param raw 一整段播报（`groupData` 全部元素用逗号拼起来）
+     */
+    private fun parseTotals(raw: String) {
+        if (raw.isBlank()) return
+
+        DIST_RE.find(raw)?.let { m ->
+            val v = ArkNavParse.parseCnNumber(m.groupValues[1])
+            if (v != null && v > 0.0) {
+                totalDistValue = ArkNavParse.fmtNum(v)
+                totalDistUnit = if (m.groupValues[2] == "千米") "公里" else m.groupValues[2]
+            }
+        }
+
+        TIME_RE.find(raw)?.let { m ->
+            val v = ArkNavParse.parseCnNumber(m.groupValues[1])
+            val unit = m.groupValues[2]
+            if (v != null && v > 0.0) {
+                if (unit == "小时") {
+                    totalTimeValue = ArkNavParse.fmtNum(v)
+                    totalTimeUnit = "小时"
+                    // `两小时三分`：把尾巴上的分钟也吃进 totalMs（展示仍是「2 小时」）
+                    var extraMin = 0.0
+                    val rest = raw.substring(m.range.last + 1)
+                    TRAIL_MIN_RE.find(rest)?.let { t ->
+                        extraMin = ArkNavParse.parseCnNumber(t.groupValues[1]) ?: 0.0
+                    }
+                    totalMs = ((v * 60.0 + extraMin) * 60_000.0).toLong()
+                } else {
+                    totalTimeValue = ArkNavParse.fmtNum(v)
+                    totalTimeUnit = "分钟"
+                    totalMs = (v * 60_000.0).toLong()
+                }
+            }
+        }
+
+        ETA_RE.find(raw)?.let { m ->
+            ArkNavParse.parseClock(m.groupValues[1])?.let { etaText = it }
+        }
+    }
+
+    /**
+     * 收口：每次拿到播报先跑一遍 [parseTotals]，并在**出发类**播报出现时记下出发时刻。
+     *
+     * 出发时刻用 `elapsedRealtime`（单调时钟，不受用户改系统时间影响），
+     * 面板拿它和 `总耗时` 一起算进度。
+     *
+     * @param group `AudioPlayerTask.groupData`（JSON 数组字符串）
+     * @param data  `AudioPlayerTask.data`（单句字符串）
+     */
+    private fun captureTotals(group: String?, data: String?) {
+        try {
+            val full = fullTextOf(group) ?: data ?: return
+            parseTotals(full)
+            if (destText.isEmpty()) parseDest(full)?.let { destText = it }
+            // `全程` 只在起点播，所以这时记时刻是安全的（见 START_PHRASES 注释）
+            if (navStartedAt == 0L && isDeparture(full)) {
+                navStartedAt = SystemClock.elapsedRealtime()
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * `groupData` 数组 → 整段文本（逗号拼接）。
+     *
+     * 与 [lastSentenceOf] 的区别：那个只要「最后一句」（喂胶囊），
+     * 这个要**全段**（行程数字散落在中间几段里，只看最后一句永远抓不到 `全程`）。
+     */
+    private fun fullTextOf(group: String?): String? {
+        if (group.isNullOrBlank()) return null
+        return try {
+            val arr = org.json.JSONArray(group)
+            val sb = StringBuilder()
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i, "").trim().trim(',', ' ')
+                if (s.isEmpty()) continue
+                if (sb.isNotEmpty()) sb.append(',')
+                sb.append(s)
+            }
+            sb.toString().takeIf { it.isNotEmpty() }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 胶囊文案 → （主指令, 副指令），供展开卡的两行文本用（纯函数）。
+     *
+     * 胶囊只有一句话，而设计稿是「主指令 + 副指令」两行：
+     * `右转，随后一百五十米右转` → 主 `右转` / 副 `随后一百五十米右转`；
+     * `70米后左转` → 主 `70米后左转` / 副 空（面板把副行藏起来）。
+     *
+     * v3.15.61 补充：设计稿的副行其实是**路名**（`进入 建国路`）。播报里若真带
+     * `进入…` / `驶入…` 段，优先把它抽出来当副行，主行用剩下的转向段拼；
+     * 没有路名段时才退化成「首句 / 后续句」，避免把「新路线预计多三点三公里」
+     * 这类尾巴和路名挤在同一行。
+     */
+    private fun splitInstruction(content: String): Pair<String, String> {
+        if (content.isBlank()) return "" to ""
+        return try {
+            val segs = content.replace('，', ',')
+                .split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            when {
+                segs.isEmpty() -> "" to ""
+                segs.size == 1 -> segs[0] to ""
+                else -> {
+                    val roadIdx = segs.indexOfFirst {
+                        it.startsWith("进入") || it.startsWith("驶入")
+                    }
+                    if (roadIdx >= 0) {
+                        val road = segs[roadIdx]
+                        val verb = if (road.startsWith("进入")) "进入" else "驶入"
+                        val sub = "$verb " + road.removePrefix(verb).trim()
+                        val main = segs.filterIndexed { i, _ -> i != roadIdx }
+                            .joinToString("，")
+                        (main.ifBlank { road }) to sub
+                    } else {
+                        segs[0] to segs.drop(1).joinToString("，")
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            content.trim() to ""
+        }
+    }
+
+    /**
+     * 主指令 → 转向码（纯函数，对应 `ArkConstants.NAV_TURN_*`）。
+     *
+     * 判定顺序有意义：`到达` 优先（`已到达目的地` 里可能含其它词），
+     * `掉头` 次之（`向左掉头` 同时含 `向左`，但语义是掉头），再左 / 右，最后直行。
+     */
+    private fun turnCodeOf(text: String?): Int {
+        if (text.isNullOrBlank()) return ArkConstants.NAV_TURN_STRAIGHT
+        return try {
+            when {
+                ARRIVE_KEYWORDS.any { text.contains(it) } -> ArkConstants.NAV_TURN_ARRIVE
+                text.contains("掉头") -> ArkConstants.NAV_TURN_UTURN
+                LEFT_KEYWORDS.any { text.contains(it) } -> ArkConstants.NAV_TURN_LEFT
+                RIGHT_KEYWORDS.any { text.contains(it) } -> ArkConstants.NAV_TURN_RIGHT
+                else -> ArkConstants.NAV_TURN_STRAIGHT
+            }
+        } catch (_: Throwable) {
+            ArkConstants.NAV_TURN_STRAIGHT
+        }
+    }
+
+    /**
+     * 清空展开卡载荷（一趟导航结束 / 新一轮导航开始）。
+     *
+     * 为什么必须清：[buildShadow] 是唯一出口，载荷是「贴在影子上的快照」。
+     * 如果上一趟的 `133 公里` 留到下一趟，用户会看到一张数字完全错的卡。
+     */
+    private fun resetNavPayload() {
+        navStartedAt = 0L
+        totalDistValue = ""
+        totalDistUnit = "公里"
+        totalTimeValue = ""
+        totalTimeUnit = "分钟"
+        totalMs = 0L
+        etaText = ""
+        destText = ""
+    }
+
     /**
      * 用新的播报文案覆盖胶囊；**没在导航时则自愈补发影子**。
      *
@@ -1058,6 +1362,7 @@ internal object ArkNavLiveInjector {
     internal fun onNavEnded() {
         navActive = false
         lastNaviText = ""
+        resetNavPayload()
     }
 
     private fun log(msg: String) {

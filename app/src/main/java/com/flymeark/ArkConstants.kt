@@ -308,6 +308,66 @@ object ArkConstants {
     /** 消息面板 → SystemUI：原通知的 key（StatusBarNotification.getKey()） */
     const val EXTRA_MSG_NOTIF_KEY = "msg_notif_key"
 
+    // ------------------------------------------------------------------
+    // 导航展开卡载荷（v3.15.61）
+    //
+    // 三个进程互相隔离：载荷生产者 [ArkNavLiveInjector] 在**高德进程**，
+    // 读取者 [ArkLiveExpandHook] 在 **SystemUI 进程**，面板
+    // [ArkNavPanelActivity] 在**模块自身进程**。高德进程与 SystemUI 之间没有
+    // 任何共享内存 / 文件 / Provider，唯一现成的跨进程通道就是**影子通知的 extras**
+    // （SystemUI 本来就能从 mNotificationEntries 里读到这条通知）。
+    //
+    // 所以这些 key 会被写进影子通知的 extras（顶层，不再套 Bundle），
+    // 由 ArkLiveExpandHook 原样搬进 Intent，最终由面板读取。
+    // 生命周期 = 影子通知的生命周期，不需要额外清理逻辑。
+    // ------------------------------------------------------------------
+
+    /** 导航展开卡：主指令（String，如「300 米后右转」） */
+    const val NAV_KEY_INSTR = "flymeark.nav.instr"
+
+    /** 导航展开卡：副指令（String，如「进入 建国路」；空串表示没有） */
+    const val NAV_KEY_SUB = "flymeark.nav.sub"
+
+    /** 导航展开卡：目的地（String，可能为空 → 面板回落显示「高德地图」） */
+    const val NAV_KEY_DEST = "flymeark.nav.dest"
+
+    /** 导航展开卡：全程距离数值（String，如「8.0」/「133」/「800」） */
+    const val NAV_KEY_DIST = "flymeark.nav.dist"
+
+    /** 导航展开卡：全程距离单位（String，「公里」/「米」） */
+    const val NAV_KEY_DIST_UNIT = "flymeark.nav.dist_unit"
+
+    /** 导航展开卡：总耗时数值（String，分钟数或小时数） */
+    const val NAV_KEY_TIME = "flymeark.nav.time"
+
+    /** 导航展开卡：总耗时单位（String，「分钟」/「小时」） */
+    const val NAV_KEY_TIME_UNIT = "flymeark.nav.time_unit"
+
+    /** 导航展开卡：预计到达时刻（String，HH:mm；空串表示算不出来） */
+    const val NAV_KEY_ETA = "flymeark.nav.eta"
+
+    /** 导航展开卡：本趟出发时刻（Long，elapsedRealtime；0 表示没拿到出发播报） */
+    const val NAV_KEY_STARTED = "flymeark.nav.started"
+
+    /** 导航展开卡：总耗时毫秒（Long，进度条分母；0 表示没有 → 只画轨不画球） */
+    const val NAV_KEY_TOTAL_MS = "flymeark.nav.total_ms"
+
+    /** 导航展开卡：转向类型（Int，0 直行 / 1 左转 / 2 右转 / 3 掉头 / 4 到达） */
+    const val NAV_KEY_TURN = "flymeark.nav.turn"
+
+    /** 导航展开卡 Activity 全类名（SystemUI 按类名显式拉起） */
+    const val NAV_PANEL_ACTIVITY = "com.flymeark.ArkNavPanelActivity"
+
+    /** 导航展开卡里对外的 App 展示名（拿不到目的地时的回落文案之一） */
+    const val NAV_LABEL = "高德地图"
+
+    /** 转向码常量（与 [NAV_KEY_TURN] 一一对应） */
+    const val NAV_TURN_STRAIGHT = 0
+    const val NAV_TURN_LEFT = 1
+    const val NAV_TURN_RIGHT = 2
+    const val NAV_TURN_UTURN = 3
+    const val NAV_TURN_ARRIVE = 4
+
     /** Xposed 日志 TAG（logcat / LSPosed 日志里搜这个） */
     const val LOG_TAG = "FlymeArk"
 

@@ -13,6 +13,7 @@ import android.media.session.MediaController
 import android.media.session.MediaSession
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.os.Bundle
 import android.os.SystemClock
 import android.os.UserHandle
 import android.view.MotionEvent
@@ -1807,7 +1808,10 @@ internal object ArkLiveExpandHook {
                 return
             }
         val pkg = XposedHelpers.callMethod(info, "getPackageName") as? String
-        if (!ArkConstants.isMediaApp(pkg) && !ArkConstants.isMessageLiveApp(pkg)) {
+        if (!ArkConstants.isMediaApp(pkg) &&
+            !ArkConstants.isMessageLiveApp(pkg) &&
+            !ArkConstants.isNavLiveApp(pkg)
+        ) {
             XposedBridge.log("$TAG: launch skipped (pkg=$pkg)")
             return
         }
@@ -1818,6 +1822,14 @@ internal object ArkLiveExpandHook {
         // 与音乐面板共用冷却 / 原生点击屏蔽 / 胶囊淡出联动。
         if (pkg != null && ArkConstants.isMessageLiveApp(pkg)) {
             launchMessagePanel(ctrl, ctx, pkg, now)
+            return
+        }
+
+        // v3.15.61：导航胶囊（高德）→ 导航展开卡（ArkNavPanelActivity）。
+        // 载荷全部来自**影子通知的 extras**（高德进程写、SystemUI 进程读），
+        // 三进程隔离下这是唯一现成通道，详见 ArkConstants.NAV_KEY_* 的注释块。
+        if (pkg != null && ArkConstants.isNavLiveApp(pkg)) {
+            launchNavPanel(ctrl, ctx, pkg, now)
             return
         }
 
@@ -2100,6 +2112,160 @@ internal object ArkLiveExpandHook {
         best
     } catch (t: Throwable) {
         XposedBridge.log("$TAG: latestMessageSbn failed: ${t.message}")
+        null
+    }
+
+    // ------------------------------------------------------------------
+    // v3.15.61：导航胶囊 → 导航展开卡
+    // ------------------------------------------------------------------
+
+    /**
+     * 拉起导航展开卡。
+     *
+     * ## 数据从哪来
+     *
+     * 高德不发实况通知（见 `docs/live-nav-research.md` §2.4），胶囊是
+     * [ArkNavLiveInjector] 在**高德进程**旁路发出的一条影子通知
+     * （`tag=flymeark_live_nav`）。高德进程把展开卡要用的行程数字写进这条影子的
+     * **顶层 extras**（`ArkConstants.NAV_KEY_*`），本进程（SystemUI）读得到、面板读不到 ——
+     * 三个进程之间没有共享内存，所以必须在这里搬一次。
+     *
+     * ## 为什么找影子而不是找高德的导航通知
+     *
+     * 高德导航通知的 `android.text` 永远是占位值（`正在导航`），拿不到任何行程数字；
+     * 影子才是唯一「被我们写满的」那份数据。
+     *
+     * @param ctrl 状态栏控制器（取胶囊屏幕矩形当动画起点）
+     * @param ctx  SystemUI 的 Context（`startActivity` 用它，身份是 system uid）
+     * @param pkg  归属包名（固定 `com.autonavi.minimap`）
+     * @param now  `SystemClock.uptimeMillis()`，冷却判定用
+     */
+    private fun launchNavPanel(ctrl: Any, ctx: Context, pkg: String, now: Long) {
+        val sbn = latestNavShadowSbn(pkg) ?: run {
+            XposedBridge.log("$TAG: nav panel skipped (no shadow notification for $pkg)")
+            // 影子还没发出来（高德刚进导航、播报还没来）→ 至少把高德拉起来，别让点击没反应
+            try {
+                ctx.packageManager.getLaunchIntentForPackage(pkg)?.let {
+                    it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ctx.startActivity(it)
+                }
+            } catch (_: Throwable) {
+            }
+            return
+        }
+
+        val n = try {
+            XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+        } catch (_: Throwable) {
+            null
+        }
+        val ex: Bundle? = try {
+            n?.extras
+        } catch (_: Throwable) {
+            null
+        }
+        // 「回到导航」的兜底目标（拉不到 Launcher Intent 时才用，见面板 openNavigation）
+        val clickIntent = try { n?.contentIntent } catch (_: Throwable) { null }
+
+        val instr = ex?.getString(ArkConstants.NAV_KEY_INSTR).orEmpty()
+        val sub = ex?.getString(ArkConstants.NAV_KEY_SUB).orEmpty()
+        val dest = ex?.getString(ArkConstants.NAV_KEY_DEST).orEmpty()
+        val dist = ex?.getString(ArkConstants.NAV_KEY_DIST).orEmpty()
+        val distUnit = ex?.getString(ArkConstants.NAV_KEY_DIST_UNIT).orEmpty()
+        val timeValue = ex?.getString(ArkConstants.NAV_KEY_TIME).orEmpty()
+        val timeUnit = ex?.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty()
+        val eta = ex?.getString(ArkConstants.NAV_KEY_ETA).orEmpty()
+        val started = ex?.getLong(ArkConstants.NAV_KEY_STARTED, 0L) ?: 0L
+        val totalMs = ex?.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L) ?: 0L
+        val turn = ex?.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT)
+            ?: ArkConstants.NAV_TURN_STRAIGHT
+
+        val intent = Intent().apply {
+            setClassName(ArkConstants.APP_PKG, ArkConstants.NAV_PANEL_ACTIVITY)
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_NO_ANIMATION
+            )
+            putExtra(ArkConstants.NAV_KEY_INSTR, instr)
+            putExtra(ArkConstants.NAV_KEY_SUB, sub)
+            putExtra(ArkConstants.NAV_KEY_DEST, dest)
+            putExtra(ArkConstants.NAV_KEY_DIST, dist)
+            putExtra(ArkConstants.NAV_KEY_DIST_UNIT, distUnit)
+            putExtra(ArkConstants.NAV_KEY_TIME, timeValue)
+            putExtra(ArkConstants.NAV_KEY_TIME_UNIT, timeUnit)
+            putExtra(ArkConstants.NAV_KEY_ETA, eta)
+            putExtra(ArkConstants.NAV_KEY_STARTED, started)
+            putExtra(ArkConstants.NAV_KEY_TOTAL_MS, totalMs)
+            putExtra(ArkConstants.NAV_KEY_TURN, turn)
+            putExtra(ArkConstants.EXTRA_PANEL_APP_PKG, pkg)
+            putExtra(ArkConstants.EXTRA_PANEL_NIGHT, isNightMode(ctx))
+            clickIntent?.let { putExtra(ArkConstants.EXTRA_PANEL_CLICK_INTENT, it) }
+            // 胶囊矩形：面板以它为展开动画起点（长大）与收起终点（缩回）
+            capsuleRectOnScreen(ctrl)?.let { r ->
+                putExtra(ArkConstants.EXTRA_CAPSULE_LEFT, r[0])
+                putExtra(ArkConstants.EXTRA_CAPSULE_TOP, r[1])
+                putExtra(ArkConstants.EXTRA_CAPSULE_WIDTH, r[2])
+                putExtra(ArkConstants.EXTRA_CAPSULE_HEIGHT, r[3])
+            }
+        }
+
+        try {
+            ctx.startActivity(intent)
+            lastLaunchAt = now
+            clickHandledAt = now
+            XposedBridge.log(
+                "$TAG: nav panel launched, instr='$instr' sub='$sub' dest='$dest' " +
+                    "dist='$dist$distUnit' time='$timeValue$timeUnit' eta='$eta' " +
+                    "turn=$turn started=$started totalMs=$totalMs"
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] $TAG nav startActivity failed: ${t.message}")
+        }
+    }
+
+    /**
+     * `mNotificationEntries` 里 tag 为 [ArkNavLiveInjector.NAV_SHADOW_TAG] 的那条影子通知。
+     *
+     * 影子的 tag 是常量、id 也是常量，一条导航只会有一条影子（新帧直接覆盖旧帧），
+     * 所以不需要像消息那样按 postTime 挑最新 —— 命中即返回。
+     */
+    private fun latestNavShadowSbn(pkg: String): Any? = try {
+        val ctrl = ctrlRef?.get()
+        if (ctrl == null) {
+            null
+        } else {
+            val entries = XposedHelpers.getObjectField(ctrl, "mNotificationEntries") as? List<*>
+            var found: Any? = null
+            entries?.forEach { pe ->
+                if (found != null || pe == null) return@forEach
+                val entry = try {
+                    XposedHelpers.callMethod(pe, "getRepresentativeEntry") ?: return@forEach
+                } catch (_: Throwable) {
+                    return@forEach
+                }
+                val sbn = try {
+                    XposedHelpers.callMethod(entry, "getSbn") ?: return@forEach
+                } catch (_: Throwable) {
+                    return@forEach
+                }
+                val p = try {
+                    XposedHelpers.callMethod(sbn, "getPackageName") as? String
+                } catch (_: Throwable) {
+                    null
+                }
+                if (p != pkg) return@forEach
+                val tag = try {
+                    XposedHelpers.callMethod(sbn, "getTag") as? String
+                } catch (_: Throwable) {
+                    null
+                }
+                if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) found = sbn
+            }
+            found
+        }
+    } catch (t: Throwable) {
+        XposedBridge.log("$TAG: latestNavShadowSbn failed: ${t.message}")
         null
     }
 

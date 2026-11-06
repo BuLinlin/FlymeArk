@@ -22,4 +22,32 @@
     <dimen name="ark_play">56dp</dimen>
     <!-- v3.15.46：48dp 触控区内 22dp 光学图标的四边余量（02/04 规范） -->
     <dimen name="ark_space_13">13dp</dimen>
+
+    <!--
+        v3.15.61：导航展开卡（设计稿 nav.html，392px 宽卡 / 1x 量取后按 dp 落位）。
+        卡片 padding 19/20/17、转向块 52dp + 16dp 圆角、人字箭头 27dp、
+        行程行与底部栏的分割线 1dp、底部按钮 30dp 高 15dp 内边距、进度条整块 17dp。
+    -->
+    <dimen name="ark_nav_pad_h">20dp</dimen>
+    <dimen name="ark_nav_pad_top">19dp</dimen>
+    <dimen name="ark_nav_pad_bottom">17dp</dimen>
+    <dimen name="ark_nav_status_height">22dp</dimen>
+    <dimen name="ark_nav_dot">12dp</dimen>
+    <dimen name="ark_nav_dot_core">6dp</dimen>
+    <dimen name="ark_nav_sep">3dp</dimen>
+    <dimen name="ark_nav_collapse">44dp</dimen>
+    <dimen name="ark_nav_turn">52dp</dimen>
+    <dimen name="ark_nav_turn_icon">27dp</dimen>
+    <dimen name="ark_nav_gap_turn">13dp</dimen>
+    <dimen name="ark_nav_maneuver_top">9dp</dimen>
+    <dimen name="ark_nav_progress_top">20dp</dimen>
+    <dimen name="ark_nav_progress">17dp</dimen>
+    <dimen name="ark_nav_stats_top">18dp</dimen>
+    <dimen name="ark_nav_stat_height">36dp</dimen>
+    <dimen name="ark_nav_stat_gap">16dp</dimen>
+    <dimen name="ark_nav_foot_top">16dp</dimen>
+    <dimen name="ark_nav_foot_pad_top">13dp</dimen>
+    <dimen name="ark_nav_btn_height">30dp</dimen>
+    <dimen name="ark_nav_btn_pad_h">15dp</dimen>
+    <dimen name="ark_nav_divider">1dp</dimen>
 </resources>

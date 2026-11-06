@@ -74,4 +74,79 @@
         <item name="android:maxLines">1</item>
         <item name="android:ellipsize">end</item>
     </style>
+
+    <!--
+        v3.15.61：导航展开卡（设计稿 nav.html）。
+        字号全部取设计稿的 px 值当 sp 用（1x 量取），字重走 sans-serif-medium +
+        textFontWeight 500/600，与面板其它卡片同一套写法。
+        色值只是首帧占位：ArkNavPanelActivity.applyPalette() 会按 p.light 重新下发，
+        不吃 values-night —— 否则「系统夜间 + 亮壁纸」会错配（与消息卡同一套规则）。
+    -->
+    <style name="ArkNavLive">
+        <item name="android:textSize">11.5sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">600</item>
+        <item name="android:textColor">@color/ark_brand</item>
+        <item name="android:letterSpacing">0.024</item>
+        <item name="android:maxLines">1</item>
+    </style>
+
+    <style name="ArkNavDest">
+        <item name="android:textSize">11.5sp</item>
+        <item name="android:textColor">@color/ark_text_secondary</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkNavInstr">
+        <item name="android:textSize">17sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">600</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
+        <item name="android:letterSpacing">-0.006</item>
+        <item name="android:lineSpacingMultiplier">1.25</item>
+        <item name="android:maxLines">2</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkNavSub">
+        <item name="android:textSize">13sp</item>
+        <item name="android:textColor">@color/ark_text_secondary</item>
+        <item name="android:lineSpacingMultiplier">1.2</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkNavValue">
+        <item name="android:textSize">16sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">600</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
+        <item name="android:letterSpacing">-0.0125</item>
+        <item name="android:fontFeatureSettings">tnum</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+
+    <style name="ArkNavLabel">
+        <item name="android:textSize">11sp</item>
+        <item name="android:textColor">@color/ark_text_tertiary</item>
+        <item name="android:maxLines">1</item>
+    </style>
+
+    <style name="ArkNavButton">
+        <item name="android:textSize">12.5sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:textFontWeight">600</item>
+        <item name="android:textColor">@color/ark_text_primary</item>
+        <item name="android:letterSpacing">0.016</item>
+        <item name="android:maxLines">1</item>
+    </style>
+
+    <style name="ArkNavSource">
+        <item name="android:textSize">11.5sp</item>
+        <item name="android:textColor">@color/ark_text_tertiary</item>
+        <item name="android:letterSpacing">0.0174</item>
+        <item name="android:maxLines">1</item>
+    </style>
 </resources>

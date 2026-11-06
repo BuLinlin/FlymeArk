@@ -14,6 +14,9 @@
         <package android:name="com.netease.cloudmusic" />
         <package android:name="com.tencent.mm" />
         <package android:name="com.tencent.mobileqq" />
+        <!-- v3.15.61：导航展开卡的「回到导航」按钮要用 getLaunchIntentForPackage()
+             拉起高德；不声明这条同样会 NameNotFoundException。 -->
+        <package android:name="com.autonavi.minimap" />
     </queries>
 
     <application
@@ -47,6 +50,19 @@
             android:launchMode="singleTask"
             android:excludeFromRecents="true"
             android:taskAffinity="com.flymeark.msgpanel"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|fontScale"
+            android:windowSoftInputMode="stateAlwaysHidden" />
+
+        <!-- v3.15.61：点击导航胶囊（高德）展开的导航大卡。
+             不设 showWhenLocked：锁屏上点胶囊不弹卡（与消息卡一致）。
+             独立 taskAffinity：不与音乐 / 消息面板互相顶栈。 -->
+        <activity
+            android:name=".ArkNavPanelActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Ark.CapsulePanel"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.flymeark.navpanel"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|fontScale"
             android:windowSoftInputMode="stateAlwaysHidden" />
 

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    v3.15.61：导航展开卡右上角的「收起」chevron（设计稿 nav.html 里 .collapse 内的
+    `<path d="M7 15l5-5 5 5" stroke="#8A9099" stroke-width="1.9">`）。
+
+    描边色写成设计稿的中性灰 #8A9099 作首帧占位；运行时由 ArkNavPanelActivity
+    按 p.light 下发 imageTintList（浅 #8A9099 / 深 #8E97A6），与通知卡 chevron
+    同一套「不吃 values-night」的规则，避免「系统夜间 + 亮壁纸」错配。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="20dp"
+    android:height="20dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M7,15 L12,10 L17,15"
+        android:strokeColor="#FF8A9099"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="1.9" />
+</vector>
