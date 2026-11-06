@@ -136,19 +136,29 @@ internal object ArkNavLiveInjector {
      */
     private val NOISE_PHRASES = arrayOf(
         "真高兴", "又见到你", "准备出发", "持续为您导航", "开启导航", "欢迎使用",
-        "室外开阔", "开阔地带", "以手机朝向为准", "一路顺风", "祝您"
+        "室外开阔", "开阔地带", "以手机朝向为准", "一路顺风", "祝您",
+        // v3.15.58：导航启动语。只需一条 ——「导航开始」是「步行导航开始」「驾车导航开始」
+        // 「骑行导航开始」的子串，`contains` 一条全覆盖。
+        // 它不会误伤 `开始导航后请靠右`（那是「开始导航后」，顺序相反）。
+        "导航开始"
     )
 
     /**
-     * 结束语。命中不仅要丢掉文案，还要把 `navActive` 关掉。
+     * 结束语。命中不仅要丢掉文案，还要把导航判为结束（见 [endNavForFarewell]）。
      *
-     * 原因（真机 v3.15.56 观测）：导航结束后高德仍会播 `这次的旅途结束了呐，下次再会！`。
-     * 此时影子已被 SystemUI 撤掉，若还允许 `updateShadowContent` 跑，就会**把胶囊复活**，
-     * 屏幕上冒出一个没有意义的「旅途结束」。所以这类句子必须当作「导航结束」信号处理。
+     * 原因（真机 v3.15.56/57 观测）：导航结束后高德仍会播 `这次的旅途结束了呐，下次再会！`、
+     * `导航到此为止啦，下次再见哦`。此时影子已被 SystemUI 撤掉，若还允许
+     * `updateShadowContent` 跑，就会**把胶囊复活**，屏幕上冒出一个没有意义的「旅途结束」。
+     *
+     * v3.15.58 补齐：真机退出导航时播的是 `导航到此为止啦，下次再见哦` —— 老的 4 个词
+     * 一个都没命中，结束语被当普通文案写进胶囊，于是退出后胶囊常驻不消。这就是本版要修的 bug。
      *
      * 注意这些词**不在** [NOISE_PHRASES] 里 —— 两者处理方式不同（这里要副作用）。
      */
-    private val END_PHRASES = arrayOf("旅途结束", "下次再会", "期待与您再次", "导航结束啦")
+    private val END_PHRASES = arrayOf(
+        "旅途结束", "下次再会", "期待与您再次", "导航结束啦",
+        "导航到此为止", "下次再见", "导航结束", "已到达目的地", "您已到达"
+    )
 
     // ---------------------------------------------------------------- 播报 → 胶囊 的实时状态
     //
@@ -167,6 +177,32 @@ internal object ArkNavLiveInjector {
 
     /** 两次命中间隔超过这个值就认为上一轮导航已结束（导航中高德刷新通知是秒级的） */
     private const val SESSION_GAP_MS = 90_000L
+
+    /**
+     * 退出导航后的静默窗长度。
+     *
+     * 真机时间线（v3.15.57 抓到的 bug）：
+     * ```
+     * 57.348  navTts: 导航到此为止啦
+     * 57.351  navInject: hit id=99910001      ← 高德退出导航时又重发了一次导航通知
+     * 57.354  shadow posted  content='导航到此为止啦'
+     * 57.374  shadow cancelled for com.autonavi.minimap
+     * 60.025  liveShadeText '导航到此为止啦'   ← 胶囊又冒出来，常驻不消
+     * ```
+     * 也就是说：结束语之后**紧跟着一次通知重发**，那次重发会绕过 endNavForFarewell 的落闸
+     * 重新发一条影子。15s 窗口用来挡掉这个尾巴。
+     */
+    private const val NAV_ENDING_WINDOW_MS = 15_000L
+
+    /** 进入退出态的时刻（`SystemClock.elapsedRealtime()`）；0 表示不在退出态 */
+    private var navEndingAt = 0L
+
+    /** 现在是否处于「刚退出导航」的静默窗内 */
+    private fun inEndingWindow(): Boolean = try {
+        navEndingAt != 0L && SystemClock.elapsedRealtime() - navEndingAt < NAV_ENDING_WINDOW_MS
+    } catch (_: Throwable) {
+        false
+    }
 
     /**
      * 上一次从源导航通知里取到的素材。
@@ -297,6 +333,14 @@ internal object ArkNavLiveInjector {
         reason: String,
         notifId: Int?
     ) {
+        // v3.15.58：刚退出导航的静默窗内**一律不发影子**。
+        // 这一步必须在取素材、置 navActive 之前 —— 高德退出导航时会重发一次导航通知，
+        // 那次重发如果照常走完，就会在 SystemUI 撤掉旧影子之后又发出一条新的（见 bug 时间线）。
+        if (inEndingWindow()) {
+            log("skip (ending window)")
+            return
+        }
+
         val resolved = resolveNm(nmAny)
         if (resolved == null) {
             log("skip reason=no_context_or_nm")
@@ -430,6 +474,9 @@ internal object ArkNavLiveInjector {
         // **不能**在这里清 lastNaviText：导航中通知是秒级刷新的，清了就等于
         // 每次刷新都把刚写的指令抹掉（清旧文案的判断在 sameSession 那几行里）。
         navActive = true
+        // 新一轮导航开始了 → 解除退出静默窗。
+        // 静默窗判断在函数最开头，所以窗口期内走不到这里，两者不会互相打架。
+        navEndingAt = 0L
         log(
             "shadow posted tag=$NAV_SHADOW_TAG capsuleType=1 content='$content' " +
                 "bg=0x${Integer.toHexString(CAPSULE_BG)}"
@@ -568,7 +615,17 @@ internal object ArkNavLiveInjector {
                 endNavForFarewell()
                 return null
             }
-            pickCapsuleText(candidate)?.let { return it }
+            pickCapsuleText(candidate)?.let {
+                // v3.15.58：静默窗内又冒出一条**真指令** → 用户其实已经重新开始导航了，
+                // 提前解除静默窗，免得「退出后马上重开」要干等 15 秒才出胶囊。
+                // 这条播报本身仍然不进胶囊（navActive 还是 false），等下一次导航通知
+                // 命中走 postShadow 重新发影子即可 —— 导航中通知是秒级刷新的。
+                if (inEndingWindow()) {
+                    navEndingAt = 0L
+                    log("ending window cleared by new guidance")
+                }
+                return it
+            }
         }
         return null
     }
@@ -593,11 +650,28 @@ internal object ArkNavLiveInjector {
      */
     private fun endNavForFarewell() {
         try {
-            if (!navActive) return
+            // ① 先开静默窗。**必须在 navActive 判断之前**：哪怕这条结束语来的时候
+            //    navActive 已经是 false，也要挡住随后高德重发通知那一下
+            //    （真机：结束语 348ms 后就有一次 navInject: hit）。
+            navEndingAt = SystemClock.elapsedRealtime()
+
+            val wasActive = navActive
             navActive = false
             lastNaviText = ""
-            log("nav ended (farewell)")
-        } catch (_: Throwable) {
+
+            // ② 主动撤掉自己的影子。不撤的话，SystemUI 撤一次之后
+            //    高德重发通知又会让我们发一条新的（v3.15.57 胶囊常驻不消的直接原因）。
+            val nm = lastNm
+                ?: (appContext()?.getSystemService(Context.NOTIFICATION_SERVICE)
+                    as? NotificationManager)
+            if (nm == null) {
+                log("nav ended (farewell, no nm)")
+                return
+            }
+            nm.cancel(NAV_SHADOW_TAG, NAV_SHADOW_ID)
+            log(if (wasActive) "nav ended (farewell, shadow cancelled)" else "nav ended (farewell)")
+        } catch (t: Throwable) {
+            log("nav ended (farewell, cancel failed: ${t.message})")
         }
     }
 
@@ -777,6 +851,8 @@ internal object ArkNavLiveInjector {
      */
     private fun updateShadowContent(content: String) {
         try {
+            // 刚退出导航：这条播报可能是退出时残留的尾巴，不许刷胶囊
+            if (inEndingWindow()) return
             if (!navActive) return
             if (content == lastNaviText) return
             val nm = lastNm ?: return

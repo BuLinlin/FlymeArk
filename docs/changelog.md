@@ -2,6 +2,93 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.58 修「手动退出导航后胶囊不销毁」
+
+### 0. 真机日志（用户抓的，根因已定位）
+
+```
+10:33:50.126  navInject: hit id=99910001
+10:33:50.126  shadow posted  content='高德地图 · 正在导航'
+10:33:50.783  navTts: 全程八公里
+10:33:57.348  navTts: 导航到此为止啦                     ← 用户退出导航，高德播结束语
+10:33:57.348  probe ttspcm: data='导航到此为止啦，下次再见哦'
+10:33:57.351  navInject: hit id=99910001                 ← 高德退出时又重发了一次导航通知
+10:33:57.354  shadow posted  content='导航到此为止啦'     ← 我们把结束语当胶囊文案又发了一条影子
+10:33:57.374  shadow cancelled for com.autonavi.minimap  ← SystemUI 撤了一次
+10:34:00.025  liveShadeText ... '导航到此为止啦'          ← 胶囊又冒出来，常驻不消
+10:34:20.604  liveExpand: launch skipped (pkg=com.autonavi.minimap)
+```
+
+两条根因：
+
+| # | 根因 | 后果 |
+|---|---|---|
+| 1 | `END_PHRASES` 只覆盖 `旅途结束`/`下次再会`/`期待与您再次`/`导航结束啦`，**没覆盖 `导航到此为止啦，下次再见哦`** | 结束语被当普通文案写进胶囊 |
+| 2 | 高德退出时**重发一次导航通知**（同 id 99910001），`postShadow` 照常发影子；且「同轮导航沿用上条文案」把刚写进去的结束语带进新影子 | SystemUI 撤掉旧影子后，这条新影子存活 → 胶囊常驻 |
+
+### 1. 词表补齐
+
+- `END_PHRASES` += `导航到此为止`、`下次再见`、`导航结束`、`已到达目的地`、`您已到达`；
+- `NOISE_PHRASES` += `导航开始`（一条足够：它是 `步行导航开始`/`驾车导航开始`/`骑行导航开始`
+  的子串；也不会误伤 `开始导航后请靠右` —— 语序相反，`contains` 匹配不到）。
+
+### 2. 退出态 + 15 秒静默窗
+
+```
+NAV_ENDING_WINDOW_MS = 15_000L
+navEndingAt            // SystemClock.elapsedRealtime()，0 表示不在退出态
+inEndingWindow()       // now - navEndingAt < 15s
+```
+
+- `postShadow()` **最开头**（取素材、置 navActive 之前）：
+  `if (inEndingWindow()) { log("skip (ending window)"); return }`
+  —— 挡掉「退出时那次通知重发」这条尾巴；
+- `updateShadowContent()` 最开头同样 `if (inEndingWindow()) return`；
+- `endNavForFarewell()` 现在做三件事：
+  1. `navEndingAt = now`（**放在 `navActive` 判断之前**，即使 `navActive` 已经是 false 也要开窗）；
+  2. `navActive = false` / `lastNaviText = ""`（原有行为）；
+  3. **主动撤自己的影子**：`lastNm`（或 `AndroidAppHelper.currentApplication()`）拿
+     `NotificationManager` → `cancel(NAV_SHADOW_TAG, NAV_SHADOW_ID)`，
+     成功打 `nav ended (farewell, shadow cancelled)`，失败打
+     `nav ended (farewell, cancel failed: ...)`。
+     `nm.cancel` 在高德进程里，撤的是我们自己发的那条影子，不影响高德的通知。
+- `postShadow` 成功后 `navEndingAt = 0L`（新一轮导航复位）。
+
+### 3. 静默窗内「真指令」提前解锁
+
+派工验收要求「退出后立刻重开导航 → 胶囊正常出现」。纯 15s 窗口会让用户干等 15 秒。
+所以 `extractNaviText` 里若解析出**有效指令**（非结束语、非噪声），就把 `navEndingAt = 0L`
+并打 `ending window cleared by new guidance` —— 有导航指令说明人确实又在导航了。
+这条播报本身仍不进胶囊（`navActive` 此时是 false），下一次导航通知命中走 `postShadow`
+重新发影子即可（导航中通知是秒级刷新的）。
+
+### 4. 验收预期
+
+1. 正常导航 → 胶囊出现、文案跟播报走（v3.15.57 行为不变）；
+2. 手动退出 → 2 秒内消失，日志 `nav ended (farewell, shadow cancelled)`，之后不再有该包名的
+   `shadow posted`（只会有 `navInject: skip (ending window)`）；
+3. 退出后立刻重开 → 胶囊正常出现（`ending window cleared by new guidance` 提前解锁）。
+
+### 5. 改动范围
+
+只改 `ArkNavLiveInjector.kt`（`END_PHRASES` / `NOISE_PHRASES` / 新增静默窗三个成员 /
+`postShadow` 头部闸与复位 / `updateShadowContent` 头部闸 / `endNavForFarewell` 重写 /
+`extractNaviText` 提前解锁）。
+`ArkMessageLiveInjector` / `ArkLiveShowFixHook` / `ArkLiveSwipeDismissHook` /
+`ArkMiniBarStyleHook` / `ArkLiveExpandHook` / `ArkLiveShadowHook` 一行未改。
+
+### 未验证
+
+- 真机没跑（功能测试由用户做）。本版只保证「日志逻辑能对上那份 bug 时间线」；
+- 15s 窗口长度是估值。若退出后 15s 内真的重开导航、但那段时间恰好一句有效播报都没有，
+  胶囊仍会延迟到窗口结束才出现 —— 到时把窗口缩到 8s 即可；
+- `nm.cancel` 若在 Flyme 上对被 SystemUI 隐藏过的通知无效（理论上无影响，撤的是我们自己的
+  通知记录），日志会打 `cancel failed`，届时改用 `nm.cancelAll()` 之外的兜底方案；
+- 高德若在退出时**不是重发通知而是更新同一个对象**，`skip (ending window)` 会连续刷 15 秒
+  日志（每次刷新一条），`probe` 节流没作用于 `log()`；若刷得太凶再给这条加节流。
+
+版本 `versionCode 81 / 3.15.58`（debug 变体已装机，release 签名同 debug key）。
+
 ## 2026-11-06 · v3.15.57 修播报噪声与拼接规则（只连有效段）
 
 ### 0. v3.15.56 真机验证到的胶囊实际显示序列
