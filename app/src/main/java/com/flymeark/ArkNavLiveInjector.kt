@@ -201,9 +201,14 @@ internal object ArkNavLiveInjector {
      * 60.025  liveShadeText '导航到此为止啦'   ← 胶囊又冒出来，常驻不消
      * ```
      * 也就是说：结束语之后**紧跟着一次通知重发**，那次重发会绕过 endNavForFarewell 的落闸
-     * 重新发一条影子。15s 窗口用来挡掉这个尾巴。
+     * 重新发一条影子。
+     *
+     * v3.15.60：15_000 → **5_000**。依据就是上面那两行时间戳 —— 重发发生在结束语之后
+     * **3 毫秒**（`57.348` → `57.351`），5 秒绰绰有余；而 15 秒只会放大另一个残留边界：
+     * 「退出后重开导航、首句正好是转向指令（不含出发语）」时胶囊要等窗过期才出现，
+     * 15 秒用户能明显感到「胶囊不出来」，5 秒基本无感。
      */
-    private const val NAV_ENDING_WINDOW_MS = 15_000L
+    private const val NAV_ENDING_WINDOW_MS = 5_000L
 
     /** 进入退出态的时刻（`SystemClock.elapsedRealtime()`）；0 表示不在退出态 */
     private var navEndingAt = 0L
