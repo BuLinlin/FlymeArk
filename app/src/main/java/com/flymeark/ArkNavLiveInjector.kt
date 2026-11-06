@@ -304,6 +304,28 @@ internal object ArkNavLiveInjector {
     private var lastTimeValue = ""
     private var lastTimeUnit = ""
 
+    // ---- 跨趟兜底的「过期」机制（v3.15.81）
+    //
+    // 真机 bug：先开驾车（37 分钟 / 9 公里），取消后改步行，高德 app 显示
+    // 「9.3 公里 · 2 小时 23 分」，我们的展开卡却还是「37 分钟 / 9 公里」——
+    // 因为新一趟在拿到自己的 totals 之前，`beginSession → stashLastTrip` 刚把
+    // **上一趟驾车**的值搬进了兜底，而兜底没有时效。
+    //
+    // 兜底只该服务「同一趟的续报 / 同一路线重开」，不该服务「换了交通方式的新一趟」。
+    // 所以给它一个 15 秒窗口 + 明确的清除触发点：宁可三栏 `--`，也不显示上一趟的数。
+
+    /** 兜底有效窗口：新会话开始后这么久还拿不到本趟全程，兜底即失效 */
+    private const val FALLBACK_TTL_MS = 15_000L
+
+    /** 兜底失效时刻（elapsedRealtime）；`<= 0` = 当前没有有效兜底 */
+    private var fallbackValidUntil = 0L
+
+    /** 交通方式（`drive` / `walk` / `bike` / `bus` / `subway`），空 = 未知。跨趟保留用于比对 */
+    private var travelMode = ""
+
+    /** 高德源通知 extras 已全量 dump 过一次（v3.15.81 一次性诊断） */
+    private var srcExtrasDumped = false
+
     /** 上一次真正写进胶囊的播报文案（去重：同一句反复播不重复刷通知） */
     private var lastNaviText = ""
 
@@ -690,6 +712,15 @@ internal object ArkNavLiveInjector {
                 "reason=$reason id=${notifId ?: "-"}"
         )
 
+        // v3.15.81 诊断 C：一次性 dump 高德源通知 extras 的全部键值。
+        // 目的：看步行/驾车切换时，通知里有没有带 `2小时23分` / `19:02` 这类结构化字段；
+        // 有的话下一版就能彻底摆脱「等播报」。只读不写。
+        dumpSrcExtrasOnce(extras)
+
+        // v3.15.81：这一帧的交通方式（通知标题/正文里可能带「步行导航」之类字样）。
+        // 必须在 beginSession 之前算出来 —— 新会话要靠它决定「要不要丢掉上一趟的兜底」。
+        val modeChanged = noteTravelMode("${title.orEmpty()} ${text.orEmpty()}")
+
         // v3.15.62：目的地名既不在播报里（真机日志的出发播报只有
         // `全程…大约需要…预计…到达`，从没出现 POI 名），也不在通知的 title/text
         // （固定「高德地图 / 正在导航」）。
@@ -734,7 +765,8 @@ internal object ArkNavLiveInjector {
         // 而网里这条（导航前搜索阶段捞到的 `终点，XXX`）恰恰是这一趟最有用的值。
         val now = SystemClock.elapsedRealtime()
         val newSession = navState != STATE_ACTIVE || (now - lastHitAt) >= SESSION_GAP_MS
-        if (newSession) beginSession(now)
+        // v3.15.81：交通方式变了的新会话，不许沿用上一趟的路线量级兜底
+        if (newSession) beginSession(now, dropFallback = modeChanged)
         lastHitAt = now
         navState = STATE_ACTIVE
         navActive = true
@@ -936,10 +968,11 @@ internal object ArkNavLiveInjector {
             se.putString(ArkConstants.NAV_KEY_TIME_UNIT, remainPair.second)
             se.putString(ArkConstants.NAV_KEY_ETA, etaText)
             se.putLong(ArkConstants.NAV_KEY_STARTED, navStartedAt)
-            // 分母：本趟钉死的全程；本趟没有就用上一趟的（否则进度条整个不画球）
+            // 分母：本趟钉死的全程；本趟没有就用上一趟的（否则进度条整个不画球）。
+            // v3.15.81：上一趟的值必须**仍在有效窗口内**才用，否则一律当未知（= 不画球）
             se.putLong(
                 ArkConstants.NAV_KEY_TOTAL_MS,
-                if (tripTotalMs > 0L) tripTotalMs else lastTripTotalMs
+                if (tripTotalMs > 0L) tripTotalMs else fallbackTotalMs()
             )
             // v3.15.65：锚点进度 —— 面板只按这个数画，两帧之间**不许自己走**
             se.putLong(ArkConstants.NAV_KEY_REMAIN_MS, remainMs)
@@ -1235,11 +1268,16 @@ internal object ArkNavLiveInjector {
      * `navStartedAt` 重置为**此刻**：新会话的进度必须从 0 开始，而不是接着上一趟的
      * 百分比往下走（上一趟的 `navStartedAt` 早于这一趟起点，沿用会让剩余直接变负）。
      */
-    private fun beginSession(now: Long) {
+    private fun beginSession(now: Long, dropFallback: Boolean = false) {
         try {
             stashLastTrip()
+            // v3.15.81：交通方式变了 = 这是**另一条路线**，上一趟的路线量级（全程/里程/耗时）
+            // 一律作废。必须在 stashLastTrip 之后清 —— 否则刚刚搬进来的旧值又活过来了。
+            if (dropFallback) clearTripFallback("mode changed on new session")
             resetNavPayload()
             navStartedAt = now
+            // v3.15.81：兜底只在新会话开头 15 秒内可信（详见 [fallbackValid]）
+            fallbackValidUntil = if (dropFallback) 0L else now + FALLBACK_TTL_MS
             // v3.15.67：新一趟从蓝色开始 —— 上一趟最后一句若是偏航，不清零就会一出发就红
             navYawed = false
             // v3.15.69：置红时刻一并归零，否则新一趟的「最短保持」会被上一趟的旧时间戳算成已过期
@@ -1249,7 +1287,7 @@ internal object ArkNavLiveInjector {
             navEndingAt = 0L
             log(
                 "session begin (new) fallbackTotal=${lastTripTotalMs / 60_000}min " +
-                    "fallbackDest='$lastDest'"
+                    "fallbackDest='$lastDest' dropFallback=$dropFallback mode='$travelMode'"
             )
         } catch (_: Throwable) {
         }
@@ -1274,6 +1312,103 @@ internal object ArkNavLiveInjector {
                 lastTimeUnit = totalTimeUnit
             }
         } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 跨趟兜底**是否仍然可信**（v3.15.81）。
+     *
+     * 有效条件只有一个：新会话开始后的 [FALLBACK_TTL_MS] 窗口内。
+     * 超时即清（幂等），调用方拿到 false 就当作「未知」→ 面板显示 `--`。
+     *
+     * 为什么用「读时判过期」而不是起一个定时器：本进程没有自己的调度器
+     * （所有时机都由高德的通知 / 播报驱动），读时判是最省的写法，也不会漏。
+     */
+    private fun fallbackValid(): Boolean {
+        if (fallbackValidUntil <= 0L) return false
+        if (SystemClock.elapsedRealtime() <= fallbackValidUntil) return true
+        clearTripFallback("ttl ${FALLBACK_TTL_MS}ms expired")
+        return false
+    }
+
+    /** 本帧可用的跨趟全程（过期/没有 → 0 = 未知，进度条不画球） */
+    private fun fallbackTotalMs(): Long = if (fallbackValid()) lastTripTotalMs else 0L
+
+    /**
+     * 清掉跨趟兜底（v3.15.81）。
+     *
+     * 只清「上一趟的路线量级」（全程 / 里程 / 耗时）——**保留 [lastDest]**：
+     * 目的地跨趟复用是安全的，用户看到「杭州东站」不会有意见，看到「37 分钟」才有。
+     */
+    private fun clearTripFallback(reason: String) {
+        try {
+            val had = lastTripTotalMs != 0L ||
+                lastDistValue.isNotEmpty() ||
+                lastTimeValue.isNotEmpty()
+            fallbackValidUntil = 0L
+            lastTripTotalMs = 0L
+            lastDistValue = ""
+            lastDistUnit = ""
+            lastTimeValue = ""
+            lastTimeUnit = ""
+            if (had) log("fallback cleared ($reason)")
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 交通方式关键词 → 归一化标记（v3.15.81，顺序有意义：先长后短避免误判） */
+    private val TRAVEL_MODE_WORDS = listOf(
+        "驾车" to "drive",
+        "开车" to "drive",
+        "步行" to "walk",
+        "骑行" to "bike",
+        "骑车" to "bike",
+        "公交" to "bus",
+        "地铁" to "subway",
+    )
+
+    /** 从一段文本里识别交通方式；识别不到返回 null（不改变现有判定） */
+    private fun detectTravelMode(text: String?): String? {
+        if (text.isNullOrBlank()) return null
+        for ((word, mode) in TRAVEL_MODE_WORDS) {
+            if (text.contains(word)) return mode
+        }
+        return null
+    }
+
+    /**
+     * 记录本帧识别到的交通方式（v3.15.81），与上一次不同则立即清掉跨趟兜底 ——
+     * 换了交通方式，路线量级必然不同，旧值绝不能当兜底。
+     *
+     * @return true 表示本帧**确认**发生了交通方式变化
+     */
+    private fun noteTravelMode(text: String?): Boolean {
+        val mode = detectTravelMode(text) ?: return false
+        if (travelMode.isNotEmpty() && travelMode != mode) {
+            clearTripFallback("mode $travelMode -> $mode")
+            travelMode = mode
+            return true
+        }
+        travelMode = mode
+        return false
+    }
+
+    /** 一次性 dump 高德源通知 extras 的全部键值（v3.15.81 诊断；`Bundle.get` 已 deprecated） */
+    @Suppress("DEPRECATION")
+    private fun dumpSrcExtrasOnce(ex: Bundle?) {
+        if (srcExtrasDumped) return
+        srcExtrasDumped = true
+        try {
+            if (ex == null) {
+                log("srcExtras: <null>")
+                return
+            }
+            val keys = ex.keySet().sorted().joinToString(",") { k ->
+                "$k=${ex.get(k)?.toString()?.take(32)}"
+            }
+            XposedBridge.log("[${ArkConstants.LOG_TAG}] srcExtras: keys=[$keys]")
+        } catch (t: Throwable) {
+            log("srcExtras failed: ${t.message}")
         }
     }
 
@@ -1926,8 +2061,9 @@ internal object ArkNavLiveInjector {
             return minutes.toString() to "分钟"
         }
         // v3.15.66：没有锚点时按「本趟解析值 → 上一趟兜底」退，别直接 `--`
+        // v3.15.81：上一趟的值只在有效窗口内可用（超时/换交通方式后一律回到 `--`）
         if (totalTimeValue.isNotEmpty()) return totalTimeValue to totalTimeUnit
-        if (lastTimeValue.isNotEmpty()) return lastTimeValue to lastTimeUnit
+        if (fallbackValid() && lastTimeValue.isNotEmpty()) return lastTimeValue to lastTimeUnit
         // 两级都空 → 返回空对，面板显示 `--`（此时进度条本来也不画球）
         return "" to ""
     }
@@ -1940,7 +2076,8 @@ internal object ArkNavLiveInjector {
      */
     private fun distPair(): Pair<String, String> = when {
         totalDistValue.isNotEmpty() -> totalDistValue to totalDistUnit
-        lastDistValue.isNotEmpty() -> lastDistValue to lastDistUnit
+        // v3.15.81：上一趟的里程只在有效窗口内可用
+        fallbackValid() && lastDistValue.isNotEmpty() -> lastDistValue to lastDistUnit
         else -> totalDistValue to totalDistUnit
     }
 
@@ -1979,7 +2116,7 @@ internal object ArkNavLiveInjector {
             remainPair.second,
             etaText,
             totalMs.toString(),
-            (if (tripTotalMs > 0L) tripTotalMs else lastTripTotalMs).toString(),
+            (if (tripTotalMs > 0L) tripTotalMs else fallbackTotalMs()).toString(),
             remainMs.toString(),
             navYawed.toString()
         ).joinToString("\u0001")
@@ -1995,6 +2132,13 @@ internal object ArkNavLiveInjector {
     private fun captureTotals(full: String?) {
         try {
             if (full.isNullOrBlank()) return
+            // v3.15.81：播报里也可能出现「步行导航开始」这类词 —— 与通知侧同一套判定
+            noteTravelMode(full)
+            // v3.15.81：**转向播报已到、本趟仍无全程** → 说明这趟不会重播「全程…」，
+            // 上一趟的全程不可信（换交通方式的典型形态），立刻让位，宁可显示 `--`。
+            if (tripTotalMs == 0L && turnCodeOf(full) != ArkConstants.NAV_TURN_STRAIGHT) {
+                clearTripFallback("turn before totals")
+            }
             val departureFrame = isDeparture(full)
             // v3.15.62：出发时刻必须先于 parseTotals 设置 —— ETA 兜底要用它。
             // v3.15.66：会话开始（[beginSession]）已经写过 navStartedAt，这里只补「漏网的首帧」。
@@ -2073,7 +2217,8 @@ internal object ArkNavLiveInjector {
         try {
             val now = SystemClock.elapsedRealtime()
             if (anchorRemainMs < 0L) {
-                val total = if (tripTotalMs > 0L) tripTotalMs else lastTripTotalMs
+                // v3.15.81：上一趟的全程只在有效窗口内可用（过期即当作没有）
+                val total = if (tripTotalMs > 0L) tripTotalMs else fallbackTotalMs()
                 if (total <= 0L) {
                     remainMs = UNKNOWN_REMAIN_MS
                     anchorAt = 0L
@@ -2203,6 +2348,9 @@ internal object ArkNavLiveInjector {
         // 它们是「上一趟的兜底值」，高德重开同一路线时不重播全程，全靠它们补三栏与目的地；
         // 在这里清掉 = 新一趟永远 `--`（这正是 v3.15.65 用户看到的 bug）。
         // 它们的唯一写入点是 [stashLastTrip]，只搬非空值，不会被这一趟的空值污染。
+        // v3.15.81：**但它们现在有 15 秒时效**（[fallbackValid]）—— 换了交通方式或转向播报
+        // 已到却仍无本趟全程时会被 [clearTripFallback] 清掉。这里不直接清，是因为
+        // 「重开同一路线」仍需要它们；时效交给读取点判断。
         // v3.15.65：载荷指纹也要清 —— 下一趟第一帧的载荷可能和上一趟末帧「看起来一样」
         // （同一条路、同一个剩余），不清就会被误判成重复而漏投，胶囊整趟不更新
         lastShadowSig = ""
