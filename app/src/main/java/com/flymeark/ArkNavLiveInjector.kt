@@ -351,6 +351,18 @@ internal object ArkNavLiveInjector {
     /** 上一次「导航通知命中」的时刻，用于判断两次命中之间是否中断过（导航结束又重开） */
     private var lastHitAt = 0L
 
+    /**
+     * 最近一次**看到导航通知投递**的时刻（v3.15.85），配合 [NAV_ALIVE_GRACE_MS] 用。
+     *
+     * 与 [lastHitAt] 的区别：[lastHitAt] 是「会话」的时间轴（决定要不要开新会话，
+     * 只有真的建立会话时才写）；这个是「通知还活着」的时间轴 —— 只要 `notify` 被调用
+     * 就写，用来扛住「撤旧 id + 发新 id」之间那 25ms 的空窗。
+     *
+     * `@Volatile`：写入在 `notify` hook 线程，读取可能在播报回调 / 投递路径的别的线程。
+     */
+    @Volatile
+    private var lastNavNotifyAt = 0L
+
     /** 会话状态：空闲（还没见过导航通知） */
     private const val STATE_IDLE = 0
 
@@ -368,6 +380,26 @@ internal object ArkNavLiveInjector {
      * （例如高德被强杀但影子没撤干净）。
      */
     private const val SESSION_GAP_MS = 90_000L
+
+    /**
+     * 「刚命中过导航通知」的宽限窗（v3.15.85）。
+     *
+     * 换交通方式时高德会**撤掉旧 id 的通知、再发新 id 的通知**（骑行 99910003 →
+     * 步行 99910002），而本 hook 挂在 `notify` 的 **before** —— 这一瞬间新旧两条
+     * 都不在 `activeNotifications` 里，[navNotificationAlive] 会误判「导航结束」，
+     * 把刚起来的会话当场打死。
+     *
+     * 真机时序（`qa_tmp/logs/mod2.log`，17:21:23）：
+     * ```
+     * 23.500 hit id=99910002 nav=true          ← 步行通知命中
+     * 23.500 fallback cleared (mode bike -> walk)
+     * 23.525 session ending (source gone) was=1 ← 25ms 后就被判死
+     * ```
+     *
+     * 「命中」本身就是导航还在跑的最强证据，给它 5 秒宽限。
+     * 代价：真正的「导航结束」最多晚 5 秒被识别（告别语走 farewell 那条路，不受影响）。
+     */
+    private const val NAV_ALIVE_GRACE_MS = 5_000L
 
     /**
      * 退出态的时间戳（`SystemClock.elapsedRealtime()`）；0 表示从没进过 ENDING。
@@ -726,6 +758,10 @@ internal object ArkNavLiveInjector {
         // 有的话下一版就能彻底摆脱「等播报」。只读不写。
         dumpSrcExtrasOnce(extras)
 
+        // v3.15.85：记下「刚刚看到导航通知投递」。必须早于 [noteTravelMode] / [beginSession] ——
+        // 换方式那一帧紧接着就会有人调 [navNotificationAlive]，晚一步就赶不上宽限窗。
+        lastNavNotifyAt = SystemClock.elapsedRealtime()
+
         // v3.15.81：这一帧的交通方式（通知标题/正文里可能带「步行导航」之类字样）。
         // 必须在 beginSession 之前算出来 —— 新会话要靠它决定「要不要丢掉上一趟的兜底」。
         val modeChanged = noteTravelMode("${title.orEmpty()} ${text.orEmpty()}")
@@ -765,15 +801,31 @@ internal object ArkNavLiveInjector {
         // 状态机优先，时间只做辅助：
         //  ① 当前不是 ACTIVE（IDLE / ENDING）→ 一定是新会话（首帧 / 结束后重开）；
         //  ② 已经 ACTIVE，但距上次命中超过 SESSION_GAP_MS → 当新会话（自愈兜底：
-        //     没收到 cancel 也没 farewell，但显然中间断过）。
+        //     没收到 cancel 也没 farewell，但显然中间断过）；
+        //  ③ **交通方式变了 → 一定是新会话**（v3.15.85）。
         //
         // 走到这里说明**确实是一条导航通知**（上游 matchReason 已过滤），
         // 所以「命中」本身就是新会话的最强证据 —— 不再靠 90 秒猜。
         //
+        // ## ③ 为什么必须有（真机 17:21 骑行 → 步行）
+        //
+        // 用户骑到一半切步行，高德在 10 秒内连发两条通知：骑行那趟 17:21:13 命中、
+        // 步行 17:21:23 命中。间隔 10s < [SESSION_GAP_MS] 90s → 老代码判 `newSession = false`
+        // → **`beginSession()` 根本没调** → `totalDistValue` / `totalTimeValue` / `tripTotalMs`
+        // 全是骑行那趟的残留（42 分钟 / 9.9 公里），步行那条迷你条直接显示「42 分钟」。
+        // 日志侧的铁证：那一帧只有 `fallback cleared (mode bike -> walk)`，
+        // **没有** `session begin (new)` 那行。
+        //
+        // 安全性：[noteTravelMode] 只在「上一趟方式已知且不同」或「上一趟为空但有兜底值」
+        // 时返回 true；同一方式重开（walk → walk）返回 false —— 所以「重开同一路线保留兜底」
+        // 那条老逻辑一个字都没变。
+        //
         // `textDestThisTrip` 在 [beginSession] 之前就取好了快照：beginSession 会清候选池，
         // 而网里这条（导航前搜索阶段捞到的 `终点，XXX`）恰恰是这一趟最有用的值。
         val now = SystemClock.elapsedRealtime()
-        val newSession = navState != STATE_ACTIVE || (now - lastHitAt) >= SESSION_GAP_MS
+        val newSession = navState != STATE_ACTIVE ||
+            (now - lastHitAt) >= SESSION_GAP_MS ||
+            modeChanged
         // v3.15.81：交通方式变了的新会话，不许沿用上一趟的路线量级兜底
         if (newSession) beginSession(now, dropFallback = modeChanged)
         lastHitAt = now
@@ -2592,14 +2644,28 @@ internal object ArkNavLiveInjector {
      * @return 拿不到列表时返回 true（宁可多更新一帧，也不要提前把功能关掉）
      */
     private fun navNotificationAlive(nm: NotificationManager): Boolean = try {
-        nm.activeNotifications.any { sbn ->
-            sbn.id in NAV_NOTIF_IDS || (
-                try {
-                    sbn.notification?.extras?.getBoolean(EXTRA_NAVIGATING, false) == true
-                } catch (_: Throwable) {
-                    false
-                }
-                )
+        // v3.15.85：换交通方式那一瞬间的宽限窗（详见 [NAV_ALIVE_GRACE_MS] 的注释）。
+        // 换方式时高德是「cancel 旧 id + notify 新 id」，而本 hook 挂在 notify 的 **before**：
+        // 这一帧里旧 id 已经没了、新 id 还没入 NotificationManager，`activeNotifications`
+        // 三个 id 一个都没有 → 误判「源通知没了」→ 刚起来的会话 25ms 就被打死。
+        //
+        // 注意这里**不能**写成 `if (...) return true`：本函数是表达式体
+        // （`= try { ... } catch { ... }`），Kotlin 不允许在表达式体里 `return`。
+        // 所以用 if/else 把值算出来。
+        if (lastNavNotifyAt != 0L &&
+            SystemClock.elapsedRealtime() - lastNavNotifyAt <= NAV_ALIVE_GRACE_MS
+        ) {
+            true
+        } else {
+            nm.activeNotifications.any { sbn ->
+                sbn.id in NAV_NOTIF_IDS || (
+                    try {
+                        sbn.notification?.extras?.getBoolean(EXTRA_NAVIGATING, false) == true
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    )
+            }
         }
     } catch (_: Throwable) {
         true
