@@ -8,20 +8,26 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.drawable.Icon
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.view.View
+import android.view.ViewGroup
 import android.widget.TextView
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.lang.ref.WeakReference
 import java.lang.reflect.Modifier
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * v3.15.51：高德地图导航实况胶囊 —— 复用「影子通知」通道。
@@ -1358,6 +1364,9 @@ internal object ArkNavLiveInjector {
                 "session begin (new) fallbackTotal=${lastTripTotalMs / 60_000}min " +
                     "fallbackDest='$lastDest' dropFallback=$dropFallback mode='$travelMode'"
             )
+            // v3.15.86 探针 4：+3s / +8s 各 dump 一次控件树（一趟只挂一次）。
+            // 放在最后：此时 navActive 已置 true，dump 里 fumbled 的节点才会被认成「导航中」。
+            scheduleViewTreeDumps()
         } catch (_: Throwable) {
         }
     }
@@ -2457,6 +2466,14 @@ internal object ArkNavLiveInjector {
         lastUiTripSig = ""
         lastUiRepostAt = 0L
         synchronized(uiTripLock) { uiCandLog.clear() }
+        // v3.15.86：取证包的「每趟一次」状态一起复位。
+        // [diagBuf] 必须跟着清：它既是去重表也是本趟的证据集，
+        // 不清的话第二趟同一串会被上一趟的去重挡住 → 白测一趟（[canvasCalls] 只做抽样计数，保留）。
+        vProbeScheduled = false
+        synchronized(diagLock) {
+            diagBuf.clear()
+            diagLines = 0
+        }
         // v3.15.65：目的地候选池是「本趟导航」的结论，跨趟保留会串味（上一趟的终点被当成这一趟的，
         // 错的目的地比没有更糟）→ 必须清。
         // ⚠ 但 [textBuf] **不许**跟着清：那是「最近看到的文案时间线」，要横跨这次复位才能覆盖
@@ -4030,6 +4047,292 @@ internal object ArkNavLiveInjector {
         }
     }
 
+    // ------------------------------------------------------------ v3.15.86：步行通道取证包
+    //
+    // ## 为什么还要取证
+    //
+    // 真机 `qa_tmp/logs/mod3.log`（17:28 那趟步行）：v3.15.85 的两个修复**都生效了** ——
+    // 有 `session begin (new) ... mode='walk'`，没有 25ms 那条 `session ending (source gone)`；
+    // 但三格还是空，而且整趟**一条 `uiTrip:` 都没有**，`NAV UI CAND` 里全是转向文案：
+    //
+    // ```
+    // NAV UI CAND: n=6 | 33米后右转 | 21米后左转 | 直行 69米 | 50米后右转 进入 文三路辅路 | …
+    // ```
+    //
+    // 同一份日志里骑行那趟完全正常：
+    // `uiTrip: from='剩余距离10.5公里预计需要38分钟18:05到达' dist=10.5公里 time=38分钟 …`
+    //
+    // 用户实拍截图对比：**骑行是底部一条卡片**（无障碍描述正好是 `剩余距离…到达` 一整串），
+    // **步行是顶部两条**（`8.2公里 · 2小时7分` 和 `19:35到达`）—— 换了一套控件。
+    //
+    // 所以现在不是正则问题，是**通道**问题。这四组探针只为回答一个问题：
+    // 步行那两条到底走 `setText` / `setContentDescription` / `TextView.append` /
+    // `Canvas.drawText`，还是干脆是自绘 View（那样就只能改走「读 View 树 + 反射取字段」）。
+    //
+    // ## 铁律
+    //
+    // **只读不写**：[parseUiTrip] / [parseUiTripLine] / `postShadow` / 任何样式
+    // 一个字节都不动，这里只新增独立的诊断函数与 hook；每个入口都 try/catch，
+    // 宿主进程绝不能被取证搞崩；所有探针都只在 `navActive == true` 时工作。
+
+    /** 取证环容量（去重后的唯一串条数） */
+    private const val DIAG_BUF_MAX = 40
+
+    /** 每条 session 最多打多少行 `VPROBE-TEXT`（防刷屏） */
+    private const val DIAG_LINE_MAX = 40
+
+    /** 控件树 BFS 节点上限 */
+    private const val VIEW_TREE_MAX = 400
+
+    /** 控件树日志最多切几行（安全阀，防止一棵畸形大树把 logcat 打满） */
+    private const val VIEW_TREE_MAX_LINES = 30
+
+    /** 最近看到的「疑似三格描述」原文（去重环，老 → 新） */
+    private val diagBuf = ArrayDeque<String>()
+
+    /** [diagBuf] / [diagLines] 的锁：`setText` 回调、Canvas 渲染线程、主线程都会进来 */
+    private val diagLock = Any()
+
+    /** 本趟已经打了多少行 `VPROBE-TEXT` */
+    private var diagLines = 0
+
+    /** Canvas 调用计数（1/8 抽样用）；两个 drawText 重载共用一个计数器 */
+    private val canvasCalls = AtomicInteger(0)
+
+    /** 最近一次拿到的根 View（`View.rootView`，通常就是 DecorView）；弱引用，不许拽住界面 */
+    @Volatile
+    private var decorRef: WeakReference<View>? = null
+
+    /** 控件树 dump 是否已经给本趟挂过定时任务（一趟只挂一次，重置点在 [resetNavPayload]） */
+    private var vProbeScheduled = false
+
+    /**
+     * 纯只读诊断：把一条「疑似三格描述」记进取证环并打一行日志。
+     *
+     * 三处共用（[rememberText] 的长串兜底 / `TextView.append` / `Canvas.drawText`）：
+     *  - **去重**：`diagBuf` 里有就整条丢弃。Canvas 是 1/8 抽样，不去重会把同一串刷几十遍；
+     *  - **限量**：[diagBuf] 只留最近 [DIAG_BUF_MAX] 条，日志只打 [DIAG_LINE_MAX] 行；
+     *  - **单行上限 200 字**：原文可能几百字，截断后仍然能看出模板长什么样。
+     */
+    private fun probeText(text: String) {
+        try {
+            if (text.isEmpty()) return
+            var shouldLog = false
+            synchronized(diagLock) {
+                if (diagBuf.contains(text)) return
+                if (diagBuf.size >= DIAG_BUF_MAX) diagBuf.removeFirst()
+                diagBuf.addLast(text)
+                if (diagLines < DIAG_LINE_MAX) {
+                    diagLines++
+                    shouldLog = true
+                }
+            }
+            if (!shouldLog) return
+            val shown = if (text.length > 200) text.take(200) + "…" else text
+            log("VPROBE-TEXT: len=${text.length} '$shown'")
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 便宜预筛：这条文案像不像「三格描述」（`剩余距离…到达` 那一族）。
+     *
+     * 先做一次字符扫描找 `到` / `剩` —— 绝大多数 `setText` 都没有这两个字，
+     * 于是不用 `toString()` 就能否掉（宿主的 `setText` 是每秒几百次的高频路径）。
+     * 只有过了这一刀才 `toString()` 做 `contains` 精确判断。
+     */
+    private fun looksLikeTripDesc(s: CharSequence): Boolean {
+        val n = s.length
+        if (n < 4 || n > 300) return false
+        var maybe = false
+        for (i in 0 until n) {
+            val c = s[i]
+            if (c == '到' || c == '剩') {
+                maybe = true
+                break
+            }
+        }
+        if (!maybe) return false
+        return try {
+            val t = s.toString()
+            t.contains("到达") || t.contains("剩余距离")
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** `android.widget.` / `android.view.` / `androidx.` 开头的算标准控件（日志里只留 simpleName） */
+    private fun isStdViewClass(name: String): Boolean =
+        name.startsWith("android.widget.") ||
+            name.startsWith("android.view.") ||
+            name.startsWith("androidx.")
+
+    /**
+     * 一次性 dump 控件树（v3.15.86 探针 4）。
+     *
+     * 目的：步行那两条「8.2公里 · 2小时7分 / 19:35到达」是顶部两条独立控件，
+     * 如果它们既不走 `setText` 也不走 `Canvas.drawText`，那就只剩「自绘 View 内部持有
+     * 字符串字段」这一种可能 —— 这张树能告诉我们到底是哪个类、什么 id，
+     * 下一版就能用反射直接从它身上取值。
+     *
+     * 输出三部分：
+     *  1. `VPROBE-TREE[tag]#n` —— BFS 逐节点（类名 + `[l,t,w x h]`，TextView 追加 text 前 24 字），
+     *     整串按 ≤900 字切行；标准控件只留 simpleName，**其余打全限定名**（这正是我们要找的）；
+     *  2. `VPROBE-CUSTOM:` —— 树里所有非标准控件的全限定类名（去重、最多 20 个）；
+     *  3. 根 View 还没拿到时打一行 `(no decorView captured yet)`，用来区分「树是空的」和「压根没抓到」。
+     */
+    private fun dumpViewTreeOnce(tag: String) {
+        try {
+            val root = decorRef?.get()
+            if (root == null) {
+                log("VPROBE-TREE[$tag] (no decorView captured yet)")
+                return
+            }
+            val sb = StringBuilder()
+            val custom = LinkedHashSet<String>()
+            val queue = ArrayDeque<Pair<View, Int>>()
+            queue.addLast(root to 0)
+            var visited = 0
+            while (queue.isNotEmpty() && visited < VIEW_TREE_MAX) {
+                val pair = queue.removeFirst()
+                val v = pair.first
+                val depth = pair.second
+                visited++
+                val full = try {
+                    v.javaClass.name
+                } catch (_: Throwable) {
+                    "?"
+                }
+                val std = isStdViewClass(full)
+                if (!std && full != "?") custom.add(full)
+                val shown = if (std) {
+                    try {
+                        v.javaClass.simpleName
+                    } catch (_: Throwable) {
+                        full
+                    }
+                } else {
+                    full
+                }
+                repeat(depth.coerceAtMost(8)) { sb.append("  ") }
+                sb.append(shown)
+                try {
+                    sb.append('[').append(v.left).append(',').append(v.top).append(' ')
+                        .append(v.width).append('x').append(v.height).append(']')
+                } catch (_: Throwable) {
+                }
+                if (v is TextView) {
+                    val t = try {
+                        v.text?.toString().orEmpty()
+                    } catch (_: Throwable) {
+                        ""
+                    }
+                    if (t.isNotEmpty()) {
+                        val cut = if (t.length > 24) t.take(24) + "…" else t
+                        sb.append(" text=\"").append(cut).append('"')
+                    }
+                }
+                sb.append(" | ")
+                if (v is ViewGroup) {
+                    val cn = try {
+                        v.childCount
+                    } catch (_: Throwable) {
+                        0
+                    }
+                    for (i in 0 until cn) {
+                        val c = try {
+                            v.getChildAt(i)
+                        } catch (_: Throwable) {
+                            null
+                        }
+                        if (c != null) queue.addLast(c to depth + 1)
+                    }
+                }
+            }
+            logLines("VPROBE-TREE[$tag] nodes=$visited", sb.toString())
+            if (custom.isEmpty()) {
+                log("VPROBE-CUSTOM: (none)")
+            } else {
+                log("VPROBE-CUSTOM: " + custom.take(20).joinToString(" | "))
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 把长串按 ≤900 字切成若干行，每行前缀 `prefix#序号`（最多 [VIEW_TREE_MAX_LINES] 行） */
+    private fun logLines(prefix: String, body: String) {
+        try {
+            if (body.isEmpty()) {
+                log(prefix)
+                return
+            }
+            var i = 0
+            var part = 0
+            while (i < body.length && part < VIEW_TREE_MAX_LINES) {
+                val end = minOf(i + 900, body.length)
+                log("$prefix#${part + 1} " + body.substring(i, end))
+                i = end
+                part++
+            }
+            if (i < body.length) {
+                log("$prefix#… truncated (${body.length} chars total)")
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 给本趟挂 +3s / +8s 两次控件树 dump（v3.15.86 探针 4）。
+     *
+     * 为什么两次：+3s 是刚进导航页（顶部那两条可能刚建出来），
+     * +8s 是数字第一轮刷新之后（能看到 `19:35到达` 这类会变的文本挂在哪个节点上）。
+     * 用主线程 Handler 而不是新线程：读 View 树必须在 UI 线程上做。
+     */
+    private fun scheduleViewTreeDumps() {
+        try {
+            if (vProbeScheduled) return
+            vProbeScheduled = true
+            val h = Handler(Looper.getMainLooper())
+            h.postDelayed({ dumpViewTreeOnce("3s") }, 3_000L)
+            h.postDelayed({ dumpViewTreeOnce("8s") }, 8_000L)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 挂 Canvas 文本探针（v3.15.86 探针 3）。
+     *
+     * `Canvas.drawText` 覆盖普通自绘；`drawTextRun` 是 `StaticLayout` / `TextLine` 走的路径
+     * （很多「看起来是 TextView、实际自己排版」的控件走这条）。两个重载共用 [canvasCalls]，
+     * 1/8 抽样 —— 这是宿主的渲染线程，绝不能每帧都 `toString()`。
+     */
+    private fun hookCanvasText() {
+        val h = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    if (!navActive) return
+                    if ((canvasCalls.incrementAndGet() and 7) != 0) return
+                    val a = param.args.firstOrNull() as? CharSequence ?: return
+                    if (a.length !in 2..40) return
+                    probeText(a.toString())
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        try {
+            XposedBridge.hookAllMethods(Canvas::class.java, "drawText", h)
+            probeRaw("text net: hooked Canvas.drawText")
+        } catch (t: Throwable) {
+            probeRaw("text net: hook Canvas.drawText failed (${t.javaClass.simpleName})")
+        }
+        try {
+            XposedBridge.hookAllMethods(Canvas::class.java, "drawTextRun", h)
+            probeRaw("text net: hooked Canvas.drawTextRun")
+        } catch (t: Throwable) {
+            probeRaw("text net: hook Canvas.drawTextRun failed (${t.javaClass.simpleName})")
+        }
+    }
+
     /**
      * 记住一条「像地名」的文本。
      *
@@ -4047,6 +4350,13 @@ internal object ArkNavLiveInjector {
     private fun rememberText(s: CharSequence?) {
         try {
             if (s == null) return
+            // ---- v3.15.86 探针 1：长串兜底（纯只读，不改任何状态）----
+            //
+            // 位置必须在**所有闸之前**：下面第一件事就是 `parseUiTrip` 的
+            // `if (raw.length > UI_TRIP_LINE_MAX) return`（60 字），超过就静默丢弃 ——
+            // 而步行那两条的无障碍描述很可能就是个长串（带「距终点」「当前速度」之类尾巴）。
+            // 这条分支只往取证环里塞 + 打日志，永远不写任何业务字段。
+            if (navActive && looksLikeTripDesc(s)) probeText(s.toString())
             // ---- v3.15.82：三格数字解析器必须跑在三刀**之前** ----
             //
             // `9.3 公里` / `2 小时 23 分` 都会在第三刀被 [sanitizeDest] 判成噪声
@@ -4245,6 +4555,27 @@ internal object ArkNavLiveInjector {
         } catch (t: Throwable) {
             probeRaw("text net: hook View.setContentDescription failed (${t.javaClass.simpleName})")
         }
+        // v3.15.86 探针 2：`TextView.append` —— 有些控件不 setText，而是
+        // `setText("")` 之后逐段 append（数字和单位分两次塞）。这条网只喂 [probeText]，
+        // **不接** [rememberText]（append 进来的多是半截串，会污染目的地候选池）。
+        try {
+            XposedBridge.hookAllMethods(
+                TextView::class.java, "append",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            if (!navActive) return
+                            val a = param.args.firstOrNull() as? CharSequence ?: return
+                            if (a.length in 2..40) probeText(a.toString())
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("text net: hooked TextView.append")
+        } catch (t: Throwable) {
+            probeRaw("text net: hook TextView.append failed (${t.javaClass.simpleName})")
+        }
     }
 
     /** 从 hook 参数里取首参（必须是 `CharSequence`）交给 [rememberText]；取不到就静默返回 */
@@ -4254,6 +4585,14 @@ internal object ArkNavLiveInjector {
             if (args == null || args.isEmpty()) return
             val first = args[0]
             if (first !is CharSequence) return
+            // v3.15.86 探针 4 的素材：`setText` / `setContentDescription` 的 `thisObject`
+            // 都是 View，顺手记下它所在的根 View（弱引用，不许拽住界面）。
+            (param.thisObject as? View)?.let { v ->
+                try {
+                    v.rootView?.let { decorRef = WeakReference(it) }
+                } catch (_: Throwable) {
+                }
+            }
             rememberText(first)
         } catch (_: Throwable) {
         }
@@ -4347,6 +4686,8 @@ internal object ArkNavLiveInjector {
         // v3.15.64：导航前文案捕捞网 —— 目的地是用户**导航前**输入/看过的，那时它是真实 Java 文案，
         // 一定走 `TextView.setText`。全程撒网，导航开始时由 [dumpTextBuf] 收网。
         hookTextNets()
+        // v3.15.86 探针 3：Canvas 自绘文本（只喂取证环，不接任何解析）。
+        hookCanvasText()
 
         // 不在 App 侧 hook cancel：高德 cancel 的通知不一定是导航那条，一律清影子会让胶囊
         // 在高德刷新通知的间隙里闪没。销毁同步统一放 SystemUI 的 onNotificationRemoved。
