@@ -540,6 +540,45 @@ internal object ArkLiveExpandHook {
     }
 
     /**
+     * 导航会话结束（v3.15.66）——由 [ArkLiveShadowHook] 在**导航影子通知被移除**时调用。
+     *
+     * 做三件事：
+     *  1. 把「已结束」广播给展开卡（[ArkConstants.EXTRA_NAV_ENDED]）——
+     *     展开卡收到后立刻 `dismiss()`，不再浮在桌面 / 多任务上（R4 的症状 3）；
+     *  2. 把胶囊透明度还原成 1 —— 面板开着时我们把胶囊压成了 0，如果面板来不及
+     *     走自己的收起流程（进程被回收 / 用户直接返回桌面），胶囊会永远隐形；
+     *  3. 清掉实时推送指纹 —— 下一趟的第一帧必须能推出去。
+     *
+     * 只在面板可见时才发广播（不可见 = 没人收，白唤醒一次模块进程）。
+     *
+     * @param pkg 被移除的那条通知的包名（只处理导航包）
+     */
+    fun onNavSessionEnded(pkg: String?) {
+        try {
+            if (pkg != null && !ArkConstants.isNavLiveApp(pkg)) return
+            lastNavPushSig = null
+            XposedBridge.log("$TAG: nav session ended (shadow removed)")
+            ctrlRef?.get()?.let { applyCapsuleAlpha(it, 1f) }
+            if (!panelVisible) return
+            val ctx = try {
+                ctrlRef?.get()?.let {
+                    XposedHelpers.getObjectField(it, "mContext") as? Context
+                }
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            ctx.sendBroadcast(
+                Intent(ArkConstants.ACTION_NAV_PANEL_UPDATE)
+                    .setPackage(ArkConstants.APP_PKG)
+                    .putExtra(ArkConstants.EXTRA_NAV_ENDED, true)
+            )
+            XposedBridge.log("$TAG: nav panel end pushed")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: onNavSessionEnded failed: ${t.message}")
+        }
+    }
+
+    /**
      * 歌词每行刷新都会重设视图，原生可能把 alpha 动画拉回来；
      * 面板开着时在每次渲染后重新压成 0，保证胶囊不会「闪回来」。
      * 只动容器视图（见 [capsuleRef]），子视图的 alpha 由容器统一乘算。

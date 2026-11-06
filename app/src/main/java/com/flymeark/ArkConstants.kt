@@ -400,6 +400,18 @@ object ArkConstants {
      */
     const val ACTION_NAV_PANEL_UPDATE = "com.flymeark.NAV_PANEL_UPDATE"
 
+    /**
+     * extra：**本趟导航已结束**（Boolean，v3.15.66）。
+     *
+     * SystemUI 侧的 `ArkLiveShadowHook` 一看到导航影子通知被移除（= 会话进入 ENDING），
+     * 就带上这个 extra 发一次 [ACTION_NAV_PANEL_UPDATE]。面板收到后立刻 `dismiss()`
+     * （带缩回动画）并**停止接受后续更新** —— 否则展开卡会一直浮在桌面 / 多任务上。
+     *
+     * 为什么由 SystemUI 发而不是高德进程发：面板的接收器是 `RECEIVER_NOT_EXPORTED`，
+     * 只有同 uid 或 system uid 发得进来；高德进程发的会被系统直接丢掉。
+     */
+    const val EXTRA_NAV_ENDED = "nav_ended"
+
     /** 转向码常量（与 [NAV_KEY_TURN] 一一对应） */
     const val NAV_TURN_STRAIGHT = 0
     const val NAV_TURN_LEFT = 1

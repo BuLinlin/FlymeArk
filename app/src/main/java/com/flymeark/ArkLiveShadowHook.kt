@@ -7,6 +7,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.WeakHashMap
 
@@ -54,6 +55,17 @@ internal object ArkLiveShadowHook {
     private val hiddenRows: MutableSet<View> =
         Collections.newSetFromMap(WeakHashMap<View, Boolean>())
 
+    /**
+     * 导航影子绑定的那一行（弱引用，v3.15.66）。
+     *
+     * 会话结束时用它调 `setLiveNotification(false)` 解除 live 标记 —— 只 cancel 通知
+     * 有时不足以让 Flyme 的 live 容器立刻消失（胶囊残留）。
+     */
+    private var navRowRef: WeakReference<View>? = null
+
+    /** 正在解除导航行：抑制自己那个 `setLiveNotification` after-hook（否则会把行再次压成 alpha=0） */
+    private var releasingNavRow = false
+
     /** 高度方法清单：方法名 → 参数类型 */
     private val HEIGHT_METHODS: List<Pair<String, Array<Class<*>>>> = listOf(
         "getIntrinsicHeight" to emptyArray<Class<*>>(),
@@ -81,9 +93,14 @@ internal object ArkLiveShadowHook {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            if (releasingNavRow) return
                             val row = param.thisObject as? View ?: return
                             if (row.javaClass.name != ROW_CLS) return
                             val shadow = isShadowRow(row)
+                            // v3.15.66：记住导航影子那一行，会话结束时要用它解除 live 标记
+                            if (shadow && shadowTagOfRow(row) == ArkNavLiveInjector.NAV_SHADOW_TAG) {
+                                navRowRef = WeakReference(row)
+                            }
                             val wasHidden = hiddenRows.contains(row)
                             if (shadow && !wasHidden) {
                                 hiddenRows.add(row)
@@ -148,24 +165,36 @@ internal object ArkLiveShadowHook {
     }
 
     /** 反射判断某行对应的通知是不是我们的影子通知 */
-    private fun isShadowRow(row: View): Boolean {
+    private fun isShadowRow(row: View): Boolean = shadowTagOfRow(row) != null
+
+    /**
+     * 某行对应的影子 tag（消息 / 导航）；不是影子返回 null。
+     *
+     * 从 [isShadowRow] 抽出来（v3.15.66）是为了在绑定阶段区分「消息影子」与「导航影子」——
+     * 会话结束时要单独解除**导航**那一行的 live 标记。
+     */
+    private fun shadowTagOfRow(row: View): String? {
         return try {
-            val entry = XposedHelpers.getObjectField(row, "mEntry") ?: return false
-            val sbn = XposedHelpers.callMethod(entry, "getSbn") ?: return false
-            val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return false
-            if (!ArkConstants.isLiveShadowApp(pkg)) return false
+            val entry = XposedHelpers.getObjectField(row, "mEntry") ?: return null
+            val sbn = XposedHelpers.callMethod(entry, "getSbn") ?: return null
+            val pkg = XposedHelpers.callMethod(sbn, "getPackageName") as? String ?: return null
+            if (!ArkConstants.isLiveShadowApp(pkg)) return null
             // 优先用 tag 判定（跨进程最稳）：影子通知 tag 固定，
             // 消息 = flymeark_live_msg，导航 = flymeark_live_nav（v3.15.51）。
             // 实测 SystemUI 进程里反射调 Notification.getExtras() 会抛
             // NoSuchMethodError（Flyme 改动），extras 判定完全不可用 —— v3.15.27 探针证实。
             val tag = XposedHelpers.callMethod(sbn, "getTag") as? String
-            if (tag == ArkMessageLiveInjector.SHADOW_TAG) return true
-            if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) return true
-            val n = XposedHelpers.callMethod(sbn, "getNotification") ?: return false
-            val extras = XposedHelpers.callMethod(n, "getExtras") as? Bundle ?: return false
-            extras.getBoolean(ArkMessageLiveInjector.KEY_SHADOW, false)
+            if (tag == ArkMessageLiveInjector.SHADOW_TAG) return tag
+            if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) return tag
+            val n = XposedHelpers.callMethod(sbn, "getNotification") ?: return null
+            val extras = XposedHelpers.callMethod(n, "getExtras") as? Bundle ?: return null
+            if (extras.getBoolean(ArkMessageLiveInjector.KEY_SHADOW, false)) {
+                ArkMessageLiveInjector.SHADOW_TAG
+            } else {
+                null
+            }
         } catch (_: Throwable) {
-            false
+            null
         }
     }
 
@@ -186,7 +215,15 @@ internal object ArkLiveShadowHook {
                         null
                     }
                     if (tag == ArkMessageLiveInjector.SHADOW_TAG) return
-                    if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) return
+                    if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) {
+                        // v3.15.66（R4）：**导航影子被移除 = 会话结束**。
+                        // 这是本进程能拿到的、最可靠的「导航真的结束了」信号
+                        // （高德侧的 farewell / 源通知消失都会走到 cancel）。
+                        // 必须转告展开卡，否则 ArkNavPanelActivity 会一直浮在桌面 / 多任务上。
+                        releaseNavLiveRow()
+                        ArkLiveExpandHook.onNavSessionEnded(pkg)
+                        return
+                    }
                     clearShadowNotification(param.thisObject, pkg)
                     // 导航的原通知没了 = 导航结束，顺手通知导航注入器「别再更新胶囊」。
                     // 注意：这里在 SystemUI 进程，改的是本进程那份 ArkNavLiveInjector 的状态，
@@ -211,6 +248,35 @@ internal object ArkLiveShadowHook {
                 Int::class.javaPrimitiveType,
                 hook
             )
+        }
+    }
+
+    /**
+     * 解除导航影子那一行的 **live 标记**（v3.15.66，R4/D2）。
+     *
+     * 为什么需要：导航结束时我们只是 `cancelNotification` 掉影子，但 Flyme 的实况容器
+     * （胶囊）有时不会立刻跟着消失 —— 用户看到的就是「退出导航后胶囊还挂着」。
+     * 对那一行调 `setLiveNotification(false)` 是系统自己的「这一行不再是实况」入口，
+     * 比我们手动改 visibility 更干净（不会和回收复用打架）。
+     *
+     * 三个保险：
+     *  1. 弱引用：行被回收后引用自然失效，不会拦住 GC；
+     *  2. `releasingNavRow` 抑制自己的 after-hook —— 否则我们会把这一行又压回 alpha=0；
+     *  3. 全程 try/catch：这是 SystemUI 进程，方法签名对不上时只能降级（打日志），不能崩。
+     */
+    private fun releaseNavLiveRow() {
+        try {
+            val row = navRowRef?.get() ?: return
+            navRowRef = null
+            releasingNavRow = true
+            try {
+                XposedHelpers.callMethod(row, "setLiveNotification", false)
+            } finally {
+                releasingNavRow = false
+            }
+            XposedBridge.log("$TAG: nav live row released (setLiveNotification=false)")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: nav live row release failed: ${t.message}")
         }
     }
 

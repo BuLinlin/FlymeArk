@@ -129,6 +129,16 @@ class ArkNavPanelActivity : Activity() {
     /** 上一次渲染的载荷指纹（去抖用；见 [applyPayload]） */
     private var lastPayloadSig: String? = null
 
+    /**
+     * 本趟导航是否已结束（v3.15.66）。
+     *
+     * 由 SystemUI 的 [ArkConstants.EXTRA_NAV_ENDED] 广播置位。置位后：
+     *  - 立刻 `dismiss()`（带缩回动画），不再浮在桌面 / 多任务上；
+     *  - **拒绝任何后续载荷**（见 [applyPayload] 首行）—— 会话都结束了，
+     *    再收到更新只可能是迟到的残帧，重绘等于让卡片「诈尸」一次。
+     */
+    private var sessionEnded = false
+
     /** 动态广播是否已注册（`onResume` / `onStop` 必须成对，靠它防重复注册 / 重复注销） */
     private var updateReceiverRegistered = false
 
@@ -146,12 +156,33 @@ class ArkNavPanelActivity : Activity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             try {
                 if (intent?.action != ArkConstants.ACTION_NAV_PANEL_UPDATE) return
+                // v3.15.66：会话结束信号（SystemUI 看到导航影子被撤时发来）
+                if (intent.getBooleanExtra(ArkConstants.EXTRA_NAV_ENDED, false)) {
+                    onNavSessionEnded()
+                    return
+                }
                 val b = intent.extras ?: return
                 applyPayload(b)
             } catch (_: Throwable) {
                 // 面板只是展示层，任何异常都不许崩给用户看
             }
         }
+    }
+
+    /**
+     * 会话结束 → 收起卡片（v3.15.66）。
+     *
+     * 只做一次（[sessionEnded] 去重）：SystemUI 可能因为通知移除 / 多次重投连发几条
+     * ENDED，重复 `dismiss()` 会让收缩动画重入、`finish()` 被调用多次。
+     *
+     * 收到信号后**先注销接收器**：会话已经结束，再来的更新一律不该被处理
+     * （注销后再发来的广播进不了本进程，连「诈尸重绘」的机会都没有）。
+     */
+    private fun onNavSessionEnded() {
+        if (sessionEnded) return
+        sessionEnded = true
+        unregisterUpdateReceiver()
+        dismiss()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -277,6 +308,10 @@ class ArkNavPanelActivity : Activity() {
     private fun readIntent(i: Intent?) {
         if (i == null) return
         try {
+            // v3.15.66：这是一次**新的**打开（点了胶囊）→ 允许接收载荷。
+            // 不复位的话，上一趟结束置的 sessionEnded 会把这一趟的所有更新全吞掉。
+            sessionEnded = false
+            lastPayloadSig = null
             // 启动专用字段（App 包名 / 夜间模式）只在这里认，广播里没有这两个 key
             appPkg = i.getStringExtra(ArkConstants.EXTRA_PANEL_APP_PKG)
                 ?.takeIf { it.isNotBlank() } ?: ArkConstants.NAV_LIVE_PKG
@@ -304,6 +339,8 @@ class ArkNavPanelActivity : Activity() {
      * @param b 只含 `NAV_KEY_*` 的载荷
      */
     private fun applyPayload(b: Bundle) {
+        // v3.15.66：会话已结束 → 迟到的残帧一律不画（否则卡片收起途中会闪一下新内容）
+        if (sessionEnded) return
         val nextInstr = b.getString(ArkConstants.NAV_KEY_INSTR).orEmpty().trim()
         val nextSub = b.getString(ArkConstants.NAV_KEY_SUB).orEmpty().trim()
         val nextDest = b.getString(ArkConstants.NAV_KEY_DEST).orEmpty().trim()

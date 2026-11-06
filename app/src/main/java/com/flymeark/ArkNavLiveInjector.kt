@@ -165,17 +165,24 @@ internal object ArkNavLiveInjector {
      */
     private val END_PHRASES = arrayOf(
         "旅途结束", "下次再会", "期待与您再次", "导航结束啦",
-        "导航到此为止", "下次再见", "导航结束", "已到达目的地", "您已到达"
+        "导航到此为止", "下次再见", "导航结束", "已到达目的地", "您已到达",
+        // v3.15.66（真机 14:16:01）：`旅程到这里就结束了…` 这一版措辞**一个旧词都没命中**，
+        // 于是告别语被当成普通正文写进胶囊（截图里那句「旅程到这里就结…」就是它），
+        // 退出后胶囊还常驻。补齐高德现用的几种收尾说法。
+        "旅程到这里就结束", "本次导航结束", "导航已结束", "行程结束", "感谢使用高德"
     )
 
     /**
-     * 出发类短语。只在导航**起点**播，用来解除退出静默窗。
+     * 出发类短语。只在导航**起点**播，是「新会话开始」最可靠的证据之一。
+     *
+     * v3.15.66 起它的作用是**建会话**（[beginSession]），而不是「解一个静默窗」：
+     * 出发播报一辈子只有一次，任何形式的窗口都不许把它挡掉
+     * （真机 14:13:35 的骑行导航就是因为旧 5 秒窗把它的出发播报吞了，整趟没有分母）。
      *
      * 为什么不复用 [pickCapsuleText] 的「任意有效指令」：真机实测高德在导航过程中
      * **不重发导航通知**（只有冷启动时重复提交一次，两次命中相隔 74ms），
-     * 所以解窗后没有任何 `postShadow` 会来补发影子 —— 只能靠 [updateShadowContent]
-     * 自愈。而且「任意有效指令」会让退出瞬间残留的转向播报把刚关上的窗顶开，
-     * 让 v3.15.58 修好的「胶囊不销毁」复发。用出发类短语则两头都稳。
+     * 而且「任意有效指令」会让退出瞬间残留的转向播报把刚结束的会话顶成新一轮。
+     * 只认 `出发 / 开始导航 / 全程` 这三个词，两头都稳。
      */
     private val START_PHRASES = listOf("出发", "开始导航", "全程")
 
@@ -185,8 +192,67 @@ internal object ArkNavLiveInjector {
     // ArkNavLiveInjector 是另一个进程里的另一份对象，两边静态字段互不影响。
     // 所以「导航什么时候算结束」必须由本进程自己判断，见 navNotificationAlive()。
 
-    /** 导航进行中标志：成功发出第一条影子时置 true */
+    /**
+     * 导航进行中标志：当前会话处于 ACTIVE 状态。
+     *
+     * v3.15.66 起它只是 [navState] 的一个派生别名（两处必须一起维护），
+     * 保留是因为 `NAV TEXT TICK` 等既有路径都读它。
+     */
     private var navActive = false
+
+    // ---------------------------------------------------------------- 会话状态机（v3.15.66）
+    //
+    // 为什么要有它（真机 14:13–14:16 的错误链）：
+    //
+    // ```
+    // 14:13:09  hit id=99910001            → 会话 1 开始（驾车）
+    // 14:13:28  nav ended (farewell)        → 会话 1 结束
+    // 14:13:28  skip (ending window)        ← 5 秒静默窗开始
+    // 14:13:35  hit id=99910003（骑行）     ← 被静默窗吞掉（窗还没过）★R2
+    // 14:15:07  hit id=99910001            → 会话 3 开始，但三栏全 --（没重播「全程」）★R1
+    // 14:16:01  content='旅程到这里就结…'   ← 告别语被当正文投出去 ★R5
+    // ```
+    //
+    // 旧实现用「距上次命中是否超过 90 秒」猜会话边界，两头都错：
+    // 90 秒内重开 → 判成同一趟，沿用上一趟残留；超过 90 秒 → 一律 `resetNavPayload()`，
+    // 而高德**重开同一路线不会重播「全程X公里」**，于是新会话永远拿不到分母和目的地。
+    //
+    // 现在改成显式状态机，边界来自**源通知的真实生死**，时间只做辅助判据。
+    private var navState = STATE_IDLE
+
+    /**
+     * 退出态下「同一次退出」的重投守卫（毫秒）。
+     *
+     * 真机时间线（v3.15.57）：结束语 `57.348` → 高德重发通知 `57.351`（相隔 **3ms**）。
+     * 那次重发必须挡住，但它和「用户 4 秒后重新点开始导航」在通知层面长得**一模一样**
+     * （同 id、同文案「正在导航」），唯一的区分依据就是时间。
+     *
+     * 所以守卫做得**比静默窗短得多**（1.5s）：既挡住 3ms 的那次重投，又不会像旧的 5 秒
+     * 静默窗那样把 14:13:35 的骑行导航首帧一起吞掉。
+     */
+    private const val ENDING_REPOST_GUARD_MS = 1_500L
+
+    // ---------------------------------------------------------------- 跨趟兜底值（v3.15.66）
+    //
+    // 高德「结束导航 → 重开同一条路线」时**不会重播** `全程X公里, 大约需要X分钟`，
+    // 于是新会话拿不到分母 / 距离 / 目的地，三栏全 `--`、状态行退回「高德地图」。
+    //
+    // 对策：会话结束时把本趟的结论搬到这几个字段里当**兜底**，新会话解析不到时用它们顶上。
+    // ⚠ 它们只被**读**，绝不参与本趟解析（否则上一趟的数字会污染这一趟）。
+
+    /** 上一趟的全程耗时（进度条分母的兜底） */
+    private var lastTripTotalMs = 0L
+
+    /** 上一趟的总里程（数值 / 单位） */
+    private var lastDistValue = ""
+    private var lastDistUnit = ""
+
+    /** 上一趟的目的地 */
+    private var lastDest = ""
+
+    /** 上一趟的耗时文案（`27` / `分钟`），仅在没有剩余值时兜底 */
+    private var lastTimeValue = ""
+    private var lastTimeUnit = ""
 
     /** 上一次真正写进胶囊的播报文案（去重：同一句反复播不重复刷通知） */
     private var lastNaviText = ""
@@ -204,13 +270,32 @@ internal object ArkNavLiveInjector {
     /** 上一次「导航通知命中」的时刻，用于判断两次命中之间是否中断过（导航结束又重开） */
     private var lastHitAt = 0L
 
-    /** 两次命中间隔超过这个值就认为上一轮导航已结束（导航中高德刷新通知是秒级的） */
+    /** 会话状态：空闲（还没见过导航通知） */
+    private const val STATE_IDLE = 0
+
+    /** 会话状态：导航中 */
+    private const val STATE_ACTIVE = 1
+
+    /** 会话状态：已结束（farewell / 源通知消失），禁止任何影子投递 */
+    private const val STATE_ENDING = 2
+
+    /**
+     * 两次命中间隔超过这个值就认为上一轮导航已结束。
+     *
+     * v3.15.66 起它**降级为辅助判据**：会话边界以状态机（[navState]）为准，
+     * 这里只在「既没收到 cancel、又长时间没有通知刷新」的自愈场景兜底
+     * （例如高德被强杀但影子没撤干净）。
+     */
     private const val SESSION_GAP_MS = 90_000L
 
     /**
-     * 退出导航后的静默窗长度。
+     * 退出态的时间戳（`SystemClock.elapsedRealtime()`）；0 表示从没进过 ENDING。
      *
-     * 真机时间线（v3.15.57 抓到的 bug）：
+     * v3.15.66 起它不再是一个「5 秒静默窗」的起点，而只是 [ENDING_REPOST_GUARD_MS]
+     * （1.5 秒）的基准。旧的 5 秒静默窗把**新一轮导航的首帧**也吞了（真机 14:13:35
+     * 骑行导航的 `hit id=99910003` 直接被 skip），那一趟永远没有分母。
+     *
+     * 历史证据（v3.15.57，为什么需要这个守卫）：
      * ```
      * 57.348  navTts: 导航到此为止啦
      * 57.351  navInject: hit id=99910001      ← 高德退出导航时又重发了一次导航通知
@@ -218,31 +303,15 @@ internal object ArkNavLiveInjector {
      * 57.374  shadow cancelled for com.autonavi.minimap
      * 60.025  liveShadeText '导航到此为止啦'   ← 胶囊又冒出来，常驻不消
      * ```
-     * 也就是说：结束语之后**紧跟着一次通知重发**，那次重发会绕过 endNavForFarewell 的落闸
-     * 重新发一条影子。
-     *
-     * v3.15.60：15_000 → **5_000**。依据就是上面那两行时间戳 —— 重发发生在结束语之后
-     * **3 毫秒**（`57.348` → `57.351`），5 秒绰绰有余；而 15 秒只会放大另一个残留边界：
-     * 「退出后重开导航、首句正好是转向指令（不含出发语）」时胶囊要等窗过期才出现，
-     * 15 秒用户能明显感到「胶囊不出来」，5 秒基本无感。
+     * 结束语之后 **3 毫秒**就有一次重发，1.5 秒的守卫绰绰有余。
      */
-    private const val NAV_ENDING_WINDOW_MS = 5_000L
-
-    /** 进入退出态的时刻（`SystemClock.elapsedRealtime()`）；0 表示不在退出态 */
     private var navEndingAt = 0L
 
-    /** 上一次打 `skip (ending window)` 的时刻（1s 节流，防退出时高频刷新刷屏） */
+    /** 上一次打 `skip (...)` 的时刻（1s 节流，防退出时高频刷新刷屏） */
     private var lastSkipLogAt = 0L
 
-    /** `skip (ending window)` 日志最短间隔 */
+    /** `skip (...)` 日志最短间隔 */
     private const val SKIP_LOG_INTERVAL_MS = 1_000L
-
-    /** 现在是否处于「刚退出导航」的静默窗内 */
-    private fun inEndingWindow(): Boolean = try {
-        navEndingAt != 0L && SystemClock.elapsedRealtime() - navEndingAt < NAV_ENDING_WINDOW_MS
-    } catch (_: Throwable) {
-        false
-    }
 
     /**
      * 上一次从源导航通知里取到的素材。
@@ -278,9 +347,6 @@ internal object ArkNavLiveInjector {
     /** 本趟出发时刻（`elapsedRealtime`），进度条用；0 表示本趟还没出发 */
     private var navStartedAt = 0L
 
-    /** 本趟出发的**墙钟**时刻（`currentTimeMillis`），只用于算「预计到达」兜底 */
-    private var startWallMs = 0L
-
     /** 每趟导航只 dump 一次原通知 extras，用于定位高德把目的地名放在哪个字段 */
     private var extrasDumped = false
 
@@ -315,6 +381,18 @@ internal object ArkNavLiveInjector {
 
     /** 剩余毫秒（v3.15.65 锚点进度）；[UNKNOWN_REMAIN_MS] = 本趟还没有锚点 */
     private var remainMs = UNKNOWN_REMAIN_MS
+
+    /**
+     * **锚点剩余**：在 [anchorAt] 那一刻还剩多少（v3.15.66）。
+     *
+     * 与 [remainMs] 的区别：[anchorRemainMs] 是「定值」，只在播报带来新时长时被改写；
+     * [remainMs] 是它随时间递减的结果，每次投递前由 [refreshAnchor] 重算。
+     *
+     * 为什么不直接用 `navStartedAt` 推（v3.15.65 的做法）：途中重播的「大约需要十七分钟」
+     * 是**剩余**，用「全程 - 已用」根本表达不了它；而锚点式只需要把锚点挪到这一刻、
+     * 锚点剩余改成 17 分钟即可，两个语义各归各位。
+     */
+    private var anchorRemainMs = UNKNOWN_REMAIN_MS
 
     /** [remainMs] 是哪一刻算出来的（`elapsedRealtime`），只用于日志对齐 */
     private var anchorAt = 0L
@@ -457,22 +535,20 @@ internal object ArkNavLiveInjector {
         reason: String,
         notifId: Int?
     ) {
-        // v3.15.58：刚退出导航的静默窗内**一律不发影子**。
-        // 这一步必须在取素材、置 navActive 之前 —— 高德退出导航时会重发一次导航通知，
-        // 那次重发如果照常走完，就会在 SystemUI 撤掉旧影子之后又发出一条新的（见 bug 时间线）。
+        // v3.15.66（R2）：这里只挡「同一次退出之后 1.5 秒内的重投」。
         //
-        // v3.15.59：日志加 1s 节流 —— 真机上高德退出时可能高频刷新同一条通知，
-        // 不节流会把这行刷满 logcat（`log()` 本身没有节流，`probe()` 才有）。
-        if (inEndingWindow()) {
-            try {
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastSkipLogAt >= SKIP_LOG_INTERVAL_MS) {
-                    lastSkipLogAt = now
-                    log("skip (ending window)")
+        // 旧实现是 5 秒静默窗一刀切，真机上把 14:13:35 那次**骑行导航的新首帧**也吞了
+        // （`skip (ending window)`），那一趟永远没有分母。现在窗缩到 1.5 秒：
+        // 结束语后 3ms 的那次重发照样挡住，超过 1.5 秒的命中一律按**新会话**处理。
+        if (navState == STATE_ENDING) {
+            val now0 = SystemClock.elapsedRealtime()
+            if (now0 - navEndingAt < ENDING_REPOST_GUARD_MS) {
+                if (now0 - lastSkipLogAt >= SKIP_LOG_INTERVAL_MS) {
+                    lastSkipLogAt = now0
+                    log("skip (ending repost guard)")
                 }
-            } catch (_: Throwable) {
+                return
             }
-            return
         }
 
         val resolved = resolveNm(nmAny)
@@ -546,14 +622,12 @@ internal object ArkNavLiveInjector {
 
         // v3.15.62：目的地名既不在播报里（真机日志的出发播报只有
         // `全程…大约需要…预计…到达`，从没出现 POI 名），也不在通知的 title/text
-        // （固定「高德地图 / 正在导航」）。所以这里两手准备：
-        //  ① 每趟导航 dump 一次原通知全部 extras，供下一轮日志取证定位真实字段；
-        //  ② 同时按「像地名」的字段即时兜底，能抓到就当场显示。
-        dumpNavExtras(extras, src)
-        if (destText.isEmpty()) guessDest(extras, src)?.let { destText = it }
-        // v3.15.65：文案网兜底（播报 → guessDest → 文案网）。这里**只取值不写** ——
-        // 下面的会话复位会把 destText 连同候选池一起清掉，写在这里会被同一帧的 reset 抹掉；
-        // 真正落值放在复位之后（见 `lastHitAt = now` 那一段）。
+        // （固定「高德地图 / 正在导航」）。
+        // v3.15.62 / v3.15.65 / v3.15.66：目的地共两条来源，且**都要在会话复位之后落值**：
+        //  ① 通知 extras 里「像地名」的字段（`guessDest`，见复位之后）；
+        //  ② 文案网里的 `终点，XXX`（v3.15.65，见 §9）。
+        // 这里**只取快照、不落值** —— 下面的 beginSession 会把 destText 连同候选池一起清掉，
+        // 写在这里会被同一帧的 reset 抹掉；真正落值放在复位之后（见 `lastHitAt = now` 那一段）。
         val textDestThisTrip = synchronized(destPoolLock) { destFromText }
 
         if (title.isNullOrBlank()) {
@@ -576,43 +650,48 @@ internal object ArkNavLiveInjector {
             return
         }
 
-        // ---- 决定这一帧胶囊写什么
+        // ---- 会话边界（v3.15.66）
         //
-        // 高德在导航中会**频繁刷新**这条通知（剩余距离 / ETA 每秒级），每次都进到这里。
-        // 如果这里一律用 `title · text`（占位文案「高德地图 · 正在导航」），
-        // 那么刚由语音播报写进胶囊的真实指令会在几十毫秒内被盖回去 —— 用户看到的就是
-        // 胶囊在「前方三百米右转」和「正在导航」之间乱跳。所以：
-        //   * 同一轮导航里已经有播报文案 → 继续沿用播报文案；
-        //   * 新一轮导航（间隔超过 SESSION_GAP_MS）→ 丢掉上一轮的旧指令，回到占位文案。
+        // 状态机优先，时间只做辅助：
+        //  ① 当前不是 ACTIVE（IDLE / ENDING）→ 一定是新会话（首帧 / 结束后重开）；
+        //  ② 已经 ACTIVE，但距上次命中超过 SESSION_GAP_MS → 当新会话（自愈兜底：
+        //     没收到 cancel 也没 farewell，但显然中间断过）。
+        //
+        // 走到这里说明**确实是一条导航通知**（上游 matchReason 已过滤），
+        // 所以「命中」本身就是新会话的最强证据 —— 不再靠 90 秒猜。
+        //
+        // `textDestThisTrip` 在 [beginSession] 之前就取好了快照：beginSession 会清候选池，
+        // 而网里这条（导航前搜索阶段捞到的 `终点，XXX`）恰恰是这一趟最有用的值。
         val now = SystemClock.elapsedRealtime()
-        val sameSession = navActive && (now - lastHitAt) < SESSION_GAP_MS
-        if (!sameSession) {
-            lastNaviText = ""
-            lastShadowSig = ""     // v3.15.65：新一趟 → 载荷指纹一起作废
-            // v3.15.61：新一趟导航 → 上一趟的行程数字必须清掉，否则展开卡会显示上一趟
-            // 的距离 / 耗时 / 到达时刻（数字错得比没有更糟）。
-            //
-            // `lastHitAt != 0L` 是防误清：自愈路径 [selfHealShadow] 不发通知、不更新
-            // lastHitAt，此时若紧跟着来一次真正的 postShadow，不能把刚解析好的数字抹掉。
-            if (lastHitAt != 0L) resetNavPayload()
-        }
+        val newSession = navState != STATE_ACTIVE || (now - lastHitAt) >= SESSION_GAP_MS
+        if (newSession) beginSession(now)
         lastHitAt = now
+        navState = STATE_ACTIVE
+        navActive = true
+
+        // v3.15.62：目的地兜底 —— 通知 extras 里「像地名」的字段（复位之后才写，
+        // 否则会被 beginSession 的 reset 清掉）。
+        dumpNavExtras(extras, src)
+        if (destText.isEmpty()) guessDest(extras, src)?.let { destText = it }
 
         // v3.15.65：文案网兜底落值（顺序：播报解析 → guessDest → 文案网）。
         // 文案网是**最新证据但语义最粗**（只有 `终点，XXX` 这一层），所以放最后；
         // 播报里真出现「前往XX」时仍然优先。
-        //
-        // 位置必须在会话复位之后：复位会清掉 destText 与候选池，若写在 dumpNavExtras 旁边，
-        // 每趟第二帧起就全被抹掉（`lastHitAt != 0` 时复位一定会跑）。
         if (destText.isEmpty()) textDestThisTrip?.let { destText = it }
 
         // v3.15.64：收网 —— 把「导航前文案缓冲」一次性倒进日志。
         //
-        // 位置必须在**上面这段会话复位之后**：复位会把 [textBufDumped] 置回 false，而高德每趟开头
-        // 会连发 2 次导航通知（实测相隔 74ms）。若跟在 dumpNavExtras 后面（复位之前）倒，
-        // 第一次那行会被复位抹掉，第二次再倒一次 → 每趟两行。放在这里 = 每趟恰好一行。
+        // 位置必须在会话复位之后：复位会把 [textBufDumped] 置回 false，而高德每趟开头
+        // 会连发 2 次导航通知（实测相隔 74ms）。若在复位之前倒，第一次那行会被抹掉、
+        // 第二次再倒一次 → 每趟两行。放在这里 = 每趟恰好一行。
         dumpTextBuf()
-        val content = if (sameSession && lastNaviText.isNotEmpty()) {
+
+        // v3.15.66（R3）：投递前必须先把锚点 / 剩余 / ETA 算好。
+        // 旧代码只在播报里算，通知路径直接拿旧值投递，于是出现「ETA 有值而 remain=-1」
+        // 这种自相矛盾的载荷（真机 14:15:07 三栏全 `--` 就是它）。
+        syncTripView()
+
+        val content = if (!newSession && lastNaviText.isNotEmpty()) {
             lastNaviText
         } else {
             if (text.isNullOrBlank()) title else "$title · $text"
@@ -645,10 +724,9 @@ internal object ArkNavLiveInjector {
 
         // 导航在跑 —— 从此语音播报可以实时改写胶囊文案。
         // **不能**在这里清 lastNaviText：导航中通知是秒级刷新的，清了就等于
-        // 每次刷新都把刚写的指令抹掉（清旧文案的判断在 sameSession 那几行里）。
+        // 每次刷新都把刚写的指令抹掉（清旧文案的判断在 newSession 那几行里）。
         navActive = true
-        // 新一轮导航开始了 → 解除退出静默窗。
-        // 静默窗判断在函数最开头，所以窗口期内走不到这里，两者不会互相打架。
+        navState = STATE_ACTIVE
         navEndingAt = 0L
         log(
             "shadow posted tag=$NAV_SHADOW_TAG capsuleType=1 content='$content' " +
@@ -748,20 +826,21 @@ internal object ArkNavLiveInjector {
             val instrPair = splitInstruction(content)
             se.putString(ArkConstants.NAV_KEY_INSTR, instrPair.first)
             se.putString(ArkConstants.NAV_KEY_SUB, instrPair.second)
-            se.putString(ArkConstants.NAV_KEY_DEST, destText)
-            se.putString(ArkConstants.NAV_KEY_DIST, totalDistValue)
-            se.putString(ArkConstants.NAV_KEY_DIST_UNIT, totalDistUnit)
-            // v3.15.65：「耗时」栏改成**剩余**耗时（分钟），不再是出发那一刻的全程总耗时。
-            // 拿不到锚点时退回播报里的全程值（总比 `--` 强，且此时进度条也不画球）。
+            // v3.15.66：目的地 / 距离 / 耗时都带「上一趟兜底」（详见 destTextForPayload 等）
+            se.putString(ArkConstants.NAV_KEY_DEST, destTextForPayload())
+            val distPair = distPair()
+            se.putString(ArkConstants.NAV_KEY_DIST, distPair.first)
+            se.putString(ArkConstants.NAV_KEY_DIST_UNIT, distPair.second)
+            // v3.15.65：「耗时」栏是**剩余**耗时（分钟），不再是出发那一刻的全程总耗时。
             val remainPair = remainTimePair()
             se.putString(ArkConstants.NAV_KEY_TIME, remainPair.first)
             se.putString(ArkConstants.NAV_KEY_TIME_UNIT, remainPair.second)
             se.putString(ArkConstants.NAV_KEY_ETA, etaText)
             se.putLong(ArkConstants.NAV_KEY_STARTED, navStartedAt)
-            // 分母：出发帧钉死的那份全程（[totalMs] 途中会被重播改写成「剩余」）
+            // 分母：本趟钉死的全程；本趟没有就用上一趟的（否则进度条整个不画球）
             se.putLong(
                 ArkConstants.NAV_KEY_TOTAL_MS,
-                if (tripTotalMs > 0L) tripTotalMs else totalMs
+                if (tripTotalMs > 0L) tripTotalMs else lastTripTotalMs
             )
             // v3.15.65：锚点进度 —— 面板只按这个数画，两帧之间**不许自己走**
             se.putLong(ArkConstants.NAV_KEY_REMAIN_MS, remainMs)
@@ -796,11 +875,13 @@ internal object ArkNavLiveInjector {
      * ```
      *
      * 取候选串的顺序：
+     *  0. （v3.15.66）先看整段是不是**出发播报** → 是且当前不在 ACTIVE → [beginSession]
+     *     **先建会话再解析**，否则刚解析到的「全程X公里」会被 reset 抹掉；
      *  1. `groupData` 是这一轮播报的分句数组 → 取**最后一个非空元素**（它才是此刻要播的）；
      *  2. 第一个候选没过筛（纯数字 / 噪音 / 空）→ 退回 `data` 再试一次
      *     （真机上两者不是同一句：`data` 是单句、`groupData` 是整段队列）；
-     *  3. 中途命中**结束语**（[END_PHRASES]）→ 立刻把 `navActive` 关掉再返回 null ——
-     *     导航结束了，后面的播报不许再复活胶囊；
+     *  3. 中途命中**结束语**（[END_PHRASES]）→ [endNavForFarewell] 进 ENDING 再返回 null ——
+     *     导航结束了，后面的播报（含告别语本身）不许再被投成正文；
      *  4. 都不过 → 返回 null，胶囊保持上一句有效指令。
      *
      * 文本选取在 [pickCapsuleText]（纯函数），结束语的副作用只在这里做 ——
@@ -821,17 +902,26 @@ internal object ArkNavLiveInjector {
             null
         }
 
+        val full = fullTextOf(group) ?: data
+
+        // v3.15.66（R2/C）：**出发播报是新会话的铁证，且一辈子只有一次**。
+        // 必须放在解析之前：
+        //  ① 先建会话再解析 —— 否则刚解析出来的「全程X公里 / 大约需要X分钟」
+        //     会被 beginSession 的 reset 清掉（顺序反了就是一整趟三栏全 `--`）；
+        //  ② 不再受任何静默窗 / 守卫约束 —— 旧实现里 5 秒静默窗把 14:13:35 那次
+        //     骑行导航的出发播报一起吞了，那一趟永远没有分母。
+        if (full != null && isDeparture(full) && navState != STATE_ACTIVE) {
+            beginSession(SystemClock.elapsedRealtime())
+            log("session begin (departure tts)")
+        }
+
         // v3.15.61：展开卡的行程数字（全程距离 / 总耗时 / 预计到达）只在播报里有，
         // 而且散落在**中间**几段（`准备出发,,全程八公里,大约需要二十七分钟,…`），
         // 只看最后一句永远抓不到 —— 所以先整段解析一遍，再挑胶囊文案。
-        captureTotals(group, data)
+        captureTotals(full)
 
         for (candidate in listOfNotNull(lastSentenceOf(group), data)) {
-            // v3.15.59：**出发类短语**才解静默窗（不再用「任意有效指令」，见 isDeparture 注释）
-            if (isDeparture(candidate) && inEndingWindow()) {
-                navEndingAt = 0L
-                log("ending window cleared (departure)")
-            }
+            // v3.15.66：命中结束语 → 会话进 ENDING（不许再投递任何影子，见 enterEnding）
             if (isFarewell(candidate)) {
                 endNavForFarewell()
                 return null
@@ -880,32 +970,99 @@ internal object ArkNavLiveInjector {
      * 屏幕上就冒出一个没有意义的胶囊。所以这里主动落闸。
      */
     private fun endNavForFarewell() {
+        enterEnding("farewell")
+    }
+
+    /**
+     * 进入 ENDING 态（v3.15.66）。
+     *
+     * 三件事，缺一件就会复发旧 bug：
+     *  1. 状态置 ENDING —— 之后 `updateShadowContent` / `selfHealShadow` 一律直接返回，
+     *     告别语再也不许当正文投出去（R5）；
+     *  2. 把本趟结论搬进跨趟兜底（[stashLastTrip]）—— 下一次会话靠它补三栏与目的地（R1）；
+     *  3. 主动撤掉影子 —— 不撤的话高德重发通知又会让我们发一条新的（v3.15.57 胶囊常驻的直接原因）。
+     *
+     * ⚠ **不在这里 `resetNavPayload()`**：一 reset 就把「兜底值」的来源清空了。
+     * 本趟的值留到下一次 [beginSession] 里再清（那时已经 stash 完毕）。
+     *
+     * @param reason 进 ENDING 的原因（写日志用：`farewell` / `source gone` / `cancel`）
+     */
+    private fun enterEnding(reason: String) {
         try {
-            // ① 先开静默窗。**必须在 navActive 判断之前**：哪怕这条结束语来的时候
-            //    navActive 已经是 false，也要挡住随后高德重发通知那一下
-            //    （真机：结束语 348ms 后就有一次 navInject: hit）。
-            navEndingAt = SystemClock.elapsedRealtime()
-
-            val wasActive = navActive
+            val was = navState
+            if (was == STATE_ENDING) return          // 幂等：同一次结束只处理一次
+            navState = STATE_ENDING
             navActive = false
+            // 守卫时间戳：挡「结束语后 3ms 的那次重发」，见 ENDING_REPOST_GUARD_MS
+            navEndingAt = SystemClock.elapsedRealtime()
             lastNaviText = ""
-            // v3.15.61：影子马上被 cancel，展开卡的载荷也一起作废（否则下一次导航
-            // 复用同一张卡时会带回这一趟的数字）。
-            resetNavPayload()
+            lastShadowSig = ""
+            stashLastTrip()
+            cancelShadowQuietly()
+            log("session ending ($reason) was=$was")
+        } catch (_: Throwable) {
+        }
+    }
 
-            // ② 主动撤掉自己的影子。不撤的话，SystemUI 撤一次之后
-            //    高德重发通知又会让我们发一条新的（v3.15.57 胶囊常驻不消的直接原因）。
+    /**
+     * 开一趟新会话（v3.15.66）。
+     *
+     * 顺序是硬要求：**先 stash、再 reset**（否则上一趟的结论先被清掉，兜底就空了）。
+     *
+     * `navStartedAt` 重置为**此刻**：新会话的进度必须从 0 开始，而不是接着上一趟的
+     * 百分比往下走（上一趟的 `navStartedAt` 早于这一趟起点，沿用会让剩余直接变负）。
+     */
+    private fun beginSession(now: Long) {
+        try {
+            stashLastTrip()
+            resetNavPayload()
+            navStartedAt = now
+            navState = STATE_ACTIVE
+            navActive = true
+            navEndingAt = 0L
+            log(
+                "session begin (new) fallbackTotal=${lastTripTotalMs / 60_000}min " +
+                    "fallbackDest='$lastDest'"
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 把本趟的结论搬进跨趟兜底字段（v3.15.66）。
+     *
+     * **只搬非空值** —— 这样它可以被反复调用（[beginSession] 与 [enterEnding] 都调），
+     * 后一次调用不会用「本趟已被清空的值」把好不容易攒下的兜底覆盖掉。
+     */
+    private fun stashLastTrip() {
+        try {
+            if (tripTotalMs > 0L) lastTripTotalMs = tripTotalMs
+            if (totalDistValue.isNotEmpty()) {
+                lastDistValue = totalDistValue
+                lastDistUnit = totalDistUnit
+            }
+            if (destText.isNotEmpty()) lastDest = destText
+            if (totalTimeValue.isNotEmpty()) {
+                lastTimeValue = totalTimeValue
+                lastTimeUnit = totalTimeUnit
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 撤掉自己的影子通知（拿不到 NotificationManager 就静默放弃） */
+    private fun cancelShadowQuietly() {
+        try {
             val nm = lastNm
                 ?: (appContext()?.getSystemService(Context.NOTIFICATION_SERVICE)
                     as? NotificationManager)
             if (nm == null) {
-                log("nav ended (farewell, no nm)")
+                log("nav shadow cancel skipped (no nm)")
                 return
             }
             nm.cancel(NAV_SHADOW_TAG, NAV_SHADOW_ID)
-            log(if (wasActive) "nav ended (farewell, shadow cancelled)" else "nav ended (farewell)")
         } catch (t: Throwable) {
-            log("nav ended (farewell, cancel failed: ${t.message})")
+            log("nav shadow cancel failed: ${t.message}")
         }
     }
 
@@ -1472,22 +1629,27 @@ internal object ArkNavLiveInjector {
         }
 
         // v3.15.62：高德**不是每趟都播**「预计X点X分到达」（真机日志里
-        // `全程九公里,大约需要三十三分钟,` 就整句没有 ETA）。播报里拿不到时，
-        // 用「出发墙钟 + 总耗时」自己算一个，别让第三栏一直显示 `--`。
-        computeEtaFallback()
+        // `全程九公里,大约需要三十三分钟,` 就整句没有 ETA）。播报里拿不到时兜底算一个。
+        //
+        // v3.15.66：兜底调用**挪到 [syncTripView]**，紧跟锚点更新之后。
+        // 原来写在这里的话，用的是**上一帧**的 remainMs（这一帧的锚点还没落），
+        // 于是日志里会出现 `eta fallback = '14:48' (remain=-1ms)` 这种自相矛盾的行
+        // （真机 14:13:10 就是这么来的）。解析函数只解析，算值的事交给收口函数。
     }
 
     /**
      * 「预计到达」兜底：此刻墙钟 + 剩余时长。
      *
-     * v3.15.65 起**每帧都重算**（返回值直接覆盖 [etaText]），这是「实时 ETA」的关键：
+     * v3.15.65 起**每帧都重算**（直接覆盖 [etaText]），这是「实时 ETA」的关键：
      * 高德只在**出发**那一句里报一次到达时刻，之后再播「大约需要十七分钟」时
      * 到达时刻其实没变 —— 拿 `此刻 + 剩余` 反复算，得到的正是那个钉住的时刻，
      * 而 `剩余` 越来越小、`此刻` 越来越大，两者抵消。
      *
-     * 两级口径（优先用更准的那级）：
-     *  1. [remainMs] > 0 → `此刻 + 剩余`（锚点值，随播报刷新）；
-     *  2. 没有锚点 → `出发墙钟 + 全程`（出发那一刻的粗算，只在第一帧用得上）。
+     * **只有一级口径**（v3.15.66 收窄）：[remainMs] >= 0 → `此刻 + 剩余`；
+     * 算不出剩余就把 ETA **清空**，绝不允许「ETA 有值而 remainMs = -1」这种
+     * 自相矛盾的载荷（真机 14:15:07 三栏全 `--` 时日志里却是
+     * `eta fallback = '14:51' (remain=-1ms)`）。旧实现还有一级
+     * `出发墙钟 + 全程` 兜底，它就是这种矛盾载荷的来源，已删。
      *
      * **播报明确给过到达时刻（[etaExplicit]）就一律不碰** —— 那是高德自己的判断。
      *
@@ -1496,11 +1658,19 @@ internal object ArkNavLiveInjector {
     private fun computeEtaFallback() {
         if (etaExplicit) return
         try {
-            val arrival = when {
-                remainMs > 0L -> System.currentTimeMillis() + remainMs
-                totalMs > 0L && startWallMs > 0L -> startWallMs + totalMs
-                else -> return
+            // v3.15.66（R3）：**剩余都没有，就不许有 ETA**。
+            // 旧实现在 totalMs>0 时还能用「出发墙钟 + 全程」硬算一个 ETA，于是载荷里
+            // 出现「etaText 有值、remainMs = -1」的自相矛盾组合（真机 14:15:07）。
+            // 现在只有一种来源：锚点剩余。算不出来就把 ETA 清空，让三栏一起显示 `--`，
+            // 至少语义是一致的。
+            if (remainMs < 0L) {
+                if (etaText.isNotEmpty()) {
+                    etaText = ""
+                    log("eta cleared (no anchor)")
+                }
+                return
             }
+            val arrival = System.currentTimeMillis() + remainMs
             val text = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(arrival))
             if (text == etaText) return          // 值没变就别刷日志（每帧都会走到这里）
             etaText = text
@@ -1528,15 +1698,39 @@ internal object ArkNavLiveInjector {
             val minutes = (rm + 59_999L) / 60_000L
             return minutes.toString() to "分钟"
         }
-        return totalTimeValue to totalTimeUnit
+        // v3.15.66：没有锚点时按「本趟解析值 → 上一趟兜底」退，别直接 `--`
+        if (totalTimeValue.isNotEmpty()) return totalTimeValue to totalTimeUnit
+        if (lastTimeValue.isNotEmpty()) return lastTimeValue to lastTimeUnit
+        // 两级都空 → 返回空对，面板显示 `--`（此时进度条本来也不画球）
+        return "" to ""
     }
 
     /**
-     * 影子通知「整份载荷」的指纹（v3.15.65）。
+     * 「总里程」的值 + 单位（v3.15.66 起带跨趟兜底）。
+     *
+     * 高德重开同一路线时不重播「全程X公里」，没有这一级兜底第二栏就会空着。
+     * 本趟解析到就用本趟的，绝不拿上一趟盖掉本趟。
+     */
+    private fun distPair(): Pair<String, String> = when {
+        totalDistValue.isNotEmpty() -> totalDistValue to totalDistUnit
+        lastDistValue.isNotEmpty() -> lastDistValue to lastDistUnit
+        else -> totalDistValue to totalDistUnit
+    }
+
+    /** 目的地（v3.15.66 起带跨趟兜底）：本趟 > 上一趟 > 空（面板回落「高德地图」） */
+    private fun destTextForPayload(): String =
+        if (destText.isNotEmpty()) destText else lastDest
+
+    /**
+     * 影子通知「整份载荷」的指纹（v3.15.65，v3.15.66 与载荷字段对齐）。
      *
      * 只取**会写进影子**且**用户看得见**的字段：胶囊文案 + 展开卡的 6 个数值/文案。
      * 用来判断这一帧要不要重投影子（[updateShadowContent]）—— 展开卡的锚点进度
      * 全靠「重投 → SystemUI 广播 → 面板」这条链推进，漏一个字段就是「数字永远不动」。
+     *
+     * ⚠ 必须与 [buildShadow] 写进 extras 的取值**完全同源**（v3.15.66）：
+     * 那边用的是兜底后的 [destTextForPayload] / [distPair] / `tripTotalMs ?: lastTripTotalMs`，
+     * 这里若还取原字段，就会出现「载荷变了但指纹没变」（面板钉在旧值）或反之。
      *
      * 刻意**不含** `anchorAt`：它每帧都变，算进来等于取消去重。
      *
@@ -1544,16 +1738,17 @@ internal object ArkNavLiveInjector {
      * @param remainPair  已经算好的「剩余耗时（值, 单位）」（避免重复计算 / 两次取值不一致）
      */
     private fun shadowSigOf(content: String, remainPair: Pair<String, String>): String = try {
+        val dist = distPair()
         listOf(
             content,
-            destText,
-            totalDistValue,
-            totalDistUnit,
+            destTextForPayload(),
+            dist.first,
+            dist.second,
             remainPair.first,
             remainPair.second,
             etaText,
             totalMs.toString(),
-            tripTotalMs.toString(),
+            (if (tripTotalMs > 0L) tripTotalMs else lastTripTotalMs).toString(),
             remainMs.toString()
         ).joinToString("\u0001")
     } catch (_: Throwable) {
@@ -1561,71 +1756,103 @@ internal object ArkNavLiveInjector {
     }
 
     /**
-     * 收口：每次拿到播报先跑一遍 [parseTotals]，并在**出发类**播报出现时记下出发时刻。
+     * 收口：每次拿到播报先跑一遍 [parseTotals]，再把「这一帧声明的新时长」落成锚点。
      *
-     * 出发时刻用 `elapsedRealtime`（单调时钟，不受用户改系统时间影响），供 [refreshAnchor]
-     * 算剩余；面板**不碰**它（面板只认 [remainMs]，见 [ArkConstants.NAV_KEY_REMAIN_MS]）。
-     *
-     * @param group `AudioPlayerTask.groupData`（JSON 数组字符串）
-     * @param data  `AudioPlayerTask.data`（单句字符串）
+     * @param full 整段播报（`groupData` 拼起来 / 退回 `data`）；null 表示这一帧没有播报
      */
-    private fun captureTotals(group: String?, data: String?) {
+    private fun captureTotals(full: String?) {
         try {
-            val full = fullTextOf(group) ?: data ?: return
+            if (full.isNullOrBlank()) return
             val departureFrame = isDeparture(full)
-            // v3.15.62：出发时刻必须**先于** parseTotals 设置 —— ETA 兜底要用
-            // 「出发墙钟 + 总耗时」，而总耗时就在这一帧才被解析出来。
+            // v3.15.62：出发时刻必须先于 parseTotals 设置 —— ETA 兜底要用它。
+            // v3.15.66：会话开始（[beginSession]）已经写过 navStartedAt，这里只补「漏网的首帧」。
             if (navStartedAt == 0L && departureFrame) {
                 navStartedAt = SystemClock.elapsedRealtime()
-                startWallMs = System.currentTimeMillis()
             }
             val beforeTotal = totalMs
-            parseTotals(full)          // 内含一次 computeEtaFallback（口径见该函数注释）
+            parseTotals(full)          // 纯解析：只写 totalDist* / totalTime* / totalMs / etaText
             if (destText.isEmpty()) parseDest(full)?.let { destText = it }
-            // v3.15.65：锚点重算要放在 parseTotals 之后 —— 它要用这一帧刚解析出来的时长。
-            refreshAnchor(departureFrame, totalMs != beforeTotal)
-            // remainMs 刚更新过，再算一次 ETA 才是「实时」的（parseTotals 里那次用的是上一帧的剩余）
-            computeEtaFallback()
+            // v3.15.65/v3.15.66：这一帧若带来了**新的时长**，它就是一次剩余值刷新
+            applyAnchorFromDuration(departureFrame, totalMs != beforeTotal)
+            // 锚点刚更新过，必须重算剩余 / ETA 才是「实时」的（v3.15.66：唯一收口点）
+            syncTripView()
         } catch (_: Throwable) {
         }
     }
 
     /**
-     * 锚点进度重算（v3.15.65）。
+     * 把「这一帧声明的时长」落成锚点（v3.15.66）。
      *
-     * 核心口径：**分母不动，只动剩余**。每次播报调一次，算出来的 [remainMs] 就是面板要画的
-     * 唯一依据 —— 面板两帧之间不会自己往前走（v3.15.64 及以前是「面板每秒自己加上去」，
-     * 于是「进度在跑、剩余耗时不动」，两套口径必然对不上）。
+     * 两种情况语义完全不同，混在一起就是 v3.15.65 的隐患：
+     *  1. **出发帧 / 本趟还没定过分母**：`大约需要 X` = **全程** → 钉死分母 [tripTotalMs]；
+     *  2. **途中重播了新时长**（改道 / 重新规划）：`大约需要 X` = **剩余** → 直接当剩余，
+     *     绝不能当新分母（否则已用 10 分钟 / 新分母 17 分钟 → 58% 的假进度）。
      *
-     * 三个分支：
-     *  1. **出发帧 / 本趟还没定过分母**：这一帧的「大约需要 X」就是全程 → 钉死分母 [tripTotalMs]，
-     *     剩余 = 全程 - 已用（首帧已用通常只有几十毫秒）；
-     *  2. **途中重播了新时长**（改道 / 重新规划）：新值本身是**剩余**，绝不能当新分母，
-     *     否则分母被改小、进度球倒着跑；
-     *  3. **重复播报同样的数字**：按 `全程 - 已用` 推一遍即可。
+     * 重复播报同一个数字（`totalChanged == false`）时**不动锚点** —— 让剩余自然往下走，
+     * 不然后一次播报会把剩余「回拨」到同一个值，进度条看起来在抖。
      *
      * @param departureFrame 这一帧是不是「准备出发 / 开始导航 / 全程…」这类出发播报
-     * @param totalChanged   parseTotals 是否改写了 [totalMs]
+     * @param totalChanged   [parseTotals] 是否改写了 [totalMs]
      */
-    private fun refreshAnchor(departureFrame: Boolean, totalChanged: Boolean) {
+    private fun applyAnchorFromDuration(departureFrame: Boolean, totalChanged: Boolean) {
         try {
-            if (navStartedAt <= 0L || totalMs <= 0L) return
+            if (!totalChanged || totalMs <= 0L) return
             val now = SystemClock.elapsedRealtime()
-            val elapsed = (now - navStartedAt).coerceAtLeast(0L)
-            when {
-                departureFrame || tripTotalMs <= 0L -> {
-                    tripTotalMs = totalMs
-                    remainMs = (tripTotalMs - elapsed).coerceAtLeast(0L)
-                }
-                totalChanged -> {
-                    // 途中播报的时长 = 剩余时长（不是新全程）
-                    remainMs = totalMs.coerceAtLeast(0L)
-                }
-                else -> {
-                    remainMs = (tripTotalMs - elapsed).coerceAtLeast(0L)
-                }
+            if (departureFrame || tripTotalMs <= 0L) {
+                tripTotalMs = totalMs
+                anchorRemainMs = totalMs
+            } else {
+                // 途中：高德报的是「还需要 X」，分母不动
+                anchorRemainMs = totalMs.coerceAtLeast(0L)
             }
             anchorAt = now
+            remainMs = anchorRemainMs.coerceAtLeast(0L)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * 投递前的统一收口（v3.15.66）：锚点 / 剩余 / ETA 三件套一次算完。
+     *
+     * **每一次 `publishShadow` / `nm.notify` 之前都必须先调它**。
+     * 旧代码只在播报路径上算锚点，通知路径直接拿旧值投递，于是真机 14:15:07 出现了
+     * `eta fallback`（说明有总耗时）却 `remain=-1` 的自相矛盾载荷 → 三栏全 `--`。
+     */
+    private fun syncTripView() {
+        refreshAnchor()
+        computeEtaFallback()
+    }
+
+    /**
+     * 锚点 → 剩余（v3.15.65 起，v3.15.66 改为「锚点式递减」）。
+     *
+     * 核心口径：**锚点定一次，剩余随时间递减**；每次播报只是把锚点往前挪（并重置锚点剩余）。
+     * 面板两帧之间永远不会自己走（只认 [remainMs]）。
+     *
+     * 分母的取值顺序（v3.15.66 新增第二级）：
+     *  1. 本趟已解析到的 [tripTotalMs]；
+     *  2. **上一趟的** [lastTripTotalMs] —— 高德重开同一路线时**不重播全程**，
+     *     没有这一级就会整趟三栏 `--`；
+     *  3. 都没有 → 剩余无意义（[UNKNOWN_REMAIN_MS]），面板只画轨不画球。
+     *
+     * 边界：剩余到 0 就停在 0（进度满格），不回绕、不变负。
+     */
+    private fun refreshAnchor() {
+        try {
+            val now = SystemClock.elapsedRealtime()
+            if (anchorRemainMs < 0L) {
+                val total = if (tripTotalMs > 0L) tripTotalMs else lastTripTotalMs
+                if (total <= 0L) {
+                    remainMs = UNKNOWN_REMAIN_MS
+                    anchorAt = 0L
+                    return
+                }
+                // 新会话刚开始 / 还没收到任何时长播报：以「全程」为锚点剩余，进度天然是 0
+                anchorRemainMs = total
+                anchorAt = now
+            }
+            if (anchorAt <= 0L) anchorAt = now
+            remainMs = (anchorRemainMs - (now - anchorAt)).coerceAtLeast(0L)
         } catch (_: Throwable) {
         }
     }
@@ -1723,7 +1950,6 @@ internal object ArkNavLiveInjector {
      */
     private fun resetNavPayload() {
         navStartedAt = 0L
-        startWallMs = 0L
         totalDistValue = ""
         totalDistUnit = "公里"
         totalTimeValue = ""
@@ -1736,8 +1962,15 @@ internal object ArkNavLiveInjector {
         // remainMs 回哨兵（不是 0）—— 0 是合法的「刚好到达」，面板会画满格。
         tripTotalMs = 0L
         remainMs = UNKNOWN_REMAIN_MS
+        // v3.15.66：锚点剩余也要归零，否则下一趟会拿着上一趟的锚点继续往下走
+        // （表现是「刚点开始导航，剩余就已经少了 20 分钟」）
+        anchorRemainMs = UNKNOWN_REMAIN_MS
         anchorAt = 0L
         etaExplicit = false
+        // ⚠ v3.15.66：**不清 [lastTripTotalMs] / [lastDistValue] / [lastDest] / [lastTime*]**。
+        // 它们是「上一趟的兜底值」，高德重开同一路线时不重播全程，全靠它们补三栏与目的地；
+        // 在这里清掉 = 新一趟永远 `--`（这正是 v3.15.65 用户看到的 bug）。
+        // 它们的唯一写入点是 [stashLastTrip]，只搬非空值，不会被这一趟的空值污染。
         // v3.15.65：载荷指纹也要清 —— 下一趟第一帧的载荷可能和上一趟末帧「看起来一样」
         // （同一条路、同一个剩余），不清就会被误判成重复而漏投，胶囊整趟不更新
         lastShadowSig = ""
@@ -1788,8 +2021,13 @@ internal object ArkNavLiveInjector {
      */
     private fun updateShadowContent(content: String) {
         try {
-            // 刚退出导航：这条播报可能是退出时残留的尾巴，不许刷胶囊
-            if (inEndingWindow()) return
+            // v3.15.66（R5/E）：**ENDING 之后任何播报都不许再把影子投出去**。
+            // 真机 14:16:01 的 `content='旅程到这里就结…'` 就是从这里漏出去的 ——
+            // 告别语被当成正文写进胶囊，退出后还常驻。状态机现在是硬闸。
+            if (navState == STATE_ENDING) {
+                log("skip (session ending)")
+                return
+            }
             if (!navActive) {
                 selfHealShadow(content)
                 return
@@ -1798,6 +2036,10 @@ internal object ArkNavLiveInjector {
             // 高德连续播同一句时文案不变、但剩余耗时 / ETA 一直在变，而展开卡的锚点进度
             // 完全靠「影子重新投递 → SystemUI 广播 → 面板」这条链推动；
             // 只看文案的话面板会整趟钉死在第一次点开的那一刻。
+            //
+            // v3.15.66：算指纹**之前**先同步锚点 / ETA —— 指纹里含 remainMs，
+            // 不同步就会用上一帧的剩余做去重依据，该重投的可能被误判成重复。
+            syncTripView()
             val remainPair = remainTimePair()
             val sig = shadowSigOf(content, remainPair)
             if (sig == lastShadowSig) return
@@ -1806,10 +2048,8 @@ internal object ArkNavLiveInjector {
                     as? NotificationManager)
                 ?: return
             if (!navNotificationAlive(nm)) {
-                navActive = false
-                lastNaviText = ""
-                lastShadowSig = ""
-                log("nav ended (source notification gone), stop updating capsule")
+                // 源导航通知已经没了 = 会话结束（R4 在高德进程侧的落点）
+                enterEnding("source gone")
                 return
             }
             val shadow = buildShadow(content) ?: return
@@ -1838,6 +2078,11 @@ internal object ArkNavLiveInjector {
      */
     private fun selfHealShadow(content: String) {
         try {
+            // v3.15.66：自愈**也不许**在 ENDING 里复活胶囊（否则告别语会借自愈这条路漏出去）
+            if (navState == STATE_ENDING) {
+                log("self-heal skipped (session ending)")
+                return
+            }
             val ctx = lastCtx ?: appContext()
             if (ctx == null) {
                 log("self-heal skipped (no context)")
@@ -1869,6 +2114,15 @@ internal object ArkNavLiveInjector {
                 return
             }
 
+            // v3.15.66：自愈说明「胶囊该在却没有」，那就是一趟新会话（状态机还没进 ACTIVE）。
+            // 先建会话再投递：重置本趟、锚点归零，进度才从 0 开始。
+            if (navState != STATE_ACTIVE) {
+                beginSession(SystemClock.elapsedRealtime())
+                log("session begin (self-heal)")
+            }
+            // 投递前同步锚点 / 剩余 / ETA（R3）
+            syncTripView()
+
             ensureChannel(nm)
             val shadow = buildShadow(content, requireLargeIcon = false)
             if (shadow == null) {
@@ -1878,10 +2132,12 @@ internal object ArkNavLiveInjector {
             if (!publishShadow(nm, shadow)) return
 
             navActive = true
+            navState = STATE_ACTIVE
             lastNaviText = content
             // v3.15.65：自愈发出的这一帧同样是「上次投递过的载荷」（否则下一条播报会重投）
             lastShadowSig = shadowSigOf(content, remainTimePair())
             navEndingAt = 0L
+            lastHitAt = SystemClock.elapsedRealtime()
             log("self-heal shadow posted content='$content' hasIcon=${lastNaviIcon != null}")
         } catch (t: Throwable) {
             log("self-heal failed: ${t.message}")
@@ -1937,9 +2193,8 @@ internal object ArkNavLiveInjector {
      * （ContentProvider / 广播）可以从这里接。
      */
     internal fun onNavEnded() {
-        navActive = false
-        lastNaviText = ""
-        resetNavPayload()
+        // v3.15.66：走统一出口（幂等）。注意这里**不 reset**，本趟的值要留作跨趟兜底。
+        enterEnding("shadow cancelled")
     }
 
     private fun log(msg: String) {
@@ -2473,8 +2728,9 @@ internal object ArkNavLiveInjector {
     //
     // 时间口径：日志里的秒数是「这条文案多少秒前被看到的」，**恒为正**（`now - atMs`，
     // `elapsedRealtime` 单调递增），越小越接近导航开始那一刻，`0.0s` 就是启动瞬间的文案。
-    // **不要想改成「负号 = 导航前」**：那得拿 `navStartedAt` 当基准，而它只在 `captureTotals()`
-    // 收到出发播报时才置位 —— 首帧 dump 时它还是 0，会打出 `-1.4e9s` 这种垃圾数字。
+    // **不要想改成「负号 = 导航前」**：那得拿 `navStartedAt` 当基准，而它要到
+    // `beginSession()`（v3.15.66 起）/ 出发播报才置位 —— 首帧 dump 时它可能还是 0，
+    // 会打出 `-1.4e9s` 这种垃圾数字。
 
     /** 一条文案命中：什么时候看到的（elapsedRealtime）、文本是什么 */
     private data class TextHit(val atMs: Long, val text: String)

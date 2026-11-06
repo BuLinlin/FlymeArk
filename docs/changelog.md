@@ -2,6 +2,110 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.66 会话状态机重写（结束 / 重开 / 实况销毁）
+
+用户复现了一条完整的错误链，三个症状（三栏全 `--`、终点丢失、退出后实况不销毁）看起来是三个 bug，
+**根因只有一个：会话生命周期是「猜」出来的**。这版不打补丁，把生命周期重写成显式状态机。
+
+真机日志（v3.15.65，14:13–14:16）：
+
+```
+14:13:09  hit id=99910001 nav=true        → 影子投递（会话 1 开始，驾车）
+14:13:10  eta fallback = '14:48' (remain=-1ms)
+14:13:28  nav ended (farewell, shadow cancelled)
+14:13:28  skip (ending window)            ← 5 秒静默窗开始
+14:13:35  hit id=99910003（骑行）          ← 被静默窗吞掉
+14:14:46  liveShadow shadow cancelled for com.autonavi.minimap
+14:15:07  hit id=99910001 → shadow posted '高德地图 · 正在导航'
+14:15:07  eta fallback = '14:51' (remain=-1ms)   ← 三栏全空
+14:16:01  hit nav=true → shadow posted content='旅程到这里就结…'  ← 告别语当正文
+14:16:01  liveShadow shadow cancelled
+```
+
+### 1. 五个根因（先验证再改，全部成立）
+
+| 编号 | 根因 | 代码位置（v3.15.65） |
+|---|---|---|
+| **R1** | 会话判定靠时间猜：`sameSession = navActive && (now - lastHitAt) < 90s`。90 秒内重开 → 判成同一趟、沿用上一趟残留；超过 90 秒 → `resetNavPayload()` 把 `destText` / `tripTotalMs` / 锚点全清，而高德**重开同一路线不重播「全程X公里」** → 新会话永远拿不到分母和目的地 | `postShadow` 的 `sameSession` |
+| **R2** | 静默窗绑错对象：`navEndingAt` 的 5 秒窗是**会话级**的，退出后 7 秒进来的骑行导航首帧仍被 `skip (ending window)` 吞掉。出发播报一辈子只有一次，吞了就永远没有 `totalMs` | `postShadow` 开头 / `updateShadowContent` 开头 |
+| **R3** | `remain=-1` 与 `etaText` 并存：ETA 兜底在 `parseTotals` 里就跑（那时锚点还没更新），还能用「出发墙钟 + 全程」硬算一个 ETA，于是载荷里出现「有到达时刻、没有剩余」的自相矛盾组合；通知路径更是直接拿旧值投递 | `parseTotals` 尾部 / `buildShadow` |
+| **R4** | 实况（展开卡）不销毁：影子 cancel 有日志，但**没有任何人告诉 `ArkNavPanelActivity` 会话结束了** → 卡片一直浮在桌面 / 多任务上。胶囊侧的 `setLiveNotification` 也没人解除 | `ArkLiveShadowHook` 把导航影子 tag 直接 `return` |
+| **R5** | 告别语漏进正文：`content='旅程到这里就结…'` 被当胶囊正文投出去。不是「ENDING 之后还在投递」，而是**这一版措辞一个 `END_PHRASES` 词都没命中**（`旅途结束` ≠ `旅程到这里就结束`），于是它走了普通文案路径 | `extractNaviText` 的 farewell 判定 |
+
+> R3 的日志读法提醒：`eta fallback = '14:48' (remain=-1ms)` 里的 `-1` 是**打印时机**造成的
+> （当时 `computeEtaFallback()` 在锚点更新之前跑）。但它暴露的**真实缺陷**是
+> 「ETA 可以脱离剩余独立存在」——这一版把这条通路删掉了。
+
+### 2. 对策：显式状态机（`IDLE` / `ACTIVE` / `ENDING`）
+
+边界来自**源通知的真实生死**，时间只做辅助判据：
+
+| 迁移 | 触发 |
+|---|---|
+| `IDLE → ACTIVE` | 首帧导航通知命中 → 影子投递成功（`beginSession`） |
+| `ACTIVE → ENDING` | farewell 播报 / 源导航通知消失 / 影子被 SystemUI 撤（`enterEnding`） |
+| `ENDING → ACTIVE` | **任意一次导航通知命中**（过了 1.5 秒重投守卫）或**任意一句出发播报** → 立刻视为新会话 |
+| `ACTIVE → ACTIVE` | 会话内的秒级刷新（不改会话） |
+
+- `SESSION_GAP_MS` **降级为辅助判据**：只在「既没 cancel、又长时间没刷新」时兜底判新会话。
+- **静默窗改成 1.5 秒的「重投守卫」**（`ENDING_REPOST_GUARD_MS`）：真机证据是结束语后
+  **3 毫秒**的一次重发（v3.15.57 时间线），1.5 秒足够挡住它；超过 1.5 秒的命中一律当新会话。
+  旧 5 秒窗的副作用（吞掉骑行导航首帧）随之消失。
+- `beginSession()` 的三件事按**固定顺序**：`stashLastTrip()` → `resetNavPayload()` →
+  `navStartedAt = now`（顺序反了就会把刚解析到的数字清掉，或者拿上一趟的起点算剩余）。
+
+### 3. 数据补齐：跨趟兜底值（解决三栏 `--` 与终点丢失）
+
+新会话拿不到本趟数据时，取值链是 **本趟 → 上一趟兜底 → 文案网 → `--`**：
+
+| 字段 | 兜底 | 说明 |
+|---|---|---|
+| 目的地 | `lastDest` | 本趟 `destText` 为空时用它 |
+| 总里程 | `lastDistValue/Unit` | 同上 |
+| 进度分母 | `lastTripTotalMs` | 本趟 `tripTotalMs == 0` 时用它（**不清它**是这版的关键） |
+| 剩余耗时 | `remainMs` | 锚点算出来就一定有值；四个字段一起消失才显示 `--` |
+
+`stashLastTrip()` **只搬非空值**，可以被 `beginSession` 与 `enterEnding` 反复调用而不互相覆盖。
+`resetNavPayload()` 明确**不清**这几个字段（清了新一趟就永远 `--`）。
+
+### 4. 锚点口径收紧：投递前必算，且不许自相矛盾
+
+- 新增 `syncTripView()` = `refreshAnchor()` + `computeEtaFallback()`，
+  **每一次影子投递之前都必须先调它**（`postShadow` / `updateShadowContent` / `selfHealShadow` 三处）。
+- `refreshAnchor()` 改成「锚点式递减」：`remainMs = anchorRemainMs - (now - anchorAt)`。
+  `anchorRemainMs` 只在**播报带来新时长**时改写（`applyAnchorFromDuration`）：
+  出发帧 → 全程并钉死分母；途中 → 直接当剩余（分母不动）。
+- `computeEtaFallback()` **只剩一级口径**：`此刻 + 剩余`。算不出剩余就**把 ETA 清空**
+  （并打一行 `eta cleared (no anchor)`），彻底消灭「有 ETA、无剩余」的矛盾载荷。
+  旧的「出发墙钟 + 全程」兜底已删（`startWallMs` 一并删除）。
+- 重复播报同一个时长数字**不动锚点**，否则剩余会被反复回拨、进度条发抖。
+
+### 5. 结束即收摊（R4 / R5）
+
+- **高德进程**：`ENDING` 之后 `updateShadowContent` / `selfHealShadow` **首行直接返回**，
+  告别语再也没有任何通路被投成正文（`enterEnding` 幂等，重复 farewell 不会重置守卫时间）。
+- **SystemUI 进程**：`ArkLiveShadowHook` 收到**导航影子被移除**时做两件事 ——
+  ① `releaseNavLiveRow()`：对那一行调 `setLiveNotification(false)`，解除 live 标记
+  （只 cancel 通知有时不足以让 Flyme 的实况容器立刻消失）；
+  ② `ArkLiveExpandHook.onNavSessionEnded(pkg)`：向 `com.flymeark` 发
+  `ACTION_NAV_PANEL_UPDATE` + `EXTRA_NAV_ENDED=true`，并把胶囊透明度还原成 1（防止面板
+  没来得及收起时胶囊永久隐形）。
+- **模块进程**：面板收到 `EXTRA_NAV_ENDED` → `onNavSessionEnded()`：先**注销接收器**、
+  再 `dismiss()`（带缩回动画）。`sessionEnded` 去重保证 `dismiss()` 只执行一次
+  （SystemUI 可能因为多次 cancel 连发几条 ENDED）。之后 `applyPayload` 一律拒收。
+
+### 6. 硬约束（**不要动**）
+
+1. `resetNavPayload()` **不清** `textBuf`（v3.15.64 §4）与 **不清** `lastTrip* / lastDest`
+   （v3.15.66 §3）—— 两者都是「跨会话必须活着」的状态。
+2. 面板**不许**引入任何按秒自走的进度逻辑（v3.15.65 §6 仍然有效）。
+3. `beginSession()` 的「先 stash、再 reset、最后写 navStartedAt」顺序不许调换。
+4. `ENDING` 状态下任何代码路径都不许调用 `nm.notify(NAV_SHADOW_TAG, ...)`。
+
+版本 `versionCode 89 / 3.15.66`。
+
+---
+
 ## 2026-11-06 · v3.15.65 目的地落地 + 锚点进度 + 实时 ETA（用户可见行为有变化）
 
 v3.15.64 的文案网立了大功：**目的地在 `contentDescription` 里，且高德自己写好了模板**。
