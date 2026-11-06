@@ -323,6 +323,15 @@ internal object ArkNavLiveInjector {
     /** 交通方式（`drive` / `walk` / `bike` / `bus` / `subway`），空 = 未知。跨趟保留用于比对 */
     private var travelMode = ""
 
+    /**
+     * 本趟是否**已确认换过交通方式**（v3.15.81）。
+     *
+     * 用途：给「转向播报已到但本趟无全程 → 清兜底」这条触发条件上闸。
+     * 没有这道闸，**同一路线重开**（高德刻意不重播「全程…」）会在第一句转向播报时
+     * 就把刚从上一趟 stash 来的兜底清掉 —— R1 兜底功能等于白做。
+     */
+    private var sessionModeChanged = false
+
     /** 高德源通知 extras 已全量 dump 过一次（v3.15.81 一次性诊断） */
     private var srcExtrasDumped = false
 
@@ -1278,6 +1287,8 @@ internal object ArkNavLiveInjector {
             navStartedAt = now
             // v3.15.81：兜底只在新会话开头 15 秒内可信（详见 [fallbackValid]）
             fallbackValidUntil = if (dropFallback) 0L else now + FALLBACK_TTL_MS
+            // v3.15.81：本趟的「换过方式」闸门跟着新会话重置（dropFallback 就是本帧的判定结论）
+            sessionModeChanged = dropFallback
             // v3.15.67：新一趟从蓝色开始 —— 上一趟最后一句若是偏航，不清零就会一出发就红
             navYawed = false
             // v3.15.69：置红时刻一并归零，否则新一趟的「最短保持」会被上一趟的旧时间戳算成已过期
@@ -1398,6 +1409,7 @@ internal object ArkNavLiveInjector {
             (prev.isEmpty() && lastTripTotalMs != 0L)
         travelMode = mode
         if (changed) {
+            sessionModeChanged = true
             clearTripFallback("mode ${prev.ifEmpty { "unknown" }} -> $mode")
             return true
         }
@@ -2145,10 +2157,14 @@ internal object ArkNavLiveInjector {
             if (full.isNullOrBlank()) return
             // v3.15.81：播报里也可能出现「步行导航开始」这类词 —— 与通知侧同一套判定
             noteTravelMode(full)
-            // v3.15.81：**转向播报已到、本趟仍无全程** → 说明这趟不会重播「全程…」，
-            // 上一趟的全程不可信（换交通方式的典型形态），立刻让位，宁可显示 `--`。
-            if (tripTotalMs == 0L && turnCodeOf(full) != ArkConstants.NAV_TURN_STRAIGHT) {
-                clearTripFallback("turn before totals")
+            // v3.15.81：**转向播报已到、本趟仍无全程** → 说明这趟不会重播「全程…」。
+            // 但只在「本趟已确认换过交通方式」时才清：否则同一路线重开（高德同样不重播全程）
+            // 会在第一句转向播报就把上一趟的兜底清掉，R1 兜底功能等于白做。
+            // 没换方式的情况交给 15s TTL 兜住（见 [fallbackValid]）。
+            if (sessionModeChanged && tripTotalMs == 0L &&
+                turnCodeOf(full) != ArkConstants.NAV_TURN_STRAIGHT
+            ) {
+                clearTripFallback("turn before totals (mode changed)")
             }
             val departureFrame = isDeparture(full)
             // v3.15.62：出发时刻必须先于 parseTotals 设置 —— ETA 兜底要用它。
