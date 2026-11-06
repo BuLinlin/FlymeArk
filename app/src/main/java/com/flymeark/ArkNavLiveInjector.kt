@@ -14,6 +14,9 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Modifier
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * v3.15.51：高德地图导航实况胶囊 —— 复用「影子通知」通道。
@@ -260,6 +263,12 @@ internal object ArkNavLiveInjector {
     /** 本趟出发时刻（`elapsedRealtime`），进度条用；0 表示本趟还没出发 */
     private var navStartedAt = 0L
 
+    /** 本趟出发的**墙钟**时刻（`currentTimeMillis`），只用于算「预计到达」兜底 */
+    private var startWallMs = 0L
+
+    /** 每趟导航只 dump 一次原通知 extras，用于定位高德把目的地名放在哪个字段 */
+    private var extrasDumped = false
+
     /** 全程距离数值：`"8"` / `"133"` / `"800"`（单位另存，面板负责加粗数值 / 弱化单位） */
     private var totalDistValue = ""
 
@@ -481,6 +490,14 @@ internal object ArkNavLiveInjector {
             "src title='${title ?: ""}' text='${text ?: ""}' largeIcon=$iconSrc " +
                 "reason=$reason id=${notifId ?: "-"}"
         )
+
+        // v3.15.62：目的地名既不在播报里（真机日志的出发播报只有
+        // `全程…大约需要…预计…到达`，从没出现 POI 名），也不在通知的 title/text
+        // （固定「高德地图 / 正在导航」）。所以这里两手准备：
+        //  ① 每趟导航 dump 一次原通知全部 extras，供下一轮日志取证定位真实字段；
+        //  ② 同时按「像地名」的字段即时兜底，能抓到就当场显示。
+        dumpNavExtras(extras, src)
+        if (destText.isEmpty()) guessDest(extras, src)?.let { destText = it }
 
         if (title.isNullOrBlank()) {
             log("skip reason=no_title")
@@ -1027,6 +1044,98 @@ internal object ArkNavLiveInjector {
         return null
     }
 
+    /** extras 里像「目的地」的 key 片段（命中即用） */
+    private val DEST_KEY_HINTS = listOf(
+        "destination", "dest", "poiname", "poi", "endname", "toname", "target", "终点"
+    )
+
+    /** 明显不是地名的片段 —— 宁可回落显示「高德地图」，也不能把播报词当目的地 */
+    private val DEST_NOISE = listOf(
+        "高德", "导航", "正在", "公里", "千米", "分钟", "小时", "服务区", "剩余",
+        "预计", "全程", "路线", "播报", "语音", "后台", "提醒", "持续", "为您提供",
+        "正在为您", "下车", "车道", "限速", "摄像头", "点击", "查看", "米后", "转"
+    )
+
+    /**
+     * 每趟导航打一次原通知 extras 全量取证。
+     *
+     * v3.15.62 的目的地问题：播报和 title/text 都没有 POI 名，必须先看清楚
+     * 高德到底把它放在哪个字段（或压根没放在通知里）。这一条日志是下一轮
+     * 精确定位的依据，不要删。
+     */
+    @Suppress("DEPRECATION") // Bundle.get(String) 是全量 dump 唯一能用的泛型取法
+    private fun dumpNavExtras(extras: Bundle, src: Notification) {
+        if (extrasDumped) return
+        extrasDumped = true
+        try {
+            val sb = StringBuilder()
+            for (k in extras.keySet()) {
+                val v = extras.get(k)
+                val s = when (v) {
+                    is CharSequence -> v.toString()
+                    is Array<*> -> v.joinToString("|") { it?.toString().orEmpty() }
+                    is Bundle -> "Bundle{" + v.keySet().joinToString(",") + "}"
+                    is Number, is Boolean -> v.toString()
+                    else -> v?.javaClass?.simpleName ?: "null"
+                }
+                sb.append(k).append('=').append(s.take(80)).append(" ; ")
+            }
+            val ticker = try {
+                src.tickerText?.toString()
+            } catch (_: Throwable) {
+                null
+            }
+            log("NAV EXTRAS DUMP: $sb | ticker='${ticker.orEmpty()}'")
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 从原通知里找一个「像地名」的值；找不到返回 null（面板回落「高德地图」）。 */
+    @Suppress("DEPRECATION") // 同上：按 key 取任意类型的值
+    private fun guessDest(extras: Bundle, src: Notification): String? {
+        // ① 明确的「目的地类」key
+        for (k in extras.keySet()) {
+            val lk = k.lowercase(Locale.ROOT)
+            if (!DEST_KEY_HINTS.any { lk.contains(it) }) continue
+            val v = extras.get(k)
+            val s = when (v) {
+                is CharSequence -> v.toString()
+                is Array<*> -> v.firstOrNull()?.toString()
+                else -> null
+            }
+            sanitizeDest(s.orEmpty())?.let { return it }
+        }
+        // ② tickerText
+        try {
+            sanitizeDest(src.tickerText?.toString().orEmpty())?.let { return it }
+        } catch (_: Throwable) {
+        }
+        // ③ 常见的「补充文案」字段
+        for (k in listOf(
+            Notification.EXTRA_SUB_TEXT,
+            Notification.EXTRA_INFO_TEXT,
+            Notification.EXTRA_SUMMARY_TEXT,
+            Notification.EXTRA_TEXT_LINES,
+        )) {
+            val v = extras.get(k)
+            val s = when (v) {
+                is CharSequence -> v.toString()
+                is Array<*> -> v.firstOrNull()?.toString()
+                else -> null
+            }
+            sanitizeDest(s.orEmpty())?.let { return it }
+        }
+        return null
+    }
+
+    private fun sanitizeDest(raw: String): String? {
+        val s = raw.trim().trim('，', ',', '。', '!', '！', ' ')
+        if (s.length !in 2..16) return null
+        if (!s.any { it in '\u4e00'..'\u9fff' }) return null
+        if (DEST_NOISE.any { s.contains(it) }) return null
+        return s
+    }
+
     /**
      * 把整段播报里的「全程距离 / 总耗时 / 预计到达」解析出来并回写状态。
      *
@@ -1072,6 +1181,28 @@ internal object ArkNavLiveInjector {
         ETA_RE.find(raw)?.let { m ->
             ArkNavParse.parseClock(m.groupValues[1])?.let { etaText = it }
         }
+
+        // v3.15.62：高德**不是每趟都播**「预计X点X分到达」（真机日志里
+        // `全程九公里,大约需要三十三分钟,` 就整句没有 ETA）。播报里拿不到时，
+        // 用「出发墙钟 + 总耗时」自己算一个，别让第三栏一直显示 `--`。
+        computeEtaFallback()
+    }
+
+    /**
+     * 「预计到达」兜底：出发时刻 + 总耗时。
+     *
+     * 两个值都来自同一帧的出发播报：全程距离 / 总耗时在 `全程…大约需要…` 里，
+     * 出发时刻用单调时钟记进度、用墙钟记 ETA。用墙钟而不是 `elapsedRealtime + 开机时间`
+     * 是为了避开用户改系统时间后格式化出错。
+     */
+    private fun computeEtaFallback() {
+        if (etaText.isNotEmpty() || totalMs <= 0L || startWallMs <= 0L) return
+        try {
+            etaText = SimpleDateFormat("HH:mm", Locale.getDefault())
+                .format(Date(startWallMs + totalMs))
+            log("eta fallback (departure + duration) = '$etaText'")
+        } catch (_: Throwable) {
+        }
     }
 
     /**
@@ -1086,12 +1217,14 @@ internal object ArkNavLiveInjector {
     private fun captureTotals(group: String?, data: String?) {
         try {
             val full = fullTextOf(group) ?: data ?: return
-            parseTotals(full)
-            if (destText.isEmpty()) parseDest(full)?.let { destText = it }
-            // `全程` 只在起点播，所以这时记时刻是安全的（见 START_PHRASES 注释）
+            // v3.15.62：出发时刻必须**先于** parseTotals 设置 —— ETA 兜底要用
+            // 「出发墙钟 + 总耗时」，而总耗时就在这一帧才被解析出来。
             if (navStartedAt == 0L && isDeparture(full)) {
                 navStartedAt = SystemClock.elapsedRealtime()
+                startWallMs = System.currentTimeMillis()
             }
+            parseTotals(full)
+            if (destText.isEmpty()) parseDest(full)?.let { destText = it }
         } catch (_: Throwable) {
         }
     }
@@ -1189,6 +1322,7 @@ internal object ArkNavLiveInjector {
      */
     private fun resetNavPayload() {
         navStartedAt = 0L
+        startWallMs = 0L
         totalDistValue = ""
         totalDistUnit = "公里"
         totalTimeValue = ""
@@ -1196,6 +1330,7 @@ internal object ArkNavLiveInjector {
         totalMs = 0L
         etaText = ""
         destText = ""
+        extrasDumped = false
     }
 
     /**

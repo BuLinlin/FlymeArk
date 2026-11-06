@@ -2,11 +2,12 @@ package com.flymeark
 
 import android.app.Activity
 import android.content.Intent
-import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.Rect
 import android.os.Bundle
+import android.view.ViewOutlineProvider
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -56,7 +57,7 @@ class ArkNavPanelActivity : Activity() {
 
     private lateinit var liveView: TextView
     private lateinit var destView: TextView
-    private lateinit var collapseView: ImageView
+    private lateinit var appIconView: ImageView
     private lateinit var dotRing: View
     private lateinit var dotCore: View
     private lateinit var sepView: View
@@ -148,7 +149,7 @@ class ArkNavPanelActivity : Activity() {
 
         liveView = findViewById(R.id.nav_live)
         destView = findViewById(R.id.nav_dest)
-        collapseView = findViewById(R.id.nav_collapse)
+        appIconView = findViewById(R.id.nav_app_icon)
         dotRing = findViewById(R.id.nav_dot_ring)
         dotCore = findViewById(R.id.nav_dot_core)
         sepView = findViewById(R.id.nav_sep)
@@ -190,6 +191,24 @@ class ArkNavPanelActivity : Activity() {
         footDivider.background = footDividerChip
         btnView.background = btnChip
 
+        // v3.15.62：右上角来源 logo（28dp / R9 = 边长 × 0.32，handoff-spec.md §四）。
+        // 圆角用 outline 裁，不用 shape drawable —— Flyme 深色模式会反色形状 drawable。
+        // logo 不设点击监听，点击自然穿透到 nav_card 触发收起。
+        val logoRadius = 28f * 0.32f * resources.displayMetrics.density
+        appIconView.clipToOutline = true
+        appIconView.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                outline.setRoundRect(0, 0, view.width, view.height, logoRadius)
+            }
+        }
+        try {
+            appIconView.setImageDrawable(
+                packageManager.getApplicationIcon(ArkConstants.NAV_LIVE_PKG)
+            )
+        } catch (_: Throwable) {
+            appIconView.visibility = View.GONE
+        }
+
         nightMode =
             (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
@@ -203,7 +222,6 @@ class ArkNavPanelActivity : Activity() {
         // 不能吞掉点击（那样只有 20dp 的收起箭头可点，误触率太高）。
         // card 是 clickable 的，点卡片不会穿透到 root 触发两次 dismiss。
         card.setOnClickListener { dismiss() }
-        collapseView.setOnClickListener { dismiss() }
         btnView.setOnClickListener { openNavigation() }
     }
 
@@ -320,7 +338,6 @@ class ArkNavPanelActivity : Activity() {
         val divider = if (light) ArkTokens.DIVIDER_LIGHT else ArkTokens.DIVIDER_DARK
         val subtleChip = if (light) ArkTokens.SUBTLE_CHIP_LIGHT else ArkTokens.SUBTLE_CHIP_DARK
         val sepColor = if (light) 0xFFC8CDD6.toInt() else 0x40FFFFFF
-        val chevronColor = if (light) 0xFF8A9099.toInt() else ArkTokens.INK3_DARK
 
         liveView.setTextColor(ArkLiquidGlass.ink(brand, p))
         destView.setTextColor(ArkLiquidGlass.ink(subtle, p))
@@ -344,7 +361,6 @@ class ArkNavPanelActivity : Activity() {
         footDividerChip.setFill(divider)
         btnChip.setFill(subtleChip)
 
-        collapseView.imageTintList = ColorStateList.valueOf(chevronColor)
         progressView.setPalette(
             accent = brand,
             track = if (light) ArkTokens.TRACK_NEUTRAL_LIGHT else ArkTokens.TRACK_NEUTRAL_DARK,

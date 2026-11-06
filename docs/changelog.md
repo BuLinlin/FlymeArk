@@ -2,6 +2,71 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.62 导航卡 / 迷你条首轮实测修订
+
+依据用户第一轮实拍（展开卡 + 迷你条截图）与 LSPosed 日志，改 5 处。
+**这版之后模块更新只需 `am force-stop com.android.systemui`，不要整机重启**
+（整机重启会让 USB 调试断开、要重新授权，是 v3.15.61 交付时踩的坑）。
+
+### 1. 预计到达不再显示 `--`
+
+日志实锤：这一趟的出发播报是
+`,全程十二公里,大约需要二十九分钟,右转,随后一百五十米右转` —— **没有「预计X点X分到达」那句**。
+高德不是每趟都播 ETA（历史日志里 `全程九公里,大约需要三十三分钟,` 同样没有）。
+v3.15.61 只在播报里找 ETA，找不到就空着。
+
+现在补上工单里本就要求、但首版漏掉的兜底：`出发墙钟 + 总耗时 → HH:mm`。
+新增 `startWallMs`（与 `elapsedRealtime` 版 `navStartedAt` 成对记录，避免用户改系统时间算错），
+`computeEtaFallback()` 在每次 `parseTotals()` 末尾调用；播报里真有 ETA 时仍优先用播报值。
+
+### 2. 右上角改回来源 logo
+
+按 `handoff-spec.md` §四：展开卡右上角是 **28×28 / R9 的高德 logo**（不是 `nav.html` 的向上 chevron）。
+删掉 `nav_collapse`，`ArkNavPanelActivity` 用 `getApplicationIcon()` 取真实图标 +
+outline 圆角裁剪；收起改由「点卡片 / 点空白 / 返回键」完成（§六）。
+状态行高度 22 → 28dp 容纳 logo。
+
+### 3. 目的地名：目前仍拿不到，已埋取证探针
+
+**这一条本轮没有解决，如实记录。** 三个已知数据源都查过了：
+
+| 来源 | 结果 |
+|---|---|
+| 出发播报 | 只有 `全程…大约需要…`，日志里 `前往 / 目的地 / 终点` 命中 0 次 |
+| 导航通知 title/text | 固定 `高德地图` / `正在导航` |
+| `dumpsys notification --noredact` 统计 | `numWithSubText=0`、`numWithInfoText=0` |
+
+`last_route.xml` 也只有经纬度坐标，没有 POI 名。
+本版新增 `dumpNavExtras()`：每趟导航打一次原通知 **全部 extras + tickerText** 到 LSPosed 日志
+（搜 `NAV EXTRAS DUMP`）；同时 `guessDest()` 会即时尝试 key 含
+`destination / dest / poiname / poi / endname / target / 终点` 的字段、`tickerText`、
+`EXTRA_SUB_TEXT / INFO_TEXT / SUMMARY_TEXT / TEXT_LINES`，命中即显示。
+抓不到时状态行仍回落「高德地图」。下一轮开一次导航、读一次日志即可定位真实字段。
+
+### 4. 导航迷你条按设计稿重做
+
+之前 `styleFrom()` 只给 `isMessageLiveApp` 做结构改造，导航胶囊一直吃系统默认样式
+（截图里的「高德地图 + 空心圆」）。本版新增 `isNav` 分支 + `applyNavStructure()` +
+自绘 `ArkMiniNavView`，按 `handoff-minibar.html` §02 补齐：
+
+- 40×40 R12 蓝渐变转向块（白箭头按 `NAV_KEY_TURN` 切左 / 右 / 直行 / 掉头）
+- 主文案用播报指令覆盖系统占位标题「高德地图」，13sp 加粗
+- 文字下方 2dp 路线进度（时间口径，与展开卡同源）
+- 右侧 12sp 剩余时间（`总耗时 − 已用时间`，分钟向上取整）
+- 最右 24×24 R8 高德 logo，空心圆只 `GONE` 不 remove
+
+和消息条同一套做法：**一个自绘 View 画完所有非文字元素**，不往系统 RelativeLayout 里塞多个子 View。
+消息 / 音乐迷你条保持 v3.15.48 已验收状态，一行未动。
+
+### 5. 部署方式
+
+模块更新后执行 `adb shell am force-stop com.android.systemui` 即可让 LSPosed 重新注入，
+**不要 `adb reboot`**。
+
+版本 `versionCode 85 / 3.15.62`。
+
+---
+
 ## 2026-11-06 · v3.15.61 导航展开卡（设计稿落地）
 
 点高德导航胶囊 → 从状态栏下方展开 392×258 的导航大卡。**胶囊本体（迷你条）、消息卡、音乐卡一律不动**，

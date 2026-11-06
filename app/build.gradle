@@ -12,8 +12,8 @@ android {
         applicationId 'com.flymeark'
         minSdk rootProject.ext.min_sdk
         targetSdk rootProject.ext.target_sdk
-        versionCode 84
-        versionName '3.15.61'
+        versionCode 85
+        versionName '3.15.62'
     }
 
     buildTypes {

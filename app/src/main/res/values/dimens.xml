@@ -31,7 +31,8 @@
     <dimen name="ark_nav_pad_h">20dp</dimen>
     <dimen name="ark_nav_pad_top">19dp</dimen>
     <dimen name="ark_nav_pad_bottom">17dp</dimen>
-    <dimen name="ark_nav_status_height">22dp</dimen>
+    <dimen name="ark_nav_status_height">28dp</dimen>
+    <dimen name="ark_nav_logo">28dp</dimen>
     <dimen name="ark_nav_dot">12dp</dimen>
     <dimen name="ark_nav_dot_core">6dp</dimen>
     <dimen name="ark_nav_sep">3dp</dimen>

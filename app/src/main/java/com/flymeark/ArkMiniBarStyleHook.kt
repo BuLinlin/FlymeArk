@@ -13,7 +13,10 @@ import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
+import android.graphics.LinearGradient
+import android.graphics.Shader
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.RelativeLayout
@@ -128,6 +131,7 @@ internal object ArkMiniBarStyleHook {
     private val KEY_ARROW = "flymeark.mini.arrow".hashCode()
     private val KEY_SHIFTED = "flymeark.mini.shifted".hashCode()
     private val KEY_CENTERED = "flymeark.mini.centered".hashCode()
+    private val KEY_NAV = "flymeark.mini.nav".hashCode()
 
     @Volatile
     private var idsReady = false
@@ -208,13 +212,18 @@ internal object ArkMiniBarStyleHook {
             val isMessage = pkg != null &&
                 ArkConstants.isMessageLiveApp(pkg) &&
                 !ArkConstants.isMediaApp(pkg)
+            // v3.15.62：导航胶囊（高德）也要按设计稿 02·导航迷你条 改造。
+            // 之前这里只放行消息，导航一直停留在系统默认样式（「高德地图 + 空心圆」）。
+            val isNav = pkg != null && ArkConstants.isNavLiveApp(pkg)
 
             // 文字与圆环不依赖背景，永远可以做（零风险项）
-            applyText(root, night, boldTitle = isMessage)
+            applyText(root, night, boldTitle = isMessage || isNav)
             applyCircle(root, night)
 
-            if (isMessage && pkg != null) {
-                applyMessageStructure(header, night, pkg, density, badgeCountOf(row))
+            if (isMessage) {
+                pkg?.let { applyMessageStructure(header, night, it, density, badgeCountOf(row)) }
+            } else if (isNav) {
+                pkg?.let { applyNavStructure(header, night, it, density, row) }
             }
 
             // 背景是唯一会替换 View 已有状态的操作，带保守 guard
@@ -261,6 +270,280 @@ internal object ArkMiniBarStyleHook {
      * @return 图标是否就位；false 表示取不到彩色应用图标，此时连标题右移都跳过，
      *         直接把这条通知留给 v3.15.45 的原样。
      */
+    /**
+     * v3.15.62：导航迷你条（`handoff-minibar.html` §02）的结构改造。
+     *
+     * 系统默认那条是「高德地图 + 空心圆」，和设计稿差了整个骨架：
+     * 40×40 R12 蓝渐变转向块 / 13sp 指令 / 文字下方 2dp 路线进度 /
+     * 右侧 12sp 时间值 / 24×24 R8 来源 logo。
+     *
+     * 与消息条同一套做法：**一个自绘 View 画完所有非文字元素**，
+     * 不往系统 RelativeLayout 里塞多个子 View（v3.15.47 踩过主题色 / clipChildren）。
+     * 文字仍由系统 TextView 画，我们只右移让位 + 覆盖成播报指令。
+     */
+    private fun applyNavStructure(
+        header: View,
+        night: Boolean,
+        pkg: String,
+        density: Float,
+        row: View?,
+    ) {
+        val parent = header as? ViewGroup ?: return
+        val p = navPayloadOf(row)
+
+        var overlay = header.getTag(KEY_NAV) as? ArkMiniNavView
+        if (overlay == null) {
+            overlay = ArkMiniNavView(header.context, density, appIconOf(header.context, pkg))
+            overlay.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            parent.addView(
+                overlay,
+                RelativeLayout.LayoutParams(
+                    RelativeLayout.LayoutParams.MATCH_PARENT,
+                    RelativeLayout.LayoutParams.MATCH_PARENT,
+                )
+            )
+            header.setTag(KEY_NAV, overlay)
+        }
+        overlay.setData(p.turn, p.started, p.totalMs, p.timeText, p.timeUnit, night)
+
+        // 系统模板显示的是通知标题（固定「高德地图」），设计稿要的是**下一步指令**。
+        // 每次影子刷新都会重进这里，覆盖不会被系统改回去。
+        if (p.instr.isNotBlank() && titleId != 0) {
+            val tv = header.findViewById<View>(titleId) as? TextView
+            if (tv != null && tv.text?.toString() != p.instr) tv.text = p.instr
+        }
+
+        ensureTextShift(header, density)
+        ensureTextCentered(header)
+        // 空心圆让位给 logo：只 GONE 不 removeView（系统仍会读写它）
+        if (circleId != 0) header.findViewById<View>(circleId)?.visibility = View.GONE
+    }
+
+    /** 导航迷你条载荷：从影子通知的顶层 extras 读（见 ArkConstants.NAV_KEY_*） */
+    private data class NavMiniPayload(
+        val instr: String = "",
+        val turn: Int = ArkConstants.NAV_TURN_STRAIGHT,
+        val started: Long = 0L,
+        val totalMs: Long = 0L,
+        val timeText: String = "",
+        val timeUnit: String = "",
+    )
+
+    private fun navPayloadOf(row: View?): NavMiniPayload = try {
+        val sbn = sbnOf(row) ?: return NavMiniPayload()
+        val n = XposedHelpers.callMethod(sbn, "getNotification") as? Notification
+            ?: return NavMiniPayload()
+        val ex = n.extras ?: return NavMiniPayload()
+        NavMiniPayload(
+            instr = ex.getString(ArkConstants.NAV_KEY_INSTR).orEmpty(),
+            turn = ex.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT),
+            started = ex.getLong(ArkConstants.NAV_KEY_STARTED, 0L),
+            totalMs = ex.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L),
+            timeText = ex.getString(ArkConstants.NAV_KEY_TIME).orEmpty(),
+            timeUnit = ex.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty(),
+        )
+    } catch (_: Throwable) {
+        NavMiniPayload()
+    }
+
+    /**
+     * 导航迷你条的「非文字层」：一个 View 自绘左块 / 进度 / 时间值 / logo。
+     * 透明区域不遮挡系统文字，也不拦截点击（View 默认 clickable=false）。
+     */
+    private class ArkMiniNavView(
+        context: Context,
+        private val density: Float,
+        private val appIcon: Drawable?,
+    ) : View(context) {
+
+        private val surfacePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = ArkTokens.BRAND_ON_LIGHT
+            strokeWidth = 2.2f * density
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.RIGHT
+            textSize = 12f * density
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        }
+        private val arrowPath = Path()
+        private val turnRect = RectF()
+        private val trackRect = RectF()
+        private val logoRect = RectF()
+        private val clipPath = Path()
+
+        private var turn = ArkConstants.NAV_TURN_STRAIGHT
+        private var started = 0L
+        private var totalMs = 0L
+        private var timeFallback = ""
+
+        init {
+            setWillNotDraw(false)
+        }
+
+        fun setData(
+            turn: Int,
+            started: Long,
+            totalMs: Long,
+            timeText: String,
+            timeUnit: String,
+            night: Boolean,
+        ) {
+            this.turn = turn
+            this.started = started
+            this.totalMs = totalMs
+            timeFallback = if (timeText.isBlank()) "" else "$timeText $timeUnit".trim()
+            fillPaint.color = if (night) ArkTokens.BRAND_DARK else ArkTokens.BRAND_LIGHT
+            trackPaint.color =
+                if (night) ArkTokens.TRACK_NEUTRAL_DARK else ArkTokens.TRACK_NEUTRAL_LIGHT
+            textPaint.color =
+                if (night) ArkTokens.TEXT_SECONDARY_DARK else ArkTokens.SUBTLE_TEXT_LIGHT
+            invalidate()
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            surfacePaint.shader = LinearGradient(
+                0f, 0f, 0f, 40f * density,
+                intArrayOf(ArkTokens.TURN_TOP, ArkTokens.TURN_MID, ArkTokens.TURN_BOTTOM),
+                floatArrayOf(0f, 0.62f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+        }
+
+        override fun onDraw(c: Canvas) {
+            val w = width.toFloat()
+            val cy = height / 2f
+            if (w <= 0f || cy <= 0f) return
+            val d = density
+
+            // ① 40×40 R12 蓝渐变转向块
+            val left = 10f * d
+            val size = 40f * d
+            turnRect.set(left, cy - size / 2f, left + size, cy + size / 2f)
+            c.drawRoundRect(turnRect, 12f * d, 12f * d, surfacePaint)
+            drawArrow(c, left + size / 2f, cy - size / 2f, size)
+
+            // ④ 最右 24×24 R8 来源 logo
+            val logoR = 24f * d
+            val logoLeft = w - 12f * d - logoR
+            logoRect.set(logoLeft, cy - logoR / 2f, w - 12f * d, cy + logoR / 2f)
+            drawLogo(c)
+
+            // ③ 右侧时间值
+            val label = remainingLabel()
+            val tw = if (label.isEmpty()) 0f else textPaint.measureText(label)
+            val textRight = logoLeft - 10f * d
+            if (label.isNotEmpty()) c.drawText(label, textRight, cy + 4f * d, textPaint)
+
+            // ② 文字下方 2dp 路线进度
+            val trackLeft = left + size + 10f * d
+            val trackRight = (textRight - tw - 10f * d)
+                .coerceAtLeast(trackLeft + 20f * d)
+            val ty = cy + 13f * d
+            trackRect.set(trackLeft, ty - d, trackRight, ty + d)
+            c.drawRoundRect(trackRect, d, d, trackPaint)
+            val f = fraction()
+            if (f > 0f) {
+                val fillRight = trackLeft + (trackRight - trackLeft) * f
+                trackRect.set(
+                    trackLeft, ty - d,
+                    fillRight.coerceAtLeast(trackLeft + 2f * d), ty + d
+                )
+                c.drawRoundRect(trackRect, d, d, fillPaint)
+            }
+        }
+
+        private fun fraction(): Float {
+            if (started <= 0L || totalMs <= 0L) return 0f
+            val elapsed = SystemClock.elapsedRealtime() - started
+            return (elapsed.toFloat() / totalMs.toFloat()).coerceIn(0f, 1f)
+        }
+
+        private fun remainingLabel(): String {
+            if (started > 0L && totalMs > 0L) {
+                val leftMs = totalMs - (SystemClock.elapsedRealtime() - started)
+                val min = ((leftMs + 59_999L) / 60_000L).coerceAtLeast(0L)
+                return "$min 分钟"
+            }
+            return timeFallback
+        }
+
+        private fun drawLogo(c: Canvas) {
+            val radius = 8f * density
+            if (appIcon != null) {
+                val save = c.save()
+                clipPath.reset()
+                clipPath.addRoundRect(logoRect, radius, radius, Path.Direction.CW)
+                c.clipPath(clipPath)
+                appIcon.setBounds(
+                    logoRect.left.toInt(), logoRect.top.toInt(),
+                    logoRect.right.toInt(), logoRect.bottom.toInt(),
+                )
+                appIcon.draw(c)
+                c.restoreToCount(save)
+            } else {
+                // 设计稿 §四.2：未接入时虚线描边占位，不写文字
+                val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    style = Paint.Style.STROKE
+                    strokeWidth = density
+                    color = 0x668A9099
+                    pathEffect = android.graphics.DashPathEffect(
+                        floatArrayOf(3f * density, 3f * density), 0f
+                    )
+                }
+                c.drawRoundRect(logoRect, radius, radius, p)
+            }
+        }
+
+        /** 24 viewBox 的箭头，缩到 24dp 居中画进 40dp 块 */
+        private fun drawArrow(c: Canvas, cx: Float, top: Float, size: Float) {
+            val s = (24f * density) / 24f
+            val ox = cx - 12f * s
+            val oy = top + (size - 24f * s) / 2f
+            arrowPath.reset()
+
+            fun mv(x: Float, y: Float) = arrowPath.moveTo(ox + x * s, oy + y * s)
+            fun lt(x: Float, y: Float) = arrowPath.lineTo(ox + x * s, oy + y * s)
+            fun qt(x1: Float, y1: Float, x2: Float, y2: Float) =
+                arrowPath.quadTo(ox + x1 * s, oy + y1 * s, ox + x2 * s, oy + y2 * s)
+
+            when (turn) {
+                ArkConstants.NAV_TURN_LEFT -> {
+                    mv(16f, 20.5f); lt(16f, 10.4f); qt(16f, 6f, 11.6f, 6f); lt(6.6f, 6f)
+                    arrowPath.moveTo(ox + 9f * s, oy + 2.9f * s)
+                    arrowPath.lineTo(ox + 5f * s, oy + 6f * s)
+                    arrowPath.lineTo(ox + 9f * s, oy + 9.1f * s)
+                }
+                ArkConstants.NAV_TURN_RIGHT -> {
+                    mv(8f, 20.5f); lt(8f, 10.4f); qt(8f, 6f, 12.4f, 6f); lt(17.4f, 6f)
+                    arrowPath.moveTo(ox + 15f * s, oy + 2.9f * s)
+                    arrowPath.lineTo(ox + 19f * s, oy + 6f * s)
+                    arrowPath.lineTo(ox + 15f * s, oy + 9.1f * s)
+                }
+                ArkConstants.NAV_TURN_UTURN -> {
+                    mv(8f, 20.5f); lt(8f, 10f); qt(8f, 6f, 12f, 6f)
+                    qt(17f, 6f, 17f, 10f); lt(17f, 15f)
+                    arrowPath.moveTo(ox + 14f * s, oy + 12f * s)
+                    arrowPath.lineTo(ox + 17f * s, oy + 15f * s)
+                    arrowPath.lineTo(ox + 20f * s, oy + 12f * s)
+                }
+                else -> { // 直行 / 到达
+                    mv(12f, 20f); lt(12f, 5f)
+                    arrowPath.moveTo(ox + 8.5f * s, oy + 8.5f * s)
+                    arrowPath.lineTo(ox + 12f * s, oy + 5f * s)
+                    arrowPath.lineTo(ox + 15.5f * s, oy + 8.5f * s)
+                }
+            }
+            c.drawPath(arrowPath, arrowPaint)
+        }
+    }
+
     private fun ensureIcon(
         header: View,
         pkg: String,

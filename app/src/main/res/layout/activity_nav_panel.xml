@@ -100,23 +100,18 @@
                 </LinearLayout>
 
                 <!--
-                  收起按钮：设计稿 44×44、margin -11 -12 -11 0。
-                  父容器已固定 22dp 高并开 clipChildren=false，所以负 margin 不会把行撑高。
+                  v3.15.62：按 handoff-spec.md §四 把右上角让给**来源 logo**
+                  （28 × 28 · R9 · 不可点 · 点击穿透到卡片）。
+                  设计稿 nav.html 里那个向上 chevron 不再画 —— 收起改由
+                  「点卡片 / 点空白 / 返回键」完成（handoff-spec.md §六）。
                 -->
                 <ImageView
-                    android:id="@+id/nav_collapse"
-                    android:layout_width="@dimen/ark_nav_collapse"
-                    android:layout_height="@dimen/ark_nav_collapse"
-                    android:layout_gravity="top|end"
-                    android:layout_marginTop="-11dp"
-                    android:layout_marginEnd="-12dp"
-                    android:background="?android:attr/selectableItemBackgroundBorderless"
-                    android:clickable="true"
-                    android:contentDescription="@string/ark_nav_collapse"
-                    android:focusable="true"
-                    android:padding="12dp"
-                    android:scaleType="fitCenter"
-                    android:src="@drawable/ic_ark_chevron_up" />
+                    android:id="@+id/nav_app_icon"
+                    android:layout_width="@dimen/ark_nav_logo"
+                    android:layout_height="@dimen/ark_nav_logo"
+                    android:layout_gravity="center_vertical|end"
+                    android:contentDescription="@string/ark_nav_source"
+                    android:scaleType="fitCenter" />
             </FrameLayout>
 
             <!-- ============ 转向指令 ============ -->
