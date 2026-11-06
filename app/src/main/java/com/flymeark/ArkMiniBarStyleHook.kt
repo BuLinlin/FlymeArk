@@ -16,7 +16,7 @@ import android.graphics.drawable.InsetDrawable
 import android.graphics.LinearGradient
 import android.graphics.Shader
 import android.os.Bundle
-import android.os.SystemClock
+import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
 import android.widget.RelativeLayout
@@ -280,6 +280,9 @@ internal object ArkMiniBarStyleHook {
      * 与消息条同一套做法：**一个自绘 View 画完所有非文字元素**，
      * 不往系统 RelativeLayout 里塞多个子 View（v3.15.47 踩过主题色 / clipChildren）。
      * 文字仍由系统 TextView 画，我们只右移让位 + 覆盖成播报指令。
+     *
+     * v3.15.67 补齐与设计稿的三处偏差：指令 13sp（PX 传）/ 隐藏副标题（设计稿没有第二行）/
+     * 偏航时转向块·进度·时间值同步转 [ArkTokens.NAV_YAW_RED]。
      */
     private fun applyNavStructure(
         header: View,
@@ -304,13 +307,31 @@ internal object ArkMiniBarStyleHook {
             )
             header.setTag(KEY_NAV, overlay)
         }
-        overlay.setData(p.turn, p.started, p.totalMs, p.timeText, p.timeUnit, night)
+        overlay.setData(
+            p.turn, p.remainMs, p.totalMs, p.timeText, p.timeUnit, night, p.yawed
+        )
 
         // 系统模板显示的是通知标题（固定「高德地图」），设计稿要的是**下一步指令**。
         // 每次影子刷新都会重进这里，覆盖不会被系统改回去。
+        // v3.15.67：字号对齐设计稿 `.bar .nm { font-size:13px; font-weight:600 }` ——
+        // 系统默认约 14–15sp 偏大。用 PX 传（`13f * density`），避免 sp 再被 fontScale 二次放大。
         if (p.instr.isNotBlank() && titleId != 0) {
             val tv = header.findViewById<View>(titleId) as? TextView
-            if (tv != null && tv.text?.toString() != p.instr) tv.text = p.instr
+            if (tv != null) {
+                if (tv.text?.toString() != p.instr) tv.text = p.instr
+                tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, 13f * density)
+            }
+        }
+
+        // v3.15.67：设计稿导航迷你条只有「一行指令 + 2dp 进度」，没有副标题。
+        // 必须先清空 text —— [ensureTextCentered] 见到副标题有内容就会早退，
+        // 标题拿不到 CENTER_VERTICAL，会退回贴顶。
+        if (contentId != 0) {
+            val sub = header.findViewById<View>(contentId) as? TextView
+            if (sub != null) {
+                sub.visibility = View.GONE
+                if (sub.text != null) sub.text = null
+            }
         }
 
         ensureTextShift(header, density)
@@ -323,10 +344,13 @@ internal object ArkMiniBarStyleHook {
     private data class NavMiniPayload(
         val instr: String = "",
         val turn: Int = ArkConstants.NAV_TURN_STRAIGHT,
-        val started: Long = 0L,
+        /** 本趟**剩余**毫秒（锚点式，v3.15.67）；`< 0` = 本趟还没有锚点 */
+        val remainMs: Long = -1L,
         val totalMs: Long = 0L,
         val timeText: String = "",
         val timeUnit: String = "",
+        /** 偏航态（v3.15.67）：true 时三点转 [ArkTokens.NAV_YAW_RED] */
+        val yawed: Boolean = false,
     )
 
     private fun navPayloadOf(row: View?): NavMiniPayload = try {
@@ -337,10 +361,11 @@ internal object ArkMiniBarStyleHook {
         NavMiniPayload(
             instr = ex.getString(ArkConstants.NAV_KEY_INSTR).orEmpty(),
             turn = ex.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT),
-            started = ex.getLong(ArkConstants.NAV_KEY_STARTED, 0L),
+            remainMs = ex.getLong(ArkConstants.NAV_KEY_REMAIN_MS, -1L),
             totalMs = ex.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L),
             timeText = ex.getString(ArkConstants.NAV_KEY_TIME).orEmpty(),
             timeUnit = ex.getString(ArkConstants.NAV_KEY_TIME_UNIT).orEmpty(),
+            yawed = ex.getBoolean(ArkConstants.NAV_KEY_YAWED, false),
         )
     } catch (_: Throwable) {
         NavMiniPayload()
@@ -378,9 +403,28 @@ internal object ArkMiniBarStyleHook {
         private val clipPath = Path()
 
         private var turn = ArkConstants.NAV_TURN_STRAIGHT
-        private var started = 0L
+
+        /**
+         * 本趟**剩余**毫秒（v3.15.67 锚点式）。
+         *
+         * v3.15.66 及以前这里存的是 `started`（出发时刻），进度 / 时间都拿
+         * `elapsedRealtime() - started` 现推 —— 用户停着不动，迷你条也一直往前走。
+         * 展开卡 v3.15.65 就改成锚点式了，迷你条这一版才跟上：剩余值由高德进程
+         * 在每次播报时重算（`NAV_KEY_REMAIN_MS`），我们两帧之间**只读不算**。
+         */
+        private var remainMs = -1L
+
         private var totalMs = 0L
+
+        /** 偏航态：转向块 / 进度 / 时间值三点同时转红 */
+        private var yawed = false
+
         private var timeFallback = ""
+
+        /** 蓝色 160deg 渐变；按 view 高度缓存（几何只跟高度有关，见 [blueShader]） */
+        private var blueShader: Shader? = null
+
+        private var blueShaderHeight = -1
 
         init {
             setWillNotDraw(false)
@@ -388,32 +432,33 @@ internal object ArkMiniBarStyleHook {
 
         fun setData(
             turn: Int,
-            started: Long,
+            remainMs: Long,
             totalMs: Long,
             timeText: String,
             timeUnit: String,
             night: Boolean,
+            yawed: Boolean,
         ) {
             this.turn = turn
-            this.started = started
+            this.remainMs = remainMs
             this.totalMs = totalMs
+            this.yawed = yawed
             timeFallback = if (timeText.isBlank()) "" else "$timeText $timeUnit".trim()
-            fillPaint.color = if (night) ArkTokens.BRAND_DARK else ArkTokens.BRAND_LIGHT
+            // 偏航：进度填充统一转警示红；正常：品牌蓝（深浅两档）
+            fillPaint.color = when {
+                yawed -> ArkTokens.NAV_YAW_RED
+                night -> ArkTokens.BRAND_DARK
+                else -> ArkTokens.BRAND_LIGHT
+            }
             trackPaint.color =
                 if (night) ArkTokens.TRACK_NEUTRAL_DARK else ArkTokens.TRACK_NEUTRAL_LIGHT
-            textPaint.color =
-                if (night) ArkTokens.TEXT_SECONDARY_DARK else ArkTokens.SUBTLE_TEXT_LIGHT
+            // 偏航：时间值同样转警示红；箭头恒白（[arrowPaint] 在字段初始化里定死，不随偏航变）
+            textPaint.color = when {
+                yawed -> ArkTokens.NAV_YAW_RED
+                night -> ArkTokens.TEXT_SECONDARY_DARK
+                else -> ArkTokens.SUBTLE_TEXT_LIGHT
+            }
             invalidate()
-        }
-
-        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            super.onSizeChanged(w, h, oldw, oldh)
-            surfacePaint.shader = LinearGradient(
-                0f, 0f, 0f, 40f * density,
-                intArrayOf(ArkTokens.TURN_TOP, ArkTokens.TURN_MID, ArkTokens.TURN_BOTTOM),
-                floatArrayOf(0f, 0.62f, 1f),
-                Shader.TileMode.CLAMP,
-            )
         }
 
         override fun onDraw(c: Canvas) {
@@ -422,10 +467,16 @@ internal object ArkMiniBarStyleHook {
             if (w <= 0f || cy <= 0f) return
             val d = density
 
-            // ① 40×40 R12 蓝渐变转向块
+            // ① 40×40 R12 蓝渐变转向块（偏航时整块转红）
             val left = 10f * d
             val size = 40f * d
             turnRect.set(left, cy - size / 2f, left + size, cy + size / 2f)
+            if (yawed) {
+                surfacePaint.shader = null
+                surfacePaint.color = ArkTokens.NAV_YAW_RED
+            } else {
+                surfacePaint.shader = blueGradient(turnRect, size)
+            }
             c.drawRoundRect(turnRect, 12f * d, 12f * d, surfacePaint)
             drawArrow(c, left + size / 2f, cy - size / 2f, size)
 
@@ -459,19 +510,50 @@ internal object ArkMiniBarStyleHook {
             }
         }
 
-        private fun fraction(): Float {
-            if (started <= 0L || totalMs <= 0L) return 0f
-            val elapsed = SystemClock.elapsedRealtime() - started
-            return (elapsed.toFloat() / totalMs.toFloat()).coerceIn(0f, 1f)
+        /**
+         * 蓝色转向块渐变（CSS `160deg` ≈ 从左上、向右偏 20° 往下，`tan20° ≈ 0.364`）。
+         *
+         * v3.15.67：从 `onSizeChanged` 挪到绘制期 —— 偏航时整块要换成纯色，
+         * 颜色必须**每帧按 [yawed] 决定**，不能在尺寸变化时写死一次。
+         * 渐变几何只与 view 高度有关，因此按高度缓存：稳定态下不产生分配。
+         */
+        private fun blueGradient(rect: RectF, size: Float): Shader {
+            val h = height
+            blueShader?.let { if (blueShaderHeight == h) return it }
+            val grad = LinearGradient(
+                rect.left, rect.top,
+                rect.left + size * 0.364f, rect.top + size,
+                intArrayOf(ArkTokens.TURN_TOP, ArkTokens.TURN_MID, ArkTokens.TURN_BOTTOM),
+                floatArrayOf(0f, 0.62f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+            blueShader = grad
+            blueShaderHeight = h
+            return grad
         }
 
+        /**
+         * 进度（v3.15.67 锚点式）：`(全程 - 剩余) / 全程`。
+         *
+         * 只用高德进程在播报时算好的 [remainMs]，**两帧之间不自己往前走** ——
+         * 与展开卡 [ArkNavProgressView] 同一口径。没有锚点（`remainMs < 0`）或没有分母
+         * 时返回 0，只画轨不画填充。
+         */
+        private fun fraction(): Float {
+            if (totalMs <= 0L || remainMs < 0L) return 0f
+            return ((totalMs - remainMs).toFloat() / totalMs.toFloat()).coerceIn(0f, 1f)
+        }
+
+        /**
+         * 时间值（v3.15.67 锚点式）：剩余毫秒向上取整到分钟并显示成「X 分钟」。
+         *
+         * 没有锚点就退回播报自带的剩余时长文案 [timeFallback]（`NAV_KEY_TIME` 本身就是
+         * 剩余分钟），不再拿出发时刻倒推。
+         */
         private fun remainingLabel(): String {
-            if (started > 0L && totalMs > 0L) {
-                val leftMs = totalMs - (SystemClock.elapsedRealtime() - started)
-                val min = ((leftMs + 59_999L) / 60_000L).coerceAtLeast(0L)
-                return "$min 分钟"
-            }
-            return timeFallback
+            if (remainMs < 0L) return timeFallback
+            val min = ((remainMs + 59_999L) / 60_000L).coerceAtLeast(0L)
+            return "$min 分钟"
         }
 
         private fun drawLogo(c: Canvas) {

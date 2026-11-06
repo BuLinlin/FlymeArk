@@ -186,6 +186,28 @@ internal object ArkNavLiveInjector {
      */
     private val START_PHRASES = listOf("出发", "开始导航", "全程")
 
+    /**
+     * 偏航类短语（v3.15.67）：命中即把 [navYawed] 置 true。
+     *
+     * 真机样例（整段 `groupData` 拼起来）：
+     * ```
+     * 您已偏航,七十米后左转,随后六十米右转,新路线预计多三点三公里
+     * ```
+     * 另一版口径会播 `已重新规划路线`，所以除了「偏航」还认「重新规划」。
+     *
+     * ⚠ 这些词**不进** [NOISE_PHRASES]：[pickCapsuleText] 的正则样例表已验收，
+     * 偏航句本身就是有效指令（`七十米后左转`），必须照常投进胶囊 ——
+     * 这里只多做一个「转红」的副作用。
+     */
+    private val YAW_ON_PHRASES = listOf("已偏航", "重新规划")
+
+    /**
+     * 回到主路类短语（v3.15.67）：命中即把 [navYawed] 清回 false。
+     *
+     * 高德重新规划成功后播 `已回到主路` / `回到主路,继续导航`；两种说法都认。
+     */
+    private val YAW_OFF_PHRASES = listOf("回到主路", "已回到")
+
     // ---------------------------------------------------------------- 播报 → 胶囊 的实时状态
     //
     // 重要：以下字段全部活在**高德进程**里（hook 装在 App 侧）。SystemUI 侧那一份
@@ -346,6 +368,18 @@ internal object ArkNavLiveInjector {
 
     /** 本趟出发时刻（`elapsedRealtime`），进度条用；0 表示本趟还没出发 */
     private var navStartedAt = 0L
+
+    /**
+     * 偏航态（v3.15.67）：本趟是否处于「已偏航 / 正在重新规划」。
+     *
+     * 判定来源只有语音播报（[extractNaviText] 的整段文本），见 [YAW_ON_PHRASES] /
+     * [YAW_OFF_PHRASES]。置位后迷你条的转向块 / 进度 / 时间值同时转红
+     * （[ArkTokens.NAV_YAW_RED]），回到主路再转回品牌蓝。
+     *
+     * 跨趟必须清零：否则上一趟最后一句话是偏航，下一趟一出发就是红的
+     * （重置点在 [beginSession]）。
+     */
+    private var navYawed = false
 
     /** 每趟导航只 dump 一次原通知 extras，用于定位高德把目的地名放在哪个字段 */
     private var extrasDumped = false
@@ -846,6 +880,8 @@ internal object ArkNavLiveInjector {
             se.putLong(ArkConstants.NAV_KEY_REMAIN_MS, remainMs)
             se.putLong(ArkConstants.NAV_KEY_ANCHOR_AT, anchorAt)
             se.putInt(ArkConstants.NAV_KEY_TURN, turnCodeOf(instrPair.first))
+            // v3.15.67：偏航态 —— 迷你条据此把转向块 / 进度 / 时间值同时转 NAV_YAW_RED
+            se.putBoolean(ArkConstants.NAV_KEY_YAWED, navYawed)
             n
         } catch (t: Throwable) {
             log("build shadow failed: ${t.message}")
@@ -915,6 +951,11 @@ internal object ArkNavLiveInjector {
             log("session begin (departure tts)")
         }
 
+        // v3.15.67：偏航态判定。放在 beginSession 之后 —— 新会话的「清零」优先，
+        // 出发播报里不可能出现偏航词，所以这里的先后只影响「谁最终说了算」，
+        // 而正确语义就是「新会话从蓝色开始」。
+        updateYawState(full)
+
         // v3.15.61：展开卡的行程数字（全程距离 / 总耗时 / 预计到达）只在播报里有，
         // 而且散落在**中间**几段（`准备出发,,全程八公里,大约需要二十七分钟,…`），
         // 只看最后一句永远抓不到 —— 所以先整段解析一遍，再挑胶囊文案。
@@ -958,6 +999,39 @@ internal object ArkNavLiveInjector {
             END_PHRASES.any { raw.contains(it) }
         } catch (_: Throwable) {
             false
+        }
+    }
+
+    /**
+     * 按播报文本更新偏航态（v3.15.67）。
+     *
+     * 判定顺序：**先看偏航词，再看回主路词**。理由：一句话里同时出现两者只可能是
+     * `您已偏航,…然后回到主路` 这类边偏航边指引的播报，此时「红」是更安全的观感
+     * （用户对偏航的警觉需求高于对已恢复的确认）；而真实恢复播报是独立的一句
+     * `已回到主路`，不会同时含偏航词，所以不会漏清。
+     *
+     * 状态没变时不写日志、不 invalidate —— 每 3 秒一句播报，重复刷日志没有价值。
+     *
+     * @param raw 本轮播报的整段文本（`groupData` 拼接结果，退回 `data`）
+     */
+    private fun updateYawState(raw: String?) {
+        if (raw.isNullOrBlank()) return
+        try {
+            if (YAW_ON_PHRASES.any { raw.contains(it) }) {
+                if (!navYawed) {
+                    navYawed = true
+                    log("yaw state=true text='${raw.take(48)}'")
+                }
+                return
+            }
+            if (YAW_OFF_PHRASES.any { raw.contains(it) }) {
+                if (navYawed) {
+                    navYawed = false
+                    log("yaw state=false text='${raw.take(48)}'")
+                }
+            }
+        } catch (_: Throwable) {
+            // 判定失败保持原状：宁可沿用上一帧的颜色，也不许炸掉播报链路
         }
     }
 
@@ -1017,6 +1091,8 @@ internal object ArkNavLiveInjector {
             stashLastTrip()
             resetNavPayload()
             navStartedAt = now
+            // v3.15.67：新一趟从蓝色开始 —— 上一趟最后一句若是偏航，不清零就会一出发就红
+            navYawed = false
             navState = STATE_ACTIVE
             navActive = true
             navEndingAt = 0L

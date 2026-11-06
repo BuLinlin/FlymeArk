@@ -171,6 +171,9 @@ internal object ArkTokens {
     /** 徽标红色：设计稿 #C62F3B，白字对比度 5.4:1（WCAG AA 通过） */
     const val DANGER = 0xFFC62F3B.toInt()
 
+    /** 导航偏航红：设计稿 02·导航迷你条 —— 偏航时转向块 / 进度 / 时间值同时转此色 */
+    const val NAV_YAW_RED = 0xFFE5484D.toInt()
+
     /**
      * 箭头圆底中性色：设计稿 #F2F4F7。
      * 深色无设计稿值，取白 14% 的中性叠层，不做反色。

@@ -378,6 +378,9 @@ object ArkConstants {
     /** 导航展开卡：转向类型（Int，0 直行 / 1 左转 / 2 右转 / 3 掉头 / 4 到达） */
     const val NAV_KEY_TURN = "flymeark.nav.turn"
 
+    /** 偏航态：true = 高德已播报偏航 / 重新规划，迷你条三点转 NAV_YAW_RED */
+    const val NAV_KEY_YAWED = "flymeark.nav.yawed"
+
     /** 导航展开卡 Activity 全类名（SystemUI 按类名显式拉起） */
     const val NAV_PANEL_ACTIVITY = "com.flymeark.ArkNavPanelActivity"
 

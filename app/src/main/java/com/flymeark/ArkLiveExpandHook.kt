@@ -2322,6 +2322,9 @@ internal object ArkLiveExpandHook {
             ex?.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT)
                 ?: ArkConstants.NAV_TURN_STRAIGHT
         )
+        b.putBoolean(
+            ArkConstants.NAV_KEY_YAWED, ex?.getBoolean(ArkConstants.NAV_KEY_YAWED, false) ?: false
+        )
         return b
     }
 
@@ -2343,7 +2346,8 @@ internal object ArkLiveExpandHook {
             p.getString(ArkConstants.NAV_KEY_ETA).orEmpty(),
             p.getLong(ArkConstants.NAV_KEY_TOTAL_MS, 0L).toString(),
             p.getLong(ArkConstants.NAV_KEY_REMAIN_MS, -1L).toString(),
-            p.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT).toString()
+            p.getInt(ArkConstants.NAV_KEY_TURN, ArkConstants.NAV_TURN_STRAIGHT).toString(),
+            p.getBoolean(ArkConstants.NAV_KEY_YAWED).toString(),
         ).joinToString("\u0001")
     } catch (_: Throwable) {
         ""
