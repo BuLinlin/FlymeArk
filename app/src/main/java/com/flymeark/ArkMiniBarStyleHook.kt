@@ -133,6 +133,20 @@ internal object ArkMiniBarStyleHook {
     private val KEY_CENTERED = "flymeark.mini.centered".hashCode()
     private val KEY_NAV = "flymeark.mini.nav".hashCode()
 
+    /**
+     * 上一次**成功解析**的导航载荷（v3.15.69）。
+     *
+     * [navPayloadOf] 的 catch 会返回全默认的 [NavMiniPayload]（反射失败时唯一的活路），
+     * 而 [applyNavStructure] 是无条件 `setData(...)` 的 —— 任何一次反射失败都会把
+     * 上一帧画好的进度 / 时间 / 偏航红**当场抹空**，只剩转向块 + logo + 空轨道。
+     * 用户看到的是「条突然空了」，比冻结在上一帧难看得多，外观还和高德原生那一行
+     * 几乎一样，分不清是降级还是正常。
+     *
+     * 所以这里存一份 last-good：解析不出来就沿用它，语义上等同「两次播报之间冻结」，
+     * 与产品口径（锚点式进度、两帧之间不动）一致。
+     */
+    private var lastGoodNav: NavMiniPayload? = null
+
     @Volatile
     private var idsReady = false
 
@@ -295,7 +309,16 @@ internal object ArkMiniBarStyleHook {
         row: View?,
     ) {
         val parent = header as? ViewGroup ?: return
-        val p = navPayloadOf(row)
+        val parsed = navPayloadOf(row)
+        // 三个字段全空 = 解析失败（正常导航帧至少有一个），此时沿用上一次成功的载荷。
+        // 语义上等同「两次播报之间冻结」，与产品口径一致。
+        val usable = parsed.instr.isNotBlank() || parsed.totalMs > 0L || parsed.remainMs >= 0L
+        val p = if (usable) {
+            lastGoodNav = parsed
+            parsed
+        } else {
+            lastGoodNav ?: parsed
+        }
 
         var overlay = header.getTag(KEY_NAV) as? ArkMiniNavView
         if (overlay == null) {

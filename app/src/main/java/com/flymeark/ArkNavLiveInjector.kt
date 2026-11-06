@@ -381,6 +381,12 @@ internal object ArkNavLiveInjector {
      */
     private var navYawed = false
 
+    /** 最近一次置红的时刻（elapsedRealtime）。用于「最短保持」：避免红只闪一下用户看不见 */
+    private var yawedAt = 0L
+
+    /** 偏航红最短保持时长：高德常在偏航后 3~5 秒内就播下一条转向，太短会看不出变过色 */
+    private const val YAW_MIN_HOLD_MS = 12_000L
+
     /** 每趟导航只 dump 一次原通知 extras，用于定位高德把目的地名放在哪个字段 */
     private var extrasDumped = false
 
@@ -1003,32 +1009,65 @@ internal object ArkNavLiveInjector {
     }
 
     /**
-     * 按播报文本更新偏航态（v3.15.67）。
+     * 按播报文本更新偏航态（v3.15.67 落地，v3.15.69 重写清零策略）。
      *
-     * 判定顺序：**先看偏航词，再看回主路词**。理由：一句话里同时出现两者只可能是
-     * `您已偏航,…然后回到主路` 这类边偏航边指引的播报，此时「红」是更安全的观感
-     * （用户对偏航的警觉需求高于对已恢复的确认）；而真实恢复播报是独立的一句
-     * `已回到主路`，不会同时含偏航词，所以不会漏清。
+     * ## 为什么 v3.15.69 要重写
      *
-     * 状态没变时不写日志、不 invalidate —— 每 3 秒一句播报，重复刷日志没有价值。
+     * 旧实现只有 `YAW_OFF_PHRASES = ["回到主路", "已回到"]` 这一条清零路径，而真机上
+     * 高德重新规划成功后更常播的是「已为您重新规划路线，请沿当前道路继续行驶」——
+     * 这句话**不含任何 OFF 词**，反而含 `重新规划` 会再次命中 ON 词，结果整趟红到底。
+     *
+     * ## 现在的判定顺序（顺序本身是正确性的一部分，别调换）
+     *
+     * 1. 命中偏航词 → 变红，并记下置红时刻 [yawedAt]；
+     * 2. 本来就不红 → 直接返回（绝大多数帧走这条，零额外开销）；
+     * 3. [YAW_MIN_HOLD_MS] 最短保持期内 → **任何播报都不许清**。高德常在偏航后
+     *    3~5 秒内就播下一条转向，若立刻清，红只闪一两秒，用户根本看不出变过色；
+     * 4. 兜底清零 A：明确的「回到主路」类措辞；
+     * 5. 兜底清零 B：高德又给出了**有效道路指引**（[pickCapsuleText] 能抠出句子），
+     *    说明它已经重新规划完、并且正在新路线上指引 —— 继续红着没有意义。
+     *    噪音句（`高德地图持续为您导航` 之类）过不了 [pickCapsuleText]，不会误清。
+     *
+     * 状态没变时**不写日志** —— 每 3 秒一句播报，重复刷日志没有价值。
      *
      * @param raw 本轮播报的整段文本（`groupData` 拼接结果，退回 `data`）
      */
     private fun updateYawState(raw: String?) {
         if (raw.isNullOrBlank()) return
         try {
+            val now = SystemClock.elapsedRealtime()
+
+            // ① 先判偏航词（命中即红，并记下置红时刻）
             if (YAW_ON_PHRASES.any { raw.contains(it) }) {
                 if (!navYawed) {
                     navYawed = true
+                    yawedAt = now
                     log("yaw state=true text='${raw.take(48)}'")
                 }
                 return
             }
+
+            // ② 没在偏航态，什么都不用做
+            if (!navYawed) return
+
+            // ③ 最短保持期内的任何播报都不许清 —— 否则偏航那句之后紧跟的重复转向
+            //    播报会把红在一两秒内抹掉，用户根本看不见
+            if (now - yawedAt < YAW_MIN_HOLD_MS) return
+
+            // ④ 兜底清零 A：明确的「回到主路」类措辞
             if (YAW_OFF_PHRASES.any { raw.contains(it) }) {
-                if (navYawed) {
-                    navYawed = false
-                    log("yaw state=false text='${raw.take(48)}'")
-                }
+                navYawed = false
+                log("yaw state=false (off-phrase) text='${raw.take(48)}'")
+                return
+            }
+
+            // ⑤ 兜底清零 B（v3.15.69 新增）：高德又给出了**有效道路指引**，
+            //    说明它已经重新规划完并且在新路线上 —— 此时继续红着没有意义。
+            //    噪音句（`持续为您导航` 之类）pickCapsuleText 返回 null，不会误清。
+            val instr = pickCapsuleText(raw)
+            if (instr != null) {
+                navYawed = false
+                log("yaw state=false (guidance resumed) text='${raw.take(48)}'")
             }
         } catch (_: Throwable) {
             // 判定失败保持原状：宁可沿用上一帧的颜色，也不许炸掉播报链路
@@ -1093,6 +1132,8 @@ internal object ArkNavLiveInjector {
             navStartedAt = now
             // v3.15.67：新一趟从蓝色开始 —— 上一趟最后一句若是偏航，不清零就会一出发就红
             navYawed = false
+            // v3.15.69：置红时刻一并归零，否则新一趟的「最短保持」会被上一趟的旧时间戳算成已过期
+            yawedAt = 0L
             navState = STATE_ACTIVE
             navActive = true
             navEndingAt = 0L
@@ -1810,6 +1851,10 @@ internal object ArkNavLiveInjector {
      *
      * 刻意**不含** `anchorAt`：它每帧都变，算进来等于取消去重。
      *
+     * v3.15.69 补入 [navYawed]：偏航翻转本身必须算一次「载荷变了」。否则偏航帧若文案
+     * 与上一帧相同（同一路口重复播报，真机见过），指纹不变 → [updateShadowContent]
+     * 直接 return → 影子不重投 → 迷你条永远不变红。
+     *
      * @param content     这一帧要写进胶囊的文案
      * @param remainPair  已经算好的「剩余耗时（值, 单位）」（避免重复计算 / 两次取值不一致）
      */
@@ -1825,7 +1870,8 @@ internal object ArkNavLiveInjector {
             etaText,
             totalMs.toString(),
             (if (tripTotalMs > 0L) tripTotalMs else lastTripTotalMs).toString(),
-            remainMs.toString()
+            remainMs.toString(),
+            navYawed.toString()
         ).joinToString("\u0001")
     } catch (_: Throwable) {
         ""
