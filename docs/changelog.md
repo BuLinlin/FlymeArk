@@ -2,6 +2,116 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.54 语音播报任务探针（JNIPlayer / AudioPlayerTask）
+
+### 0. v3.15.53 的实测结论（用户真机验证）
+
+| 项 | 结果 |
+|---|---|
+| `NaviManager.registerEventReceiver` hook | ✅ hook 成功（`recv: hooked ... x1`） |
+| 真实导航过程中的 `onNaviEvent` / `onNaviNonSerialEvent` | ❌ **零触发**，一条事件都没进来 |
+| `NaviManager.queryData(int, String)` | ❌ 零触发 |
+| `recv: unregistered <impl>` | ❌ 未出现 |
+
+结论：**高德手机端根本不使用 eyrie TBT 引擎**。`com.autonavi.jni.eyrie.amap.tbt.*`
+是车机投射 / HiCar / 投屏场景用的那套 TBT 通道，手机端导航不走它 ——
+所以无论注册点 hook 得多准，都不会有事件。这条线到此为止。
+
+### 1. 本版目标：验证「播报文案是否以 TTS 任务形式穿过 `com.autonavi.jni.tts`」
+
+导航文案（「前方 300 米右转」「已偏航，正在重新规划」）在手机上一定是播出来的。
+如果它走 `com.autonavi.jni.tts`，那我们就拿到了**唯一一条既实时、又自带语义**的数据源，
+比从通知 extras 里抠 `android.text` 强得多。本版只埋探针，**不动任何业务逻辑**。
+
+逆向得到的类（classes5.dex）：
+
+```
+com.autonavi.jni.tts.AudioPlayerTask        // 任务包
+    short  taskType                         // 0 / 6 / 7 ……（预录 spx vs 实时合成）
+    String data                             // 待播文本（假设，待验证）
+    String groupData
+    short  owner / int tag / long taskId
+
+com.autonavi.jni.tts.JNIPlayer (abstract)   // native 播放器门面
+    playAudioFileStart(AudioPlayerTask)                  // 任务式播放
+    playPCMStart(AudioPlayerTask)                        // 任务式 PCM
+    playAudioFile(long, short, String, int, int)          // 第 3 参 = .spx 文件路径
+```
+
+假设待验证：**固定短句**（「前方路口右转」）是预录 `.spx`，走 `playAudioFile` 那族，
+`taskType` 为某个固定值；**变量文本**（路名、剩余距离）才是 TTS 合成，塞在
+`AudioPlayerTask.data` 里。两者一对比就能看出哪条路承载真实中文文案。
+
+### 2. 探针 6：怎么找到 JNIPlayer 的实现类
+
+`JNIPlayer` 是 abstract，实现类是混淆名（调研时看到的是 `j25`），**不能硬编码**：
+
+1. **快速路径**：`findCls(cl, "j25")`，命中且 `superclass?.name == "com.autonavi.jni.tts.JNIPlayer"`
+   → 立刻挂；
+2. **兜底（无论快速路径是否命中都会装）**：hook `ClassLoader.loadClass`，
+   `afterHookedMethod` 里 `param.result as? Class<*>`，只做一次
+   `superclass?.name` 字符串比较，非目标立刻 `return`；命中则 `hookPlayerImpl`。
+   这样高德换版本改混淆名也不怕。（`loadClass` 还有 `(String, boolean)` 重载，
+   用 `param.args.size != 1` 过滤掉。）
+3. `HashSet<String> playerHooked` 按类名去重，避免同一实现类被挂两次。
+
+前置条件：`com.autonavi.jni.tts.AudioPlayerTask` 拿不到就直接放弃并打
+`tts: AudioPlayerTask not found` —— 没有 `taskCls` 就没法反射字段，硬挂只会刷异常。
+
+### 3. 三个方法各自打什么
+
+| 方法 | probe key | 日志内容 |
+|---|---|---|
+| `playAudioFileStart(AudioPlayerTask)` | `tts` | `start type=<taskType> data='<前200字>' group='<前80字>'` |
+| `playPCMStart(AudioPlayerTask)` | `ttspcm` | `pcm type=... data='...' group='...'` |
+| `playAudioFile(long, short, String, int, int)` | `ttsf` | `snd=<第2参 short> file='<第3参路径前120字>'` |
+
+字段全部走 `XposedHelpers.getShortField/getObjectField`，每个字段单独 try/catch，
+字段改名只丢那一个值（退化成 `-1` / 空），不会让 hook 抛异常到高德。
+
+日志复用既有 `probe()`：**内容去重 + 1500ms 节流**，另加**总量上限 200 条**
+（`ttsCount` / `TTS_MAX_LOG`），防止连续播报刷爆 logcat。
+
+### 4. 挂载结果日志速查
+
+```
+[FlymeArk] probe tts: AudioPlayerTask = com.autonavi.jni.tts.AudioPlayerTask
+[FlymeArk] probe tts: player impl j25
+[FlymeArk] probe tts: hooked j25.playAudioFileStart
+[FlymeArk] probe tts: hooked j25.playPCMStart
+[FlymeArk] probe tts: hooked j25.playAudioFile
+[FlymeArk] probe tts: watching ClassLoader.loadClass for com.autonavi.jni.tts.JNIPlayer impl
+--- 以上是安装期；以下是播报期 ---
+[FlymeArk] probe tts: start type=0 data='...' group='...'
+[FlymeArk] probe ttsf: snd=0 file='/data/.../*.spx'
+```
+
+失败形态只有这几种，一眼可辨：
+
+```
+probe tts: AudioPlayerTask not found
+probe tts: fast path j25 absent, rely on loadClass watcher
+probe tts: j25 super=xxx (not JNIPlayer), skip fast path
+probe tts: playAudioFileStart unavailable on j25: java.lang.NoSuchMethodException...
+probe tts: loadClass watcher failed ...
+```
+
+### 5. 本版没有改的东西
+
+零业务改动。`ArkNavLiveInjector` 的注入/识别/影子通知逻辑、`ArkLiveShadowHook`、
+`ArkConstants`、`ArkEntry`、`ArkLiveSettingsHook`、`arrays.xml`、迷你条、消息卡、
+音乐卡全部原样未动 —— 本版纯加探针。
+
+### 未验证
+
+- **探针 6 是否真能拦到播报任务**（构建期无法验证，需跑一段真实导航听播报）；
+- `AudioPlayerTask.data` 到底是不是中文文案（也可能是 PCM 的 base64 或空串）；
+- `taskType` 的语义（0/6/7 各代表什么）需要靠真机日志反推；
+- 若高德把 TTS 放在独立进程（`:tts` 之类）而作用域只勾了主包，探针会完全静默 ——
+  届时看 `pidof com.autonavi.minimap` 是不是多进程即可判断。
+
+版本 `versionCode 77 / 3.15.54`（debug 变体已装机，release 签名同 debug key）。
+
 ## 2026-11-06 · v3.15.53 导航真实数据探针重做（动态挂 NaviEventReceiver + queryData）
 
 ### 0. v3.15.52 的实测结论（用户真机验证）

@@ -705,6 +705,169 @@ internal object ArkNavLiveInjector {
         } catch (t: Throwable) {
             probeRaw("qdata: hook failed ${t.message}")
         }
+
+        // ---- 探针 6：语音播报任务（JNIPlayer 实现类）（v3.15.54）
+        //
+        // v3.15.53 的 NaviManager 探针在真机真实导航中零触发 —— 高德手机端不走
+        // eyrie TBT 引擎（那是车机投射 / HiCar 用的）。改看语音播报：
+        //   com.autonavi.jni.tts.AudioPlayerTask  { taskType(short), data, groupData, ... }
+        //   com.autonavi.jni.tts.JNIPlayer (abstract)
+        //       playAudioFileStart(AudioPlayerTask) / playPCMStart(AudioPlayerTask)
+        //       playAudioFile(long, short, String, int, int)   // 第 3 参是 .spx 路径
+        // 假设待验证：固定短句是预录 .spx 文件，TTS 合成文本在 AudioPlayerTask.data。
+        try {
+            val taskCls = findCls(cl, "com.autonavi.jni.tts.AudioPlayerTask")
+            if (taskCls == null) {
+                probeRaw("tts: AudioPlayerTask not found")
+            } else {
+                probeRaw("tts: AudioPlayerTask = ${taskCls.name}")
+                // 快速路径：混淆名通常是 j25，命中就立刻挂
+                val fast = findCls(cl, "j25")
+                if (fast == null) {
+                    probeRaw("tts: fast path j25 absent, rely on loadClass watcher")
+                } else if (fast.superclass?.name == JNI_PLAYER_CLS) {
+                    hookPlayerImpl(fast, taskCls)
+                } else {
+                    probeRaw("tts: j25 super=${fast.superclass?.name} (not JNIPlayer), skip fast path")
+                }
+                // 兜底：运行期发现（类名随版本变也不怕）
+                installClassLoadWatcher(taskCls)
+            }
+        } catch (t: Throwable) {
+            probeRaw("tts: probe install failed ${t.message}")
+        }
+    }
+
+    // ---------------------------------------------------------------- 探针 6 的实现
+
+    private const val JNI_PLAYER_CLS = "com.autonavi.jni.tts.JNIPlayer"
+
+    /** 语音任务日志总量上限，防止播报密集时刷爆 logcat */
+    private var ttsCount = 0
+    private const val TTS_MAX_LOG = 200
+
+    /** 已挂过探针的 JNIPlayer 实现类（按类名去重） */
+    private val playerHooked = HashSet<String>(4)
+
+    /**
+     * 运行期发现 `JNIPlayer` 的实现类。
+     *
+     * 为什么不硬编码 `j25`：混淆类名会随高德版本变。这里挂 `ClassLoader.loadClass`，
+     * 每次类加载后只做一次 `superclass?.name` 字符串比较，非目标立刻 return，
+     * 开销可以忽略；整个 hook 也包在 try/catch 里。
+     */
+    private fun installClassLoadWatcher(taskCls: Class<*>) {
+        try {
+            XposedBridge.hookAllMethods(
+                ClassLoader::class.java, "loadClass",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        // 同一个名字还有 loadClass(String, boolean) 重载，只处理单参那个
+                        if (param.args.size != 1) return
+                        if (param.args[0] !is String) return
+                        val c = param.result as? Class<*> ?: return
+                        if (c.superclass?.name != JNI_PLAYER_CLS) return
+                        try {
+                            hookPlayerImpl(c, taskCls)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("tts: watching ClassLoader.loadClass for $JNI_PLAYER_CLS impl")
+        } catch (t: Throwable) {
+            probeRaw("tts: loadClass watcher failed ${t.message}")
+        }
+    }
+
+    /** 在一个 JNIPlayer 实现类上挂三个方法（逐个 try/catch） */
+    private fun hookPlayerImpl(c: Class<*>, taskCls: Class<*>) {
+        if (!playerHooked.add(c.name)) return
+        probeRaw("tts: player impl ${c.name}")
+
+        hookTaskMethod(c, taskCls, "playAudioFileStart", "tts", "start")
+        hookTaskMethod(c, taskCls, "playPCMStart", "ttspcm", "pcm")
+
+        // playAudioFile(long, short, String, int, int)：第 3 参是音频文件路径
+        try {
+            val m = c.getDeclaredMethod(
+                "playAudioFile",
+                Long::class.javaPrimitiveType,
+                Short::class.javaPrimitiveType,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            )
+            m.isAccessible = true
+            XposedBridge.hookMethod(
+                m,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            if (ttsCount > TTS_MAX_LOG) return
+                            val snd = param.args.getOrNull(1)
+                            val file = param.args.getOrNull(2) as? String
+                            ttsCount++
+                            probe("ttsf", "snd=$snd file='${file?.take(120) ?: ""}'")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("tts: hooked ${c.name}.playAudioFile")
+        } catch (t: Throwable) {
+            probeRaw("tts: playAudioFile unavailable on ${c.name}: ${t.message}")
+        }
+    }
+
+    /** 挂 `playAudioFileStart` / `playPCMStart`（参数是 AudioPlayerTask） */
+    private fun hookTaskMethod(
+        c: Class<*>,
+        taskCls: Class<*>,
+        methodName: String,
+        key: String,
+        prefix: String
+    ) {
+        try {
+            val m = c.getDeclaredMethod(methodName, taskCls)
+            m.isAccessible = true
+            XposedBridge.hookMethod(
+                m,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            if (ttsCount > TTS_MAX_LOG) return
+                            val task = param.args.getOrNull(0) ?: return
+                            val type = try {
+                                XposedHelpers.getShortField(task, "taskType")
+                            } catch (_: Throwable) {
+                                -1
+                            }
+                            val data = try {
+                                XposedHelpers.getObjectField(task, "data") as? String
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            val group = try {
+                                XposedHelpers.getObjectField(task, "groupData") as? String
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            ttsCount++
+                            probe(
+                                key,
+                                "$prefix type=$type data='${data?.take(200) ?: ""}' " +
+                                    "group='${group?.take(80) ?: ""}'"
+                            )
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("tts: hooked ${c.name}.$methodName")
+        } catch (t: Throwable) {
+            probeRaw("tts: $methodName unavailable on ${c.name}: ${t.message}")
+        }
     }
 
     /** 已挂过探针的 receiver 实现类（按类名去重，避免重复注册时重复挂） */
