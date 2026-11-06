@@ -2083,7 +2083,10 @@ internal object ArkLiveExpandHook {
             } catch (_: Throwable) {
                 null
             }
+            // v3.15.53：导航影子（flymeark_live_nav）也一并跳过。
+            // 消息取图路径只认消息影子，否则导航胶囊会串进消息面板的取图/取头像逻辑。
             if (tag == ArkMessageLiveInjector.SHADOW_TAG) return@forEach
+            if (tag == ArkNavLiveInjector.NAV_SHADOW_TAG) return@forEach
             val at = try {
                 XposedHelpers.callMethod(sbn, "getPostTime") as? Long ?: 0L
             } catch (_: Throwable) {

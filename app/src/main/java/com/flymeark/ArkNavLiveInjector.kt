@@ -608,7 +608,167 @@ internal object ArkNavLiveInjector {
         } catch (t: Throwable) {
             probeRaw("tbt: hook failed ${t.message}")
         }
+
+        // ---- 探针 4：动态挂所有 NaviEventReceiver 实现（v3.15.53）
+        //
+        // 高德 TBT 引擎的 Java 入口是
+        //   com.autonavi.jni.eyrie.amap.tbt.NaviManager.registerEventReceiver(NaviEventReceiver)
+        // `NaviEventReceiver` 是 abstract 类，dex 里的具体子类只有 6 个，且全是混淆名
+        // （ke1$a / ua4$a / hy1$a …）—— 硬编码类名必然随版本挂掉。
+        // 所以只挂「注册点」，拿到实参对象后在它的 getClass() 上装那两个抽象方法。
+        try {
+            val naviMgr = findCls(cl, "com.autonavi.jni.eyrie.amap.tbt.NaviManager")
+            if (naviMgr == null) {
+                probeRaw("recv: NaviManager not found")
+            } else {
+                val regSet = XposedBridge.hookAllMethods(
+                    naviMgr, "registerEventReceiver",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            try {
+                                val receiver = param.args.getOrNull(0) ?: return
+                                val rc = receiver.javaClass
+                                if (!recvHooked.add(rc.name)) return
+                                probeRaw("recv: registered ${rc.name}")
+                                hookReceiverMethods(rc)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                )
+                probeRaw(
+                    if (regSet.isEmpty()) {
+                        "recv: registerEventReceiver not found in ${naviMgr.name}"
+                    } else {
+                        "recv: hooked ${naviMgr.name}.registerEventReceiver x${regSet.size}"
+                    }
+                )
+
+                // 注销探针：判断导航结束时高德是否真的反注册（决定胶囊该何时消失）
+                try {
+                    val unregSet = XposedBridge.hookAllMethods(
+                        naviMgr, "unregisterEventReceiver",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                try {
+                                    val receiver = param.args.getOrNull(0) ?: return
+                                    probeRaw("recv: unregistered ${receiver.javaClass.name}")
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
+                    )
+                    if (unregSet.isEmpty()) {
+                        probeRaw("recv: unregisterEventReceiver not found in ${naviMgr.name}")
+                    } else {
+                        probeRaw("recv: hooked ${naviMgr.name}.unregisterEventReceiver x${unregSet.size}")
+                    }
+                } catch (t: Throwable) {
+                    probeRaw("recv: unregisterHook failed ${t.message}")
+                }
+            }
+        } catch (t: Throwable) {
+            probeRaw("recv: NaviManager hook failed ${t.message}")
+        }
+
+        // ---- 探针 5：NaviManager.queryData(int, String)（v3.15.53）
+        //
+        // UI 每帧要显示的数据都是从这里 poll 出来的，比盲猜事件类型快得多：
+        // 能看到它在轮询哪些 key、以及返回 JSON 的字段结构。
+        try {
+            val naviMgr = findCls(cl, "com.autonavi.jni.eyrie.amap.tbt.NaviManager")
+            if (naviMgr == null) {
+                probeRaw("qdata: NaviManager not found")
+            } else {
+                val set = XposedBridge.hookAllMethods(
+                    naviMgr, "queryData",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            try {
+                                val i = param.args.getOrNull(0)
+                                val k = param.args.getOrNull(1)
+                                val r = param.result
+                                probe("qdata", "i=$i key=$k -> ${r?.toString()?.take(500)}")
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                )
+                probeRaw(
+                    if (set.isEmpty()) {
+                        "qdata: queryData not found in ${naviMgr.name}"
+                    } else {
+                        "qdata: hooked ${naviMgr.name}.queryData x${set.size}"
+                    }
+                )
+            }
+        } catch (t: Throwable) {
+            probeRaw("qdata: hook failed ${t.message}")
+        }
     }
+
+    /** 已挂过探针的 receiver 实现类（按类名去重，避免重复注册时重复挂） */
+    private val recvHooked = HashSet<String>(8)
+
+    /** TBT 事件日志总量上限（导航时每秒十几条，无上限会刷爆 logcat） */
+    private var recvCount = 0
+    private const val RECV_MAX_LOG = 300
+
+    /**
+     * 在一个具体的 NaviEventReceiver 实现类上装两个抽象方法的探针。
+     * 每一步单独 try/catch —— 方法签名变了只丢这一条日志，绝不影响高德。
+     */
+    private fun hookReceiverMethods(rc: Class<*>) {
+        try {
+            val m = rc.getDeclaredMethod("onNaviEvent", String::class.java)
+            m.isAccessible = true
+            XposedBridge.hookMethod(
+                m,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            if (recvCount > RECV_MAX_LOG) return
+                            val s = param.args.getOrNull(0) as? String ?: return
+                            recvCount++
+                            probe("recv", "${rc.simpleName} ${s.take(600)}")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("recv: hooked ${rc.name}.onNaviEvent")
+        } catch (t: Throwable) {
+            probeRaw("recv: onNaviEvent unavailable on ${rc.name}: ${t.message}")
+        }
+
+        // onNaviNonSerialEvent(String, byte[])：第二参是二进制，内容不打印（不刷屏），
+        // 每个实现类只记一条「真的在走这条路」，用来判断哪条 receiver 是活跃的。
+        try {
+            val m = rc.getDeclaredMethod(
+                "onNaviNonSerialEvent", String::class.java, ByteArray::class.java
+            )
+            m.isAccessible = true
+            XposedBridge.hookMethod(
+                m,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            if (!recvNonSerialSeen.add(rc.name)) return
+                            val len = (param.args.getOrNull(1) as? ByteArray)?.size ?: 0
+                            probeRaw("recv: nonSerial active on ${rc.name} bytes=$len")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            )
+            probeRaw("recv: hooked ${rc.name}.onNaviNonSerialEvent")
+        } catch (t: Throwable) {
+            probeRaw("recv: onNaviNonSerialEvent unavailable on ${rc.name}: ${t.message}")
+        }
+    }
+
+    /** 已经见过非序列事件的 receiver（每类只记一条） */
+    private val recvNonSerialSeen = HashSet<String>(8)
 
     private fun isNavigating(n: Notification): Boolean = try {
         n.extras?.getBoolean(EXTRA_NAVIGATING, false) == true

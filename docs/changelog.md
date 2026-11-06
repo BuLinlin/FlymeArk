@@ -2,6 +2,83 @@
 
 > 纯 Kotlin LSPosed 模块。只 hook 播放器与 SystemUI，不自建胶囊、不发通知、无常驻进程。
 
+## 2026-11-06 · v3.15.53 导航真实数据探针重做（动态挂 NaviEventReceiver + queryData）
+
+### 0. v3.15.52 的实测结论（用户真机验证）
+
+| 项 | 结果 |
+|---|---|
+| `Service.startForeground` hook | ✅ **生效**，胶囊能出来、能点回高德 |
+| 胶囊内容 | 只能是高德的占位文案 `高德地图 · 正在导航`（通知 extras 里就这些） |
+| `probe fj5` / `probe routeJson` | ✅ hook 成功（`hooked ... x1`），但整个会话**零触发** → 高德导航数据不走 AJX 那条漏斗 |
+| `probe tbt` | ❌ `GStatusObserver` 是抽象接口，ART 里没有 code，hook 不了 |
+
+结论：**从通知层拿不到真实导航数据**，必须往 TBT 引擎里看。
+
+### 1. 探针 4：动态挂 `NaviEventReceiver` 的所有实现
+
+TBT 引擎的 Java 入口（classes5.dex）：
+
+```
+com.autonavi.jni.eyrie.amap.tbt.NaviManager
+  registerEventReceiver(NaviEventReceiver)     ← hook 这个注册点
+  unregisterEventReceiver(NaviEventReceiver)   ← hook 用于判断导航结束时是否注销
+```
+
+`NaviEventReceiver` 是 **abstract 类**，两个抽象方法：
+`onNaviEvent(String)` / `onNaviNonSerialEvent(String, byte[])`。
+
+全部 8 个 dex 的 `class_def` 扫下来只有 6 个具体子类，且**全是混淆名**
+（`ke1$a`、`ua4$a`、`hy1$a`、`HicarXbusEmitter$a`、`NaviCrossManager$a`、
+`MiniAppShowRouteManager$1`）—— 硬编码类名必然随版本挂掉。
+
+因此实现为**动态**：
+
+1. `hookAllMethods(NaviManager, "registerEventReceiver")`；
+2. `afterHookedMethod` 取实参 → `val rc = receiver.javaClass`；
+3. `HashSet<String>` 按类名去重，首次见到的类打 `recv: registered <类名>`；
+4. 在 `rc.getDeclaredMethod("onNaviEvent", String)` 上 `XposedBridge.hookMethod`，
+   成功打 `recv: hooked <类名>.onNaviEvent`，失败打
+   `recv: onNaviEvent unavailable on <类名>: <msg>`（**每步独立 try/catch**）；
+5. `onNaviNonSerialEvent(String, byte[])` 同法挂，**不打印事件内容**（二进制），
+   每类只在首次触发时打一条 `recv: nonSerial active on <类名> bytes=N`，
+   用来判断哪条 receiver 是活跃的；
+6. `unregisterEventReceiver` 的 `afterHookedMethod` 打 `recv: unregistered <类名>`。
+
+事件日志走既有 `probe("recv", ...)`：内容去重 + 1500ms 节流，另加**总量上限 300 条**
+（`recvCount`），防止 TBT 每秒十几条把 logcat 刷爆。
+
+### 2. 探针 5：`NaviManager.queryData(int, String)`
+
+UI 每帧显示的数据都是从这里 poll 出来的，比盲猜事件类型快：
+`probe qdata: i=<int> key=<String> -> <返回 JSON 前 500 字>`。
+
+### 3. 一处防御性隔离
+
+`ArkLiveExpandHook`（消息胶囊取图路径）：原来只跳过 `flymeark_live_msg` 影子，
+现在同时跳过 `flymeark_live_nav`。原因：用户要求**导航胶囊与消息胶囊完全隔离**，
+导航影子绝不能进消息面板的取图/取头像逻辑。
+
+### 4. 日志速查
+
+```
+[FlymeArk] probe recv: hooked com.autonavi.jni.eyrie.amap.tbt.NaviManager.registerEventReceiver x1
+[FlymeArk] probe recv: registered <impl>
+[FlymeArk] probe recv: hooked <impl>.onNaviEvent
+[FlymeArk] probe recv: <SimpleName> {"type":..., ...}      ← 真正的导航载荷
+[FlymeArk] probe recv: nonSerial active on <impl> bytes=1234
+[FlymeArk] probe qdata: i=0 key=... -> {...}
+[FlymeArk] probe recv: unregistered <impl>
+```
+
+### 未验证
+
+- 探针 4/5 是否真能拦到（构建时无法验证，需跑一段真实导航）；
+- `NaviManager` 是否在首次导航时才实例化（若如此，注册点 hook 在 App 启动时装好，仍能覆盖）；
+- `queryData` 的调用频率（已走节流，但若 key 每次不同可能仍偏多，届时按 key 限流）。
+
+版本 `versionCode 76 / 3.15.53`（debug 变体已装机，release 签名同 debug key）。
+
 ## 2026-11-06 · v3.15.52 修 startForeground 漏 hook + 埋 3 个导航数据探针
 
 > v3.15.51 实测失败：胶囊从未出现，日志里只有 `navInject: installing`，零 `hit`。
