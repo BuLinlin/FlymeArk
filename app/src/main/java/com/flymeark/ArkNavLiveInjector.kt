@@ -97,6 +97,19 @@ internal object ArkNavLiveInjector {
     const val NAV_SHADOW_CHANNEL = "flymeark_live_nav_ch"
     const val NAV_SHADOW_ID = 0x4B000002
 
+    /**
+     * v3.15.79：**实证有害，暂时关闭。**
+     *
+     * 它只在 `postShadow` 里调用一次，之后播报更新走 `updateShadowContent` 不再改标题，
+     * 于是把高德原生那条的 `EXTRA_TITLE` 永久钉在起始帧的占位文案
+     * （「高德地图 · 正在导航」）上 —— 用户屏幕上那行字就冻在这。
+     *
+     * 现在改由 SystemUI 侧统一写标题（`ArkMiniBarStyleHook.writeNavTitle`，
+     * 每帧 preDraw + 自驱轮询兜底），数据源是影子的 `NAV_KEY_INSTR`。
+     * 函数本体保留（[rewriteSourceTitle]），以后要用把这里改 true 即可。
+     */
+    private const val REWRITE_SRC_TITLE = false
+
     /** 胶囊底色：沿用模块品牌蓝，字色按底色亮度自适应（与消息卡同一套规则） */
     private const val CAPSULE_BG = ArkTokens.BRAND_LIGHT
 
@@ -789,7 +802,9 @@ internal object ArkNavLiveInjector {
         //
         // 所以这里直接把高德那条的 contentTitle 换成指令再重投一次 —— 它自己每几秒
         // 会把标题刷回「高德地图」，所以每帧都要改。
-        rewriteSourceTitle(nm, src, notifId, content)
+        // v3.15.79：默认**关闭**（见 [REWRITE_SRC_TITLE] 的注释）——
+        // 它只改一次标题，反而把原生条钉死在起始帧占位文案上。标题现由 SystemUI 侧写。
+        if (REWRITE_SRC_TITLE) rewriteSourceTitle(nm, src, notifId, content)
         // v3.15.65：这一帧就是「上次投递过的载荷」，让后续播报的去重基准对齐，
         // 否则第一条播报会无谓地重投一次（内容一模一样）
         lastShadowSig = shadowSigOf(content, remainTimePair())

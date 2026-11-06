@@ -211,6 +211,13 @@ internal object ArkMiniBarStyleHook {
     private var lastApplySig = ""
     private var lastApplyLoggedAt = 0L
 
+    /**
+     * 最近一次被 [applyNavStructure] 处理过的导航 row（v3.15.79 D，弱引用防泄漏）。
+     * poller 靠它重读 sbn：系统更新通知时 `entry.mSbn` 会换成新对象，
+     * **只要 View 还在，重读就能拿到新数据** —— 不需要新的 UI 回调，也不需要 IPC。
+     */
+    private var navRowRef: WeakReference<View>? = null
+
     @Volatile
     private var idsReady = false
 
@@ -404,19 +411,13 @@ internal object ArkMiniBarStyleHook {
         row: View?,
     ) {
         val parent = header as? ViewGroup ?: return
-        // v3.15.78 数据源优先级：活动通知里的影子（最新，不等 UI 回调）→ 本行 extras → lastGoodNav。
-        // 真机实证：注入器侧 navTts 每几秒在重投，SystemUI 侧 4 分钟里只有一条 navApply ——
-        // 影子重投之后不再有 UI 回调，UI 只能自己去取，否则永久冻在第一帧。
-        val rowPayload = navPayloadOf(row)
-        val fresh = freshShadowPayload(header.context)
-        // 只有「影子存在 + 真的带 NAV_KEY_* + 不是占位帧」才算可用数据源
-        val freshUsable = if (fresh != null && fresh.present && !isPlaceholder(fresh)) fresh else null
-        val parsed = freshUsable ?: rowPayload
-        val src = when {
-            freshUsable != null -> "fresh"
-            rowPayload.present -> "row"
-            else -> "lastgood"
-        }
+        // v3.15.79：`freshShadowPayload`（getActiveNotifications）已实证是死路 ——
+        // 那个 API 只返回**调用方自己发的**通知，SystemUI 永远看不到 autonavi 的影子。
+        // 数据源回到「重读本行 sbn」（`entry.mSbn` 每次刷新都会换新对象，重读即最新）。
+        val parsed = navPayloadOf(row)
+        val src = if (parsed.present) "row" else "lastgood"
+        // v3.15.79 D：缓存最近一次被处理过的导航 row，poller 靠它重读 sbn（非 IPC）
+        if (row != null) navRowRef = WeakReference(row)
         // v3.15.72：把 header 整棵子树 dump 出来（前 2 次，写入前）。
         // 导航条此前是「哑」的，只能靠用户截图猜；这条一次性把「系统到底用哪个
         // TextView 画那行字 / 有没有第二个标题控件」固化下来。
@@ -424,7 +425,7 @@ internal object ArkMiniBarStyleHook {
             navDumpLeft--
             XposedBridge.log(
                 "[$TAG] navDump(${NAV_DUMP_BEFORE - navDumpLeft}/$NAV_DUMP_BEFORE): " +
-                    "src=$src rowShadow=${rowPayload.present} freshFound=${fresh != null} " +
+                    "src=$src rowShadow=${parsed.present} " +
                     "instr='${parsed.instr.take(24)}' remain=${parsed.remainMs} " +
                     "total=${parsed.totalMs} turn=${parsed.turn} yawed=${parsed.yawed}\n" +
                     dumpSubtree(header)
@@ -434,10 +435,8 @@ internal object ArkMiniBarStyleHook {
         // 清掉 lastGood 并把 overlay 藏起来 —— 避免结束后迷你条残留上一帧指令。
         // 注意保留 tag 里的 overlay 引用（只 GONE 不 removeView），下次导航直接复用，
         // 否则会往 header 里叠第二个 overlay。
-        // v3.15.78：以**影子最新状态**（活动通知里那条）为准，它才是会话真相。
-        val collapse = if (fresh != null && fresh.present) fresh else rowPayload
-        if (collapse.present && collapse.instr.isBlank() &&
-            collapse.totalMs == 0L && collapse.remainMs < 0L
+        if (parsed.present && parsed.instr.isBlank() &&
+            parsed.totalMs == 0L && parsed.remainMs < 0L
         ) {
             lastGoodNav = null
             (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.GONE
@@ -465,12 +464,12 @@ internal object ArkMiniBarStyleHook {
         // 是白色），说明 Flyme 实况窗自己渲染了结构化转向信息，而那些数据很可能
         // 就躺在源通知 extras 里（我们目前是 hook 语音播报 + 正则猜同一件事）。
         // 只读不写：这条日志决定下一版是「删掉语音解析链直接读通知」还是维持现状。
-        if (!rowPayload.present && isNavCategory && !liveDumpDone) {
+        if (!parsed.present && isNavCategory && !liveDumpDone) {
             liveDumpDone = true
             dumpNavSrcExtras(notif)
         }
         // 身份已知（category 读得到）按 category 判；读不到回退 displayed（旧行为兜底）
-        val isOurs = rowPayload.present ||
+        val isOurs = parsed.present ||
             (notif != null && isNavCategory) ||
             (notif == null && displayed)
         if (!isOurs) {
@@ -488,17 +487,17 @@ internal object ArkMiniBarStyleHook {
         // 这一帧没数据下一帧 preDraw 自己会补（writeNavTitle / hideNavChrome
         // 幂等 + 带比较，重复调用无副作用）。overlay 不存在时 preDraw 里判空跳过。
         armPredraw(header)
-        // v3.15.78 A：自驱轮询 —— 影子重投后不再有 UI 回调，迷你条必须自己去取最新载荷
+        // v3.15.79 D：自驱轮询（改为重读本行 sbn，非 IPC）
         armNavPoller(header)
-        // 无数据不画空壳：parsed 读不到且没有历史好载荷 → 保持系统原样
-        if (!usable && lastGoodNav == null) {
-            logNavApply(parsed, displayed, header, row, density, src)
-            return
-        }
+        // v3.15.79 A（回滚门禁）：**只要 isOurs 就一定创建/显示 overlay**。
+        // v3.15.78 的 `if (!usable && lastGoodNav == null) return` 是错的：
+        // 它让「有身份但这一帧没数据」什么都不画 —— 用户看到的是「样式直接丢失」，
+        // 比 v3.15.70 的空壳更糟。占位帧现在只限制两件事：
+        //   ① 不写标题；② 不更新 lastGoodNav —— **绝不允许阻止 overlay 创建或绘制**。
         (header.getTag(KEY_NAV) as? ArkMiniNavView)?.visibility = View.VISIBLE
-        // v3.15.78：只要本帧载荷可用（fresh / 本行都算）就更新 lastGoodNav；
-        // 占位帧（"高德地图 · 正在导航"）usable=false，永远不会污染它。
-        val p = if (usable) {
+        // v3.15.79 B：原生行（present=false，屏幕上那条）用 lastGoodNav 的数据上样式。
+        // 屏幕上是影子还是原生我们控制不了，两条都能画，哪条上屏都对。
+        val p = if (parsed.present && usable) {
             lastGoodNav = parsed
             parsed
         } else {
@@ -594,29 +593,13 @@ internal object ArkMiniBarStyleHook {
         NavMiniPayload()
     }
 
-    /**
-     * v3.15.78：直接从 SystemUI 的活动通知里读影子的**最新** extras。
-     *
-     * 为什么必须这样：真机日志证明注入器的 `navTts` 每几秒在重投影子，而 SystemUI 侧
-     * 4 分钟内只收到一条 `navApply` —— 影子重投不会触发任何 UI 回调，只等回调就等于
-     * 永久冻在第一帧。`getActiveNotifications()` 比 UI 回调新鲜得多。
-     *
-     * **降级策略**（拿不到就问下一层，绝不让迷你条变哑）：
-     * 1. 权限 / IPC 异常 / 返回空 → 返回 null，调用方自然回落到「本行 extras」→「lastGoodNav」；
-     * 2. 影子存在但 extras 没键（`present=false`）→ 同样算拿不到，回落；
-     * 3. 影子是占位帧（"高德地图 · 正在导航"）→ 调用方用 [isPlaceholder] 判掉，回落。
-     */
-    private fun freshShadowPayload(context: Context): NavMiniPayload? = try {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-        nm?.activeNotifications
-            ?.firstOrNull { it.tag == ArkNavLiveInjector.NAV_SHADOW_TAG }
-            ?.notification
-            ?.extras
-            ?.let { payloadOfExtras(it) }
-            ?.takeIf { it.present }
-    } catch (_: Throwable) {
-        null
-    }
+    // v3.15.79：这里原本有 `freshShadowPayload()`（走
+    // `NotificationManager.getActiveNotifications()` 找影子），已**删除**。
+    //
+    // 实证结论：`getActiveNotifications()` 只返回「调用方自己发的」通知，
+    // SystemUI 调它永远看不到 autonavi 发的影子 → 恒为 null，`src` 永远是 `row`。
+    // 正确做法是重读本行 sbn（`entry.mSbn` 每次刷新都会换新对象），见 navRowRef 与
+    // armNavPoller。留着这个函数只会让下一个人再踩一次，所以直接删掉。
 
     /**
      * 占位帧判定（v3.15.78）。
@@ -882,26 +865,61 @@ internal object ArkMiniBarStyleHook {
         val tick = object : Runnable {
             override fun run() {
                 val h = ref.get()
-                // 退出条件：header 被回收 / 已 detach → 不再 postDelayed（防泄漏）
-                if (h == null || !h.isAttachedToWindow) return
+                val navRow = navRowRef?.get()
+                // 退出条件：header 被回收 / 已 detach。
+                // v3.15.79：但**先尝试自愈** —— 若系统把 row 的 header 换成了新实例
+                // （旧实例 detach），就在同一个 navRow 上重新走一遍完整流程，新实例
+                // 自己会挂一条新 poller。这条兜底让「header 被替换且再没有 UI 回调」
+                // 这种最坏情况也能自恢复。
+                if (h == null || !h.isAttachedToWindow) {
+                    try {
+                        if (navRow != null && navRow.isAttachedToWindow && headerId != 0) {
+                            val nh = navRow.findViewById<View>(headerId)
+                            if (nh != null && nh.getTag(KEY_NAV) == null) {
+                                applyNavStructure(
+                                    nh,
+                                    isNight(nh.context),
+                                    packageOf(navRow) ?: ArkConstants.NAV_LIVE_PKG,
+                                    nh.resources.displayMetrics.density,
+                                    navRow,
+                                )
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        // 自愈失败就彻底停，交给下一次 styleFrom
+                    }
+                    return
+                }
                 var ok = true
                 try {
                     val o = h.getTag(KEY_NAV) as? ArkMiniNavView
-                    // overlay 还没建出来 / 已经收起 → 本帧不写，但继续等（数据可能后到）
-                    val fresh = freshShadowPayload(h.context)
-                    if (fresh != null && !isPlaceholder(fresh)) {
-                        lastGoodNav = fresh
-                        if (o != null && o.visibility == View.VISIBLE) {
-                            if (o.changedFrom(fresh)) {
-                                o.setData(
-                                    fresh.instr, fresh.turn, fresh.remainMs, fresh.totalMs,
-                                    fresh.timeText, fresh.timeUnit,
-                                    isNight(h.context), fresh.yawed
-                                )
-                                writeNavTitle(h, fresh.instr, o.densityPx)
-                                centerNavTitle(h)
-                            }
+                    // v3.15.79 D：重读「导航 row」的 sbn —— 系统每次刷新通知都会把
+                    // entry.mSbn 换成新对象，重读即最新；**不走 getActiveNotifications**
+                    //（那个 API 只返回调用方自己发的通知，SystemUI 永远看不到影子）。
+                    val p = if (navRow != null) navPayloadOf(navRow) else NavMiniPayload()
+                    val fresh = if (p.present && !isPlaceholder(p)) p else null
+                    if (fresh != null) lastGoodNav = fresh
+                    if (o != null && o.visibility == View.VISIBLE) {
+                        // 数据变了才 setData（它内部会 invalidate）；
+                        // v3.15.79：但**样式每秒重新施加一遍**，不依赖「数据是否变化」——
+                        // 系统 rebind 把标题刷回「高德地图」时数据可能一字未变，
+                        // 只靠 changedFrom 会漏掉这种覆盖（writeNavTitle 等本身幂等）。
+                        if (fresh != null && o.changedFrom(fresh)) {
+                            o.setData(
+                                fresh.instr, fresh.turn, fresh.remainMs, fresh.totalMs,
+                                fresh.timeText, fresh.timeUnit,
+                                isNight(h.context), fresh.yawed
+                            )
+                            logNavApply(
+                                fresh,
+                                h.isShown && h.isAttachedToWindow && h.height > 0,
+                                h, navRow, o.densityPx, "reread"
+                            )
                         }
+                        writeNavTitle(h, o.instrText, o.densityPx)
+                        hideNavChrome(h)
+                        centerNavTitle(h)
+                        compressNavHeight(h, o.densityPx)
                     }
                 } catch (_: Throwable) {
                     ok = false
@@ -988,7 +1006,7 @@ internal object ArkMiniBarStyleHook {
         src: String,
     ) {
         val sig = "$src|${parsed.present}|${parsed.instr}|${parsed.remainMs}|" +
-            "${parsed.totalMs}|${parsed.turn}|${parsed.yawed}|$displayed"
+            "${parsed.totalMs}|${parsed.turn}|${parsed.yawed}|$displayed|${header.height}"
         val now = System.currentTimeMillis()
         if (sig == lastApplySig && now - lastApplyLoggedAt < NAV_APPLY_HEARTBEAT_MS) return
         lastApplySig = sig
