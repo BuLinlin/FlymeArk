@@ -129,8 +129,9 @@ NAV SVC INTENT DUMP: svc=<simpleName> action=<action> | extras: <v> (reserve 1/4
   仍有 4 次落日志机会。判定用 `looksLikeDest(extras)`：key 命中
   `destination/dest/poiname/poi/endname/toname/target/终点`，或**某个字符串值本身能过
   `sanitizeDest()`**（2..16 字、含中文、不含噪声词 —— 地名就是这个形状，长文本一律过不了），
-  或递归进子 Bundle（≤2 层）。**不用 action 关键词判定**：`NONAV`、`canvas` 都含 `nav`，
-  实测会误命中。行末标记 `| extras: <v> (reserve 1/4)`；4 次也用完再打一次
+  或递归进子 Bundle（≤2 层）。**不用 action 关键词判定**：`NONAV`、`UNAVAILABLE` 这类都含
+  `nav` 子串，会误命中（勘误：早期写的 `canvas` 不成立，`canvas` 里是 `nva`）。
+  行末标记 `| extras: <v> (reserve 1/4)`；4 次也用完再打一次
   `NAV SVC INTENT DUMP: reserve exhausted (4)`。
 - **去重集各自独立**（8 / 2 / 4）：弱线索那一行 `<none>` 不会把「同一个 `svc:action` 之后
   带着 extras 再来一次」的主日志去重掉；主额度已打过的 key 也不会重复消耗预留额度。
